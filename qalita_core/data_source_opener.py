@@ -25,6 +25,7 @@ DEFAULT_PORTS = {
     "5000": "sqlite",
 }
 
+
 class DataSource(ABC):
     @abstractmethod
     def get_data(self, table_or_query=None, pack_config=None):
@@ -35,6 +36,7 @@ class DataSource(ABC):
 # -----------------------------
 # Helper utilities for Parquet
 # -----------------------------
+
 
 def _ensure_output_dir(pack_config: Optional[dict]) -> str:
     base_dir = (pack_config or {}).get("parquet_output_dir") or "./parquet"
@@ -59,7 +61,10 @@ def _write_df_to_parquet(df: pd.DataFrame, output_path: str) -> str:
 
 
 def _write_pandas_chunks(
-    df_iter: Iterable[pd.DataFrame], output_dir: str, base_name: str, start_part: int = 1
+    df_iter: Iterable[pd.DataFrame],
+    output_dir: str,
+    base_name: str,
+    start_part: int = 1,
 ) -> List[str]:
     paths: List[str] = []
     part = start_part
@@ -69,6 +74,7 @@ def _write_pandas_chunks(
         paths.append(path)
         part += 1
     return paths
+
 
 class FileSource(DataSource):
     def __init__(self, file_path):
@@ -98,7 +104,9 @@ class FileSource(DataSource):
         if pack_config:
             skiprows = pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
 
-        base_name = _build_base_name("file", os.path.splitext(os.path.basename(file_path))[0])
+        base_name = _build_base_name(
+            "file", os.path.splitext(os.path.basename(file_path))[0]
+        )
         # CSV: stream with chunksize
         if file_path.endswith(".csv"):
             df_iter = pd.read_csv(
@@ -165,6 +173,7 @@ class FileSource(DataSource):
             f"Unsupported file extension or missing 'skiprows' for file: {file_path}"
         )
 
+
 class DatabaseSource(DataSource):
     def __init__(self, connection_string=None, config=None):
         # Keep the config available for schema preference and other options
@@ -173,9 +182,13 @@ class DatabaseSource(DataSource):
         if connection_string:
             self.engine = create_engine(connection_string)
         elif config:
-            db_type = config.get("type") or DEFAULT_PORTS.get(str(config.get("port")), "unknown")
+            db_type = config.get("type") or DEFAULT_PORTS.get(
+                str(config.get("port")), "unknown"
+            )
             if db_type == "unknown":
-                raise ValueError(f"Unsupported or unknown database port: {config.get('port')}")
+                raise ValueError(
+                    f"Unsupported or unknown database port: {config.get('port')}"
+                )
             elif db_type == "oracle":
                 db_type = "oracle+oracledb"
                 conn_str = (
@@ -196,7 +209,9 @@ class DatabaseSource(DataSource):
                     f"{db_type}://{config['username']}:{config['password']}@{config['host']}:{config['port']}/{config['database']}"
                 )
         else:
-            raise ValueError("DatabaseSource requires a connection_string or a config dict.")
+            raise ValueError(
+                "DatabaseSource requires a connection_string or a config dict."
+            )
 
     def get_data(self, table_or_query=None, pack_config=None):
         """
@@ -218,11 +233,7 @@ class DatabaseSource(DataSource):
         if cfg_schema:
             schema = cfg_schema
         elif pack_config:
-            schema = (
-                pack_config.get("job", {})
-                .get("source", {})
-                .get("schema")
-            )
+            schema = pack_config.get("job", {}).get("source", {}).get("schema")
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
@@ -233,13 +244,21 @@ class DatabaseSource(DataSource):
             dialect_name = None
 
         # Default behavior: scan all tables
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             table_names = self._get_all_table_names(schema)
             if not table_names:
-                raise ValueError("No tables found in the database for the given schema.")
+                raise ValueError(
+                    "No tables found in the database for the given schema."
+                )
             all_paths: List[str] = []
             for table_name in table_names:
-                all_paths.extend(self._read_table_to_parquet(table_name, schema, output_dir, chunk_rows, dialect_name))
+                all_paths.extend(
+                    self._read_table_to_parquet(
+                        table_name, schema, output_dir, chunk_rows, dialect_name
+                    )
+                )
             return all_paths
 
         # If a list/tuple/set of table names is provided
@@ -247,7 +266,11 @@ class DatabaseSource(DataSource):
             table_names = list(table_or_query)
             all_paths: List[str] = []
             for table_name in table_names:
-                all_paths.extend(self._read_table_to_parquet(table_name, schema, output_dir, chunk_rows, dialect_name))
+                all_paths.extend(
+                    self._read_table_to_parquet(
+                        table_name, schema, output_dir, chunk_rows, dialect_name
+                    )
+                )
             return all_paths
 
         # If a single string is provided, determine if it's a table name or SQL query
@@ -256,13 +279,17 @@ class DatabaseSource(DataSource):
                 base_name = _build_base_name(dialect_name or "db", "query")
                 df_iter = pd.read_sql(table_or_query, self.engine, chunksize=chunk_rows)
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                table_or_query, schema, output_dir, chunk_rows, dialect_name
+            )
 
         raise TypeError(
             "table_or_query must be None, '*', a string (table name or SQL), or a list/tuple/set of table names."
         )
 
-    def _read_table(self, table_name: str, schema: Optional[str] = None) -> pd.DataFrame:
+    def _read_table(
+        self, table_name: str, schema: Optional[str] = None
+    ) -> pd.DataFrame:
         """Read a full table as a DataFrame using dialect-aware SQL. (Compatibility only)"""
         # Support fully-qualified names like "SCHEMA.TABLE" when no schema is explicitly provided
         effective_schema = schema
@@ -275,10 +302,16 @@ class DatabaseSource(DataSource):
                 effective_table = table_name
 
         try:
-            return pd.read_sql_table(effective_table, self.engine, schema=effective_schema)
+            return pd.read_sql_table(
+                effective_table, self.engine, schema=effective_schema
+            )
         except Exception:
             # Fallback to a simple SELECT * if read_sql_table is unsupported for the dialect
-            qualified = f"{effective_schema}.{effective_table}" if effective_schema else effective_table
+            qualified = (
+                f"{effective_schema}.{effective_table}"
+                if effective_schema
+                else effective_table
+            )
             return pd.read_sql(f"SELECT * FROM {qualified}", self.engine)
 
     def _read_table_to_parquet(
@@ -298,7 +331,11 @@ class DatabaseSource(DataSource):
                 effective_schema = None
                 effective_table = table_name
 
-        qualified = f"{effective_schema}.{effective_table}" if effective_schema else effective_table
+        qualified = (
+            f"{effective_schema}.{effective_table}"
+            if effective_schema
+            else effective_table
+        )
         base_name = _build_base_name(dialect_name or "db", qualified)
         # Use streaming SQL with chunksize
         sql = f"SELECT * FROM {qualified}"
@@ -341,9 +378,28 @@ class DatabaseSource(DataSource):
                 schemas = []
 
             system_schemas = {
-                "SYS","SYSTEM","OUTLN","XDB","MDSYS","CTXSYS","ORDSYS","ORDDATA","DBSNMP",
-                "APPQOSSYS","WMSYS","OLAPSYS","LBACSYS","GSMADMIN_INTERNAL","OJVMSYS",
-                "DVF","DVSYS","REMOTE_SCHEDULER_AGENT","SYS$UMF","GGSYS","AUDSYS","ANONYMOUS"
+                "SYS",
+                "SYSTEM",
+                "OUTLN",
+                "XDB",
+                "MDSYS",
+                "CTXSYS",
+                "ORDSYS",
+                "ORDDATA",
+                "DBSNMP",
+                "APPQOSSYS",
+                "WMSYS",
+                "OLAPSYS",
+                "LBACSYS",
+                "GSMADMIN_INTERNAL",
+                "OJVMSYS",
+                "DVF",
+                "DVSYS",
+                "REMOTE_SCHEDULER_AGENT",
+                "SYS$UMF",
+                "GGSYS",
+                "AUDSYS",
+                "ANONYMOUS",
             }
 
             qualified: List[str] = []
@@ -361,7 +417,9 @@ class DatabaseSource(DataSource):
             # Final fallback: try CURRENT_SCHEMA if available
             try:
                 with self.engine.connect() as conn:
-                    result = conn.execute(text("SELECT sys_context('USERENV','CURRENT_SCHEMA') FROM dual"))
+                    result = conn.execute(
+                        text("SELECT sys_context('USERENV','CURRENT_SCHEMA') FROM dual")
+                    )
                     row = result.fetchone()
                     current_schema = row[0] if row and row[0] else None
                 if current_schema:
@@ -390,7 +448,9 @@ class DatabaseSource(DataSource):
             for sch in schemas or []:
                 if not sch:
                     continue
-                if sch in system_schemas or any(sch.startswith(pfx) for pfx in system_prefixes):
+                if sch in system_schemas or any(
+                    sch.startswith(pfx) for pfx in system_prefixes
+                ):
                     continue
                 names = _collect_for_schema(sch)
                 for n in names:
@@ -410,6 +470,7 @@ class DatabaseSource(DataSource):
             return True
         starters = ("select", "with", "show", "describe", "pragma", "explain")
         return any(sql.startswith(token) for token in starters)
+
 
 def _infer_format_from_path(path: str, explicit_format: Optional[str] = None) -> str:
     if explicit_format:
@@ -460,14 +521,21 @@ def _materialize_remote_to_parquet(
         # Attempt newline-delimited JSON if hinted
         lines = bool((pack_config or {}).get("json_lines", False))
         if lines:
-            df_iter = pd.read_json(path, storage_options=storage_options, lines=True, chunksize=chunk_rows)
+            df_iter = pd.read_json(
+                path, storage_options=storage_options, lines=True, chunksize=chunk_rows
+            )
             return _write_pandas_chunks(df_iter, output_dir, base_name)
         # Fallback: load once, write once (may be memory heavy)
         df = pd.read_json(path, storage_options=storage_options)
         return [_write_df_to_parquet(df, _build_parquet_path(output_dir, base_name, 1))]
     if fmt == "excel":
         # Excel streaming from remote is complex; fallback to single load
-        df = pd.read_excel(path, storage_options=storage_options, engine="openpyxl", skiprows=int(skiprows))
+        df = pd.read_excel(
+            path,
+            storage_options=storage_options,
+            engine="openpyxl",
+            skiprows=int(skiprows),
+        )
         return [_write_df_to_parquet(df, _build_parquet_path(output_dir, base_name, 1))]
     # Fallback to CSV behavior
     df_iter = pd.read_csv(path, storage_options=storage_options, chunksize=chunk_rows)
@@ -487,7 +555,9 @@ class S3Source(DataSource):
             if bucket and key:
                 path = f"s3://{bucket}/{key}"
         if not path:
-            raise ValueError("S3Source requires either 'path' or 'bucket'+'key' in config.")
+            raise ValueError(
+                "S3Source requires either 'path' or 'bucket'+'key' in config."
+            )
 
         storage_options = {}
         for opt_key in [
@@ -500,7 +570,10 @@ class S3Source(DataSource):
                 storage_options[opt_key] = self.config[opt_key]
 
         fmt = _infer_format_from_path(path, self.config.get("format"))
-        return _materialize_remote_to_parquet(path, fmt, storage_options or None, pack_config)
+        return _materialize_remote_to_parquet(
+            path, fmt, storage_options or None, pack_config
+        )
+
 
 class GCSSource(DataSource):
     def __init__(self, config):
@@ -515,7 +588,9 @@ class GCSSource(DataSource):
             if bucket and blob:
                 path = f"gs://{bucket}/{blob}"
         if not path:
-            raise ValueError("GCSSource requires either 'path' or 'bucket'+'blob' in config.")
+            raise ValueError(
+                "GCSSource requires either 'path' or 'bucket'+'blob' in config."
+            )
 
         storage_options = {}
         for opt_key in [
@@ -526,7 +601,10 @@ class GCSSource(DataSource):
                 storage_options[opt_key] = self.config[opt_key]
 
         fmt = _infer_format_from_path(path, self.config.get("format"))
-        return _materialize_remote_to_parquet(path, fmt, storage_options or None, pack_config)
+        return _materialize_remote_to_parquet(
+            path, fmt, storage_options or None, pack_config
+        )
+
 
 class AzureBlobSource(DataSource):
     def __init__(self, config):
@@ -542,7 +620,9 @@ class AzureBlobSource(DataSource):
             if account_name and container and blob:
                 path = f"abfs://{container}@{account_name}.dfs.core.windows.net/{blob}"
         if not path:
-            raise ValueError("AzureBlobSource requires either 'path' or 'account_name'+'container'+'blob'.")
+            raise ValueError(
+                "AzureBlobSource requires either 'path' or 'account_name'+'container'+'blob'."
+            )
 
         storage_options = {}
         # adlfs uses Azure credentials via storage_options
@@ -558,7 +638,10 @@ class AzureBlobSource(DataSource):
                 storage_options[opt_key] = self.config[opt_key]
 
         fmt = _infer_format_from_path(path, self.config.get("format"))
-        return _materialize_remote_to_parquet(path, fmt, storage_options or None, pack_config)
+        return _materialize_remote_to_parquet(
+            path, fmt, storage_options or None, pack_config
+        )
+
 
 class HDFSSource(DataSource):
     def __init__(self, config):
@@ -574,7 +657,9 @@ class HDFSSource(DataSource):
             if host and hdfs_path:
                 path = f"hdfs://{host}:{port}/{hdfs_path.lstrip('/')}"
         if not path:
-            raise ValueError("HDFSSource requires 'path' or 'host'+'hdfs_path' in config.")
+            raise ValueError(
+                "HDFSSource requires 'path' or 'host'+'hdfs_path' in config."
+            )
 
         storage_options = {}
         for opt_key in [
@@ -587,45 +672,77 @@ class HDFSSource(DataSource):
                 storage_options[opt_key] = self.config[opt_key]
 
         fmt = _infer_format_from_path(path, self.config.get("format"))
-        return _materialize_remote_to_parquet(path, fmt, storage_options or None, pack_config)
+        return _materialize_remote_to_parquet(
+            path, fmt, storage_options or None, pack_config
+        )
+
 
 class FolderSource(DataSource):
     def __init__(self, config):
         self.config = config
+
     def get_data(self, table_or_query=None, pack_config=None):
         raise NotImplementedError("FolderSource.get_data Not yet Implemented.")
+
 
 class MongoDBSource(DataSource):
     def __init__(self, config):
         self.config = config
+
     def get_data(self, table_or_query=None, pack_config=None):
         raise NotImplementedError("MongoDBSource.get_data Not yet Implemented.")
+
 
 class SqliteSource(DataSource):
     def __init__(self, config):
         self.config = config
+
     def get_data(self, table_or_query=None, pack_config=None):
         raise NotImplementedError("SqliteSource.get_data Not yet Implemented.")
 
 
 def get_data_source(source_config):
     type_ = source_config.get("type")
-    if type_ == "file":
+    if (
+        type_ == "file"
+        or type_ == "csv"
+        or type_ == "excel"
+        or type_ == "json"
+        or type_ == "parquet"
+    ):
         return FileSource(source_config.get("config", {}).get("path"))
     elif type_ == "folder":
         return FolderSource(source_config.get("config", {}))
     elif type_ == "postgresql":
-        return DatabaseSource(connection_string=source_config.get("config", {}).get("connection_string"), config=source_config.get("config"))
+        return DatabaseSource(
+            connection_string=source_config.get("config", {}).get("connection_string"),
+            config=source_config.get("config"),
+        )
     elif type_ == "mysql":
-        return DatabaseSource(connection_string=source_config.get("config", {}).get("connection_string"), config=source_config.get("config"))
+        return DatabaseSource(
+            connection_string=source_config.get("config", {}).get("connection_string"),
+            config=source_config.get("config"),
+        )
     elif type_ == "oracle":
-        return DatabaseSource(connection_string=source_config.get("config", {}).get("connection_string"), config=source_config.get("config"))
+        return DatabaseSource(
+            connection_string=source_config.get("config", {}).get("connection_string"),
+            config=source_config.get("config"),
+        )
     elif type_ == "mssql":
-        return DatabaseSource(connection_string=source_config.get("config", {}).get("connection_string"), config=source_config.get("config"))
+        return DatabaseSource(
+            connection_string=source_config.get("config", {}).get("connection_string"),
+            config=source_config.get("config"),
+        )
     elif type_ == "sqlite":
-        return DatabaseSource(connection_string=source_config.get("config", {}).get("connection_string"), config=source_config.get("config"))
+        return DatabaseSource(
+            connection_string=source_config.get("config", {}).get("connection_string"),
+            config=source_config.get("config"),
+        )
     elif type_ == "mongodb":
-        return DatabaseSource(connection_string=source_config.get("config", {}).get("connection_string"), config=source_config.get("config"))
+        return DatabaseSource(
+            connection_string=source_config.get("config", {}).get("connection_string"),
+            config=source_config.get("config"),
+        )
     elif type_ == "s3":
         return S3Source(source_config.get("config", {}))
     elif type_ == "gcs":
