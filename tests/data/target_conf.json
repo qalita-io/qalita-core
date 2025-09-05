@@ -1,0 +1,15 @@
+{
+    "config": {
+        "path": "./tests/data/ref_bio_data.xlsx"
+    },
+    "description": "Ref data for clinical dataset",
+    "id": 11,
+    "name": "Bio referential data",
+    "owner": "admin",
+    "owner_id": 1,
+    "reference": true,
+    "sensitive": false,
+    "type": "file",
+    "validate": "valid",
+    "visibility": "public"
+}

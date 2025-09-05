@@ -1,0 +1,57 @@
+[tool.poetry]
+name = "qalita_core"
+version = "0.0.0-dev"
+description = "QALITA Platform Core lib for common function used in pack"
+authors = ["QALITA SAS <contact@qalita.io>"]
+readme = "docs/README.md"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: Other/Proprietary License",
+    "Operating System :: Unix",
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Natural Language :: English"
+]
+include = ["version.json"]
+
+[tool.poetry.group.dev.dependencies]
+flake8 = ">=3.8.1,<4.0"
+pylint = "^2.17.4"
+black = "^23.3.0"
+pre-commit = "^3.3.3"
+pytest = "^7.4.0"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pandas = "^2.2.0"
+sqlalchemy = "^2.0.27"
+pyarrow = "^19.0.0"
+openpyxl = "^3.1.2"
+pymysql = "^1.1.0"
+psycopg2-binary = "^2.9.9"
+pymongo = "^4.6.3"
+boto3 = "^1.34.81"
+google-cloud-storage = "^2.16.0"
+azure-storage-blob = "^12.19.1"
+hdfs = "^2.7.3"
+paramiko = "^3.4.0"
+oracledb = "^2.5.0"
+
+[[tool.poetry.source]]
+name = "qalita"
+url = "https://pkgs.dev.azure.com/qalita/_packaging/qalita/pypi/simple/"
+priority = "primary"
+
+
+[[tool.poetry.source]]
+name = "PyPI"
+priority = "primary"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

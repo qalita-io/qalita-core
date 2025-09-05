@@ -1,0 +1,38 @@
+{
+    "job": {
+        "id_columns": [],
+        "source": {
+            "skiprows": 0
+        }
+    },
+    "charts": {
+        "overview": [
+            {
+                "metric_key": "score",
+                "chart_type": "text",
+                "display_title": true,
+                "justify": true
+            }
+        ],
+        "scoped": [
+            {
+                "metric_key": "decimal_precision",
+                "chart_type": "text",
+                "display_title": true,
+                "justify": true
+            },
+            {
+                "metric_key": "proportion_score",
+                "chart_type": "text",
+                "display_title": true,
+                "justify": true
+            },
+            {
+                "metric_key": "proportion_score",
+                "chart_type": "spark_area_chart",
+                "display_title": false,
+                "justify": false
+            }
+        ]
+    }
+}

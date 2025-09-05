@@ -1,0 +1,15 @@
+{
+    "config": {
+        "path": "./tests/data/METABRIC_RNA_Mutation.xlsx"
+    },
+    "description": "Clinical attributes, m-RNA levels z-score, and genes mutations for 1904 patients",
+    "id": 9,
+    "name": "Breast Cancer Gene Expression Profiles (METABRIC)",
+    "owner": "admin",
+    "owner_id": 1,
+    "reference": true,
+    "sensitive": false,
+    "type": "file",
+    "validate": "valid",
+    "visibility": "internal"
+}
