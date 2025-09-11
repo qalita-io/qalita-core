@@ -4,83 +4,182 @@
   <img width="250px" height="auto" src="https://cloud.platform.qalita.io/logo.svg" style="max-width:250px;"/>
 </p>
 
-## Architecture d'accès aux sources de données
+QALITA Core is a lightweight helper library used by QALITA packs to load data from multiple sources, materialize them to Parquet in deterministic chunks, and share common utilities (sanitization and aggregation helpers).
 
-Le module core fournit une abstraction unifiée pour accéder à de multiples types de sources de données via la classe abstraite `DataSource` et ses sous-classes spécialisées.
+## Key features
 
-### Types de sources supportées
+- Unified data access via a simple `DataSource` abstraction and factory
+- File, database, and object storage loaders with streaming to Parquet
+- Deterministic, size-bounded Parquet chunking with stable filenames
+- Safe Parquet writing for pandas DataFrames (automatic sanitization)
+- Shared aggregators for completeness, outliers, duplicates, and timeliness
+- Minimal pack runtime with JSON config loading and simple asset persistence
 
-- mysql
-- postgresql
-- sqlite
-- mongodb
-- oracle
-- s3
-- gcs
-- azure_blob
-- hdfs
-- sftp
-- http
-- https
-- file
-- folder
+## Supported sources
 
-### Utilisation
+- Files: CSV (`.csv`), Excel (`.xlsx`), JSON, Parquet (pass-through)
+- Databases: PostgreSQL, MySQL, Oracle, MS SQL Server, SQLite
+- Object storage: Amazon S3, Google Cloud Storage, Azure Blob (via `abfs`), HDFS
 
-Pour instancier la bonne source, utilisez la factory :
+Notes:
+- Folder, MongoDB classes exist as placeholders; MongoDB is not yet implemented.
+- SQLite is supported through the generic `DatabaseSource` when selected via `type: "sqlite"`.
 
-```python
-from qalita_core.data_source_opener import get_data_source
+## Installation
 
-ds = get_data_source(source_config)
-df = ds.get_data(table_or_query, pack_config)
-```
+Prerequisites: Python 3.10–3.12 and Poetry.
 
-Chaque sous-classe implémente la méthode `get_data` pour charger les données dans un DataFrame ou un format adapté.
-
-### Ajout d'un nouveau type de source
-
-Pour ajouter un nouveau type, créez une sous-classe de `DataSource` et implémentez la méthode `get_data`.
-
----
-
-Pour plus de détails, voir le code source dans `qalita_core/data_source_opener.py`.
-
-# Poetry
-
-### 0. Dependencies installation : 
-
-Packages uses QALITA Azure Devops Artifacts Feed as a Pypi Package Proxy, you need to configure authentication to use it :
+This package uses QALITA Azure DevOps Artifacts as a PyPI proxy. Configure credentials once:
 
 ```bash
 poetry config http-basic.qalita qalita <your-pat>
 ```
 
-## Ajouter une dépendance
+Install dependencies and set your environment:
 
-> poetry add <dependency>
-
-## Run un process
-
-> poetry run <command>
-
-## Choix de l'environnement
-
-poetry env use python3.13 &&
-poetry install &&
-pip install --user poetry-plugin-export &&
-poetry export -f requirements.txt --output requirements.txt --without-hashes &&
+```bash
+poetry env use python3.12 && \
+poetry install && \
+pip install --user poetry-plugin-export && \
+poetry export -f requirements.txt --output requirements.txt --without-hashes && \
 pip install -r requirements.txt
+```
 
-## Dans VSCode choix de l'intérpréteur
+Open a Poetry shell when developing:
 
-> Ctrl + Shift + P -> Python: Select Interpreter -> Poetry
+```bash
+poetry shell
+```
 
-## shell :
+## Quickstart
 
-> poetry shell
+### Load data directly with the factory
 
-# Debug :
+```python
+from qalita_core.data_source_opener import get_data_source
 
-> poetry shell
-> pip install --editable .
+# Example 1: CSV file (chunk to parquet)
+source_conf = {
+    "type": "file",
+    "config": {"path": "./data/myfile.csv"}
+}
+pack_conf = {"parquet_output_dir": "./parquet", "chunk_rows": 100_000}
+
+ds = get_data_source(source_conf)
+paths = ds.get_data(table_or_query=None, pack_config=pack_conf)
+print(paths)  # ["./parquet/file_myfile_part_1.parquet", ...]
+
+# Example 2: SQLite table
+source_conf = {
+    "type": "sqlite",
+    "config": {"connection_string": "sqlite:///sample.db"}
+}
+paths = get_data_source(source_conf).get_data("items", pack_config=pack_conf)
+
+# Example 3: SQL query (any SQLAlchemy-supported database)
+source_conf = {
+    "type": "postgresql",
+    "config": {
+        "connection_string": "postgresql://user:pass@host:5432/db"
+    }
+}
+paths = get_data_source(source_conf).get_data("SELECT * FROM public.users", pack_config=pack_conf)
+```
+
+### Use within a Pack
+
+`Pack` loads four JSON files by default (overridable) and provides `load_data()` for `source` or `target` triggers.
+
+```python
+from qalita_core.pack import Pack
+
+pack = Pack(configs={
+    "pack_conf": "./pack_conf.json",
+    "source_conf": "./source_conf.json",
+    "target_conf": "./target_conf.json",
+    "agent_file": "~/.qalita/.agent",
+})
+
+# Ensure chunking/output are set (can be in pack_conf["job"] too)
+pack.pack_config.setdefault("job", {})
+pack.pack_config["job"]["parquet_output_dir"] = "./parquet"
+pack.pack_config["job"]["chunk_rows"] = 100_000
+
+# Load source
+source_paths = pack.load_data("source")
+# Load target (optional)
+target_paths = pack.load_data("target")
+
+# Persist custom metrics/recommendations/schemas to JSON files
+pack.metrics.data.append({"key": "score", "value": "0.95", "scope": {"perimeter": "dataset", "value": "my_dataset"}})
+pack.metrics.save()       # writes metrics.json
+pack.recommendations.save()  # writes recommendations.json
+pack.schemas.save()          # writes schemas.json
+```
+
+## Parquet chunking and filenames
+
+- CSV/JSON/Excel are streamed with `chunksize` into multiple parquet files.
+- Databases are read with chunked SQL via SQLAlchemy/`pandas.read_sql`.
+- Filenames use a stable pattern: `<source>_<object>_part_<k>.parquet` where:
+  - `<source>` is a slug of the source type (e.g. `file`, `sqlite`, `postgresql`).
+  - `<object>` is a slug of the table name, query label, or file stem.
+  - Example: `file_testdata_part_1.parquet`, `sqlite_items_part_3.parquet`, `sqlite_query_part_2.parquet`.
+
+Configure output and size via `pack_config`:
+
+- `parquet_output_dir` (default: `./parquet`)
+- `chunk_rows` (default: `100000`)
+- Optional `job.source.skiprows` applied to CSV/Excel
+
+## Safe Parquet writing for pandas
+
+On import, QALITA Core installs a small monkeypatch so `DataFrame.to_parquet`:
+
+- Ensures column names are strings
+- Decodes bytes to UTF‑8 strings when present
+- Normalizes mixed-type object columns and categoricals
+- Defaults to `engine="pyarrow"`
+
+You can also call the sanitizer explicitly:
+
+```python
+from qalita_core import sanitize_dataframe_for_parquet
+clean_df = sanitize_dataframe_for_parquet(df)
+```
+
+## Aggregation helpers (for packs)
+
+Helpers centralize common result/metric aggregation logic:
+
+```python
+from qalita_core import (
+    detect_chunked_from_items,
+    normalize_and_dedupe_recommendations,
+    CompletenessAggregator,
+    OutlierAggregator,
+    DuplicateAggregator,
+    TimelinessAggregator,
+)
+```
+
+- `CompletenessAggregator`: column/dataset completeness and schema extraction
+- `OutlierAggregator`: per-column and dataset outlier/normality metrics
+- `DuplicateAggregator`: duplicate counts and dataset-level score using key columns
+- `TimelinessAggregator`: dates/years coverage and recency scoring
+
+## Development
+
+- Tests: `poetry run pytest`
+- Formatting: `poetry run black .`
+- Linting: `poetry run flake8` and `poetry run pylint <module>`
+- Editable install while debugging:
+
+```bash
+poetry shell
+pip install --editable .
+```
+
+## Documentation
+
+A short package note also lives in `docs/README.md`. Additional material can be found in the online documentation: `https://doc.qalita.io/`.
