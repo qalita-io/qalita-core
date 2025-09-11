@@ -47,39 +47,6 @@ poetry shell
 
 ## Quickstart
 
-### Load data directly with the factory
-
-```python
-from qalita_core.data_source_opener import get_data_source
-
-# Example 1: CSV file (chunk to parquet)
-source_conf = {
-    "type": "file",
-    "config": {"path": "./data/myfile.csv"}
-}
-pack_conf = {"parquet_output_dir": "./parquet", "chunk_rows": 100_000}
-
-ds = get_data_source(source_conf)
-paths = ds.get_data(table_or_query=None, pack_config=pack_conf)
-print(paths)  # ["./parquet/file_myfile_part_1.parquet", ...]
-
-# Example 2: SQLite table
-source_conf = {
-    "type": "sqlite",
-    "config": {"connection_string": "sqlite:///sample.db"}
-}
-paths = get_data_source(source_conf).get_data("items", pack_config=pack_conf)
-
-# Example 3: SQL query (any SQLAlchemy-supported database)
-source_conf = {
-    "type": "postgresql",
-    "config": {
-        "connection_string": "postgresql://user:*****@host:5432/db"
-    }
-}
-paths = get_data_source(source_conf).get_data("SELECT * FROM public.users", pack_config=pack_conf)
-```
-
 ### Use within a Pack
 
 `Pack` loads four JSON files by default (overridable) and provides `load_data()` for `source` or `target` triggers.
