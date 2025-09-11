@@ -29,12 +29,6 @@ Notes:
 
 Prerequisites: Python 3.10–3.12 and Poetry.
 
-This package uses QALITA Azure DevOps Artifacts as a PyPI proxy. Configure credentials once:
-
-```bash
-poetry config http-basic.qalita qalita <your-pat>
-```
-
 Install dependencies and set your environment:
 
 ```bash
