@@ -3,7 +3,7 @@ name = "qalita_core"
 version = "0.0.0-dev"
 description = "QALITA Platform Core lib for common function used in pack"
 authors = ["QALITA SAS <contact@qalita.io>"]
-readme = "docs/README.md"
+readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
