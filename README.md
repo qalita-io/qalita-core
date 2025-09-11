@@ -74,7 +74,7 @@ paths = get_data_source(source_conf).get_data("items", pack_config=pack_conf)
 source_conf = {
     "type": "postgresql",
     "config": {
-        "connection_string": "postgresql://user:pass@host:5432/db"
+        "connection_string": "postgresql://user:*****@host:5432/db"
     }
 }
 paths = get_data_source(source_conf).get_data("SELECT * FROM public.users", pack_config=pack_conf)
