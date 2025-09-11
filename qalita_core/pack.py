@@ -8,6 +8,9 @@ import base64
 import logging
 from qalita_core.data_source_opener import get_data_source
 from urllib.parse import urlsplit
+import math
+from decimal import Decimal
+import datetime as _dt
 
 
 class Pack:
@@ -121,6 +124,79 @@ class ConfigLoader:
             return {}
 
 
+def _sanitize_for_json(obj):
+    """Recursively convert objects to JSON-serializable forms.
+
+    Handles pandas NA/NaT, numpy scalars/arrays, datetimes, Decimals, sets, and
+    non-string dict keys.
+    """
+    # Fast-path for basic JSON types
+    if obj is None or isinstance(obj, (bool, int, str)):
+        return obj
+
+    # Floats: normalize non-finite values
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        return None
+
+    # Datetime-like objects
+    if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+
+    # Decimal -> float (or str if not finite)
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return str(obj)
+
+    # pandas NA / NaT without importing pandas
+    tname = type(obj).__name__
+    if tname in ("NAType", "NaTType"):
+        return None
+
+    # numpy scalars and arrays without importing numpy
+    # Many numpy scalars have .item(); arrays often have .tolist()
+    try:
+        if hasattr(obj, "tolist"):
+            return _sanitize_for_json(obj.tolist())
+    except Exception:
+        pass
+    try:
+        if hasattr(obj, "item"):
+            return _sanitize_for_json(obj.item())
+    except Exception:
+        pass
+
+    # Dict: ensure keys are strings and values sanitized
+    if isinstance(obj, dict):
+        sanitized = {}
+        for k, v in obj.items():
+            if isinstance(k, str):
+                key = k
+            else:
+                try:
+                    key = str(k)
+                except Exception:
+                    key = repr(k)
+            sanitized[key] = _sanitize_for_json(v)
+        return sanitized
+
+    # Iterables (list/tuple/set)
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_json(x) for x in obj]
+
+    # Fallback: best-effort string conversion
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 class PlatformAsset:
     """
     A platform asset is a json formated data that can be pushed to the platform
@@ -133,4 +209,4 @@ class PlatformAsset:
     def save(self):
         # Writing data to metrics.json
         with open(self.type + ".json", "w", encoding="utf-8") as file:
-            json.dump(self.data, file, indent=4)
+            json.dump(_sanitize_for_json(self.data), file, indent=4)
