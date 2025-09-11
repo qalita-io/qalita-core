@@ -176,4 +176,4 @@ pip install --editable .
 
 ## Documentation
 
-A short package note also lives in `docs/README.md`. Additional material can be found in the online documentation: `https://doc.qalita.io/`.
+Additional material can be found in the online documentation: `https://doc.qalita.io/`.
