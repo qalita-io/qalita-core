@@ -43,12 +43,6 @@ paramiko = "^3.4.0"
 oracledb = "^2.5.0"
 
 [[tool.poetry.source]]
-name = "qalita"
-url = "https://pkgs.dev.azure.com/qalita/_packaging/qalita/pypi/simple/"
-priority = "primary"
-
-
-[[tool.poetry.source]]
 name = "PyPI"
 priority = "primary"
 
