@@ -27,22 +27,19 @@ Notes:
 
 ## Installation
 
-Prerequisites: Python 3.10–3.12 and Poetry.
+Prerequisites: Python 3.10–3.12 and uv.
 
 Install dependencies and set your environment:
 
 ```bash
-poetry env use python3.12 && \
-poetry install && \
-pip install --user poetry-plugin-export && \
-poetry export -f requirements.txt --output requirements.txt --without-hashes && \
-pip install -r requirements.txt
+pip install uv
+uv sync
 ```
 
-Open a Poetry shell when developing:
+Open a uv shell when developing:
 
 ```bash
-poetry shell
+uv shell
 ```
 
 ## Quickstart
@@ -131,14 +128,14 @@ from qalita_core import (
 
 ## Development
 
-- Tests: `poetry run pytest`
-- Formatting: `poetry run black .`
-- Linting: `poetry run flake8` and `poetry run pylint <module>`
+- Tests: `uv run pytest`
+- Formatting: `uv run black .`
+- Linting: `uv run flake8` and `uv run pylint <module>`
 - Editable install while debugging:
 
 ```bash
-poetry shell
-pip install --editable .
+uv sync
+uv pip install -e .
 ```
 
 ## Documentation
