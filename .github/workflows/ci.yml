@@ -10,7 +10,7 @@ on:
 jobs:
   secrets-scan:
     name: Trufflehog - Secret Detection
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-latest  # TruffleHog action has issues with self-hosted runners
     steps:
       - name: Checkout
         uses: actions/checkout@v4
