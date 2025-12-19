@@ -10,7 +10,7 @@ on:
 jobs:
   secrets-scan:
     name: Trufflehog - Secret Detection
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
 
   pylint:
     name: Pylint - Python Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +51,7 @@ jobs:
 
   bandit:
     name: Bandit - Python Security Linting
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
     name: Publish to PyPI
     needs: [secrets-scan, pylint, bandit]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     permissions:
       id-token: write  # Required for OIDC authentication with PyPI
     steps:
