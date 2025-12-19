@@ -27,7 +27,7 @@ jobs:
 
   pylint:
     name: Pylint - Python Lint
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-latest  # setup-python doesn't support Python 3.13 on ARM64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +51,7 @@ jobs:
 
   bandit:
     name: Bandit - Python Security Linting
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-latest  # setup-python doesn't support Python 3.13 on ARM64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
     name: Publish to PyPI
     needs: [secrets-scan, pylint, bandit]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-latest  # setup-python doesn't support Python 3.13 on ARM64
     permissions:
       id-token: write  # Required for OIDC authentication with PyPI
     steps:
