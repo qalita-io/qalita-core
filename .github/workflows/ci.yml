@@ -7,6 +7,11 @@ on:
       - "*"
   workflow_dispatch:
 
+# Minimal permissions following least privilege principle
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   secrets-scan:
     name: Trufflehog - Secret Detection
