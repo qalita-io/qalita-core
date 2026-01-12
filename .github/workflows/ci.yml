@@ -71,9 +71,29 @@ jobs:
       - name: Run Bandit for Code Security
         run: bandit -lll -r .
 
+  test:
+    name: Pytest - Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run tests with pytest
+        run: pytest tests/ -v --tb=short
+
   publish:
     name: Publish to PyPI
-    needs: [secrets-scan, pylint, bandit]
+    needs: [secrets-scan, pylint, bandit, test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest  # setup-python doesn't support Python 3.13 on ARM64
     permissions:
