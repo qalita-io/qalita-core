@@ -287,7 +287,8 @@ class TestGetDataSource:
     def test_postgresql_source(self):
         source_config = {
             "type": "postgresql",
-            "config": {"connection_string": "postgresql://user:pass@localhost/db"},
+            # Using placeholder URL format - no actual credentials
+            "config": {"connection_string": "postgresql://localhost/testdb"},
         }
         source = get_data_source(source_config)
         assert isinstance(source, DatabaseSource)
@@ -297,7 +298,8 @@ class TestGetDataSource:
         pytest.importorskip("MySQLdb", reason="MySQLdb not available")
         source_config = {
             "type": "mysql",
-            "config": {"connection_string": "mysql://user:pass@localhost/db"},
+            # Using placeholder URL format - no actual credentials
+            "config": {"connection_string": "mysql://localhost/testdb"},
         }
         source = get_data_source(source_config)
         assert isinstance(source, DatabaseSource)
