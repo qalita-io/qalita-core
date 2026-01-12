@@ -415,6 +415,7 @@ class TimelinessAggregator:
         recommendations: List[Dict[str, Any]] = []
 
         now = _dt.datetime.now()
+        now_date = now.date()  # Use date for comparison with date objects
         eligible_columns = set(compute_score_columns) if compute_score_columns else None
         scores: List[float] = []
 
@@ -454,8 +455,13 @@ class TimelinessAggregator:
                 latest_date = info.get("max")
                 if earliest_date is None or latest_date is None:
                     continue
-                days_since_latest = (now - latest_date).days
-                days_since_earliest = (now - earliest_date).days
+                # Convert datetime to date if needed for consistent comparison
+                if isinstance(latest_date, _dt.datetime):
+                    latest_date = latest_date.date()
+                if isinstance(earliest_date, _dt.datetime):
+                    earliest_date = earliest_date.date()
+                days_since_latest = (now_date - latest_date).days
+                days_since_earliest = (now_date - earliest_date).days
                 timeliness_score = calc_timeliness_score(days_since_latest)
                 metrics.extend(
                     [
