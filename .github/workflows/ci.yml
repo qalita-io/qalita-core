@@ -1,4 +1,4 @@
-name: CI
+name: Build and push package to PyPI
 
 on:
   push:
