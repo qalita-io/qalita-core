@@ -19,7 +19,7 @@ def config_paths():
         "pack_conf": os.path.join(base_path, "data", "pack_conf.json"),
         "source_conf": os.path.join(base_path, "data", "source_conf.json"),
         "target_conf": os.path.join(base_path, "data", "target_conf.json"),
-        "agent_file": os.path.join(base_path, "data", ".agent"),
+        "agent_file": os.path.join(base_path, "data", ".worker"),
     }
     return configs
 
@@ -409,7 +409,7 @@ class TestPackWithMissingConfigs:
         pack_conf = tmp_path / "pack_conf.json"
         source_conf = tmp_path / "source_conf.json"
         target_conf = tmp_path / "target_conf.json"
-        agent_file = tmp_path / ".agent"
+        agent_file = tmp_path / ".worker"
         
         pack_conf.write_text('{"job": {}}')
         source_conf.write_text('{"config": {}}')  # Missing 'type'
@@ -433,7 +433,7 @@ class TestPackWithMissingConfigs:
         pack_conf = tmp_path / "pack_conf.json"
         source_conf = tmp_path / "source_conf.json"
         target_conf = tmp_path / "target_conf.json"
-        agent_file = tmp_path / ".agent"
+        agent_file = tmp_path / ".worker"
         
         pack_conf.write_text('{"job": {}}')
         source_conf.write_text('{}')  # Empty

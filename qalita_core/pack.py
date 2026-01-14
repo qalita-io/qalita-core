@@ -23,7 +23,7 @@ class Pack:
         "pack_conf": "pack_conf.json",
         "source_conf": "source_conf.json",
         "target_conf": "target_conf.json",
-        "agent_file": "~/.qalita/.agent",
+        "agent_file": "~/.qalita/.worker",
     }
 
     def __init__(self, configs=None):
