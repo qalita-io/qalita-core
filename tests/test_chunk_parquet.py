@@ -36,7 +36,7 @@ def _mk_pack(tmp_path: Path, source_conf_obj: dict) -> Pack:
 
     # Reuse existing agent file in tests data
     tests_data_dir = Path(__file__).parent / "data"
-    agent_file = tests_data_dir / ".agent"
+    agent_file = tests_data_dir / ".worker"
 
     return Pack(
         configs={

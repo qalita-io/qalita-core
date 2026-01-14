@@ -55,7 +55,7 @@ pack = Pack(configs={
     "pack_conf": "./pack_conf.json",
     "source_conf": "./source_conf.json",
     "target_conf": "./target_conf.json",
-    "agent_file": "~/.qalita/.agent",
+    "agent_file": "~/.qalita/.worker",
 })
 
 # Ensure chunking/output are set (can be in pack_conf["job"] too)
