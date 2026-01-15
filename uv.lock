@@ -1610,7 +1610,7 @@ wheels = [
 
 [[package]]
 name = "qalita-core"
-version = "0.0.0.dev0"
+version = "0.0.0.dev"
 source = { editable = "." }
 dependencies = [
     { name = "azure-storage-blob" },
