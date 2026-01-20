@@ -1,7 +1,7 @@
 # QALITA Core
 
 <p align="center">
-  <img width="250px" height="auto" src="https://cloud.platform.qalita.io/logo.svg" style="max-width:250px;"/>
+  <img width="250px" height="auto" src="https://app.platform.qalita.io/logo.svg" style="max-width:250px;"/>
 </p>
 
 QALITA Core is a lightweight helper library used by QALITA packs to load data from multiple sources, materialize them to Parquet in deterministic chunks, and share common utilities (sanitization and aggregation helpers).
