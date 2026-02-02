@@ -6,7 +6,7 @@ import os
 import json
 import base64
 import logging
-from qalita_core.data_source_opener import get_data_source
+from qalita_core.data_source_opener import get_data_source, cleanup_parquet_files
 from urllib.parse import urlsplit
 import math
 from decimal import Decimal
@@ -42,11 +42,50 @@ class Pack:
         self.recommendations = PlatformAsset("recommendations")
         self.schemas = PlatformAsset("schemas")
 
+        # Initialize paths for cleanup tracking
+        self.paths_source = None
+        self.paths_target = None
+        self.df_source = None
+        self.df_target = None
+
         # Validate configurations
         if not self.source_config:
             self.logger.error("Source configuration is empty.")
         elif "type" not in self.source_config:
             self.logger.error("Source configuration is missing the 'type' key.")
+
+    def __enter__(self):
+        """Context manager entry - returns self for use in 'with' statements."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup of temporary parquet files."""
+        self.cleanup()
+        # Don't suppress exceptions - return False or None
+        return False
+
+    def cleanup(self):
+        """
+        Remove temporary parquet files created during data loading.
+
+        This method should be called when the analysis is complete (success or failure)
+        to free up disk space. It is automatically called when using Pack as a context manager.
+
+        Returns:
+            int: Total number of files removed.
+        """
+        total_removed = 0
+        if self.paths_source:
+            removed = cleanup_parquet_files(self.paths_source, self.logger)
+            self.logger.debug(f"Cleaned up {removed} source parquet file(s)")
+            total_removed += removed
+        if self.paths_target:
+            removed = cleanup_parquet_files(self.paths_target, self.logger)
+            self.logger.debug(f"Cleaned up {removed} target parquet file(s)")
+            total_removed += removed
+        if total_removed > 0:
+            self.logger.info(f"Cleaned up {total_removed} temporary parquet file(s)")
+        return total_removed
 
     def load_agent_config(self, agent_file_path):
         try:

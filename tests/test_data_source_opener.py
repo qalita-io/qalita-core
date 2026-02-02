@@ -442,9 +442,11 @@ class TestMongoDBSource:
         source = MongoDBSource(config)
         assert source.config == config
 
-    def test_get_data_not_implemented(self):
-        source = MongoDBSource({})
-        with pytest.raises(NotImplementedError):
+    def test_get_data_requires_database(self):
+        """Test that MongoDBSource requires database in config."""
+        source = MongoDBSource({"connection_string": "mongodb://localhost:27017"})
+        with pytest.raises((ImportError, ValueError)):
+            # Will raise ImportError if pymongo not available, or ValueError if database missing
             source.get_data()
 
 
