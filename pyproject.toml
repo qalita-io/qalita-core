@@ -34,6 +34,23 @@ dependencies = [
     "hdfs>=2.7.3",
     "paramiko>=3.4.0",
     "oracledb>=2.5.0",
+    # Data warehouse drivers
+    "snowflake-sqlalchemy>=1.5.0",
+    "sqlalchemy-bigquery>=1.9.0",
+    "databricks-sql-connector>=3.0.0",
+    "redshift-connector>=2.1.0",
+    "clickhouse-sqlalchemy>=0.3.0",
+    "duckdb>=0.10.0",
+    "trino>=0.327.0",
+    # Enterprise database drivers
+    "teradatasqlalchemy>=17.20.0",
+    "sqlalchemy-hana>=0.5.0",
+    "hdbcli>=2.10.0",
+    "cassandra-driver>=3.28.0",
+    "elasticsearch>=8.0.0",
+    "ibm-db-sa>=0.4.0",
+    "pyathena>=3.0.0",
+    "pymssql>=2.2.0",
 ]
 
 [project.optional-dependencies]

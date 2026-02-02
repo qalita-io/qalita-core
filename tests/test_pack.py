@@ -4,6 +4,7 @@ Tests for qalita_core.pack module
 """
 
 from qalita_core.pack import Pack, ConfigLoader, PlatformAsset, _sanitize_for_json
+from qalita_core.data_source_opener import cleanup_parquet_files
 import pytest
 import os
 import json
@@ -450,3 +451,162 @@ class TestPackWithMissingConfigs:
             "agent_file": str(agent_file),
         })
         assert pack.source_config == {}
+
+
+class TestCleanupParquetFiles:
+    """Tests for cleanup_parquet_files function."""
+
+    def test_cleanup_removes_files(self, tmp_path):
+        # Create some fake parquet files
+        files = []
+        for i in range(3):
+            f = tmp_path / f"test_part_{i}.parquet"
+            f.write_text("fake parquet content")
+            files.append(str(f))
+        
+        # Verify files exist
+        for f in files:
+            assert os.path.exists(f)
+        
+        # Cleanup
+        removed = cleanup_parquet_files(files)
+        
+        # Verify files are removed
+        assert removed == 3
+        for f in files:
+            assert not os.path.exists(f)
+
+    def test_cleanup_handles_nonexistent_files(self, tmp_path):
+        files = [
+            str(tmp_path / "nonexistent1.parquet"),
+            str(tmp_path / "nonexistent2.parquet"),
+        ]
+        
+        # Should not raise an error
+        removed = cleanup_parquet_files(files)
+        assert removed == 0
+
+    def test_cleanup_handles_empty_list(self):
+        removed = cleanup_parquet_files([])
+        assert removed == 0
+
+    def test_cleanup_handles_none(self):
+        removed = cleanup_parquet_files(None)
+        assert removed == 0
+
+    def test_cleanup_partial_success(self, tmp_path):
+        # Create one real file
+        real_file = tmp_path / "real.parquet"
+        real_file.write_text("content")
+        
+        files = [
+            str(real_file),
+            str(tmp_path / "nonexistent.parquet"),
+        ]
+        
+        removed = cleanup_parquet_files(files)
+        assert removed == 1
+        assert not os.path.exists(real_file)
+
+
+class TestPackCleanup:
+    """Tests for Pack cleanup method and context manager."""
+
+    def test_cleanup_method(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
+        
+        # Load data
+        pack.load_data("source")
+        
+        # Verify parquet files exist
+        assert pack.paths_source is not None
+        for p in pack.paths_source:
+            assert os.path.exists(p)
+        
+        # Cleanup
+        removed = pack.cleanup()
+        
+        # Verify files are removed
+        assert removed > 0
+        for p in pack.paths_source:
+            assert not os.path.exists(p)
+
+    def test_cleanup_source_and_target(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
+        
+        # Load both source and target
+        pack.load_data("source")
+        pack.load_data("target")
+        
+        # Verify parquet files exist
+        all_paths = pack.paths_source + pack.paths_target
+        for p in all_paths:
+            assert os.path.exists(p)
+        
+        # Cleanup
+        removed = pack.cleanup()
+        
+        # Verify all files are removed
+        assert removed == len(all_paths)
+        for p in all_paths:
+            assert not os.path.exists(p)
+
+    def test_cleanup_without_loading_data(self, config_paths):
+        pack = Pack(configs=config_paths)
+        
+        # Should not raise an error
+        removed = pack.cleanup()
+        assert removed == 0
+
+    def test_context_manager_cleanup(self, config_paths, tmp_path):
+        paths_to_check = None
+        
+        with Pack(configs=config_paths) as pack:
+            pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
+            pack.load_data("source")
+            paths_to_check = list(pack.paths_source)
+            
+            # Verify files exist inside the context
+            for p in paths_to_check:
+                assert os.path.exists(p)
+        
+        # After exiting context, files should be cleaned up
+        for p in paths_to_check:
+            assert not os.path.exists(p)
+
+    def test_context_manager_cleanup_on_exception(self, config_paths, tmp_path):
+        paths_to_check = None
+        
+        try:
+            with Pack(configs=config_paths) as pack:
+                pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
+                pack.load_data("source")
+                paths_to_check = list(pack.paths_source)
+                
+                # Verify files exist inside the context
+                for p in paths_to_check:
+                    assert os.path.exists(p)
+                
+                # Raise an exception
+                raise ValueError("Test exception")
+        except ValueError:
+            pass
+        
+        # After exception, files should still be cleaned up
+        for p in paths_to_check:
+            assert not os.path.exists(p)
+
+    def test_double_cleanup_safe(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
+        pack.load_data("source")
+        
+        # First cleanup
+        removed1 = pack.cleanup()
+        assert removed1 > 0
+        
+        # Second cleanup should be safe (files already removed)
+        removed2 = pack.cleanup()
+        assert removed2 == 0
