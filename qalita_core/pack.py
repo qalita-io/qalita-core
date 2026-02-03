@@ -6,11 +6,23 @@ import os
 import json
 import base64
 import logging
+from typing import List, Optional, Union, TYPE_CHECKING
 from qalita_core.data_source_opener import get_data_source, cleanup_parquet_files
 from urllib.parse import urlsplit
 import math
 from decimal import Decimal
 import datetime as _dt
+
+# Polars support for big data (100GB+)
+try:
+    import polars as pl
+    POLARS_AVAILABLE = True
+except ImportError:
+    pl = None  # type: ignore
+    POLARS_AVAILABLE = False
+
+if TYPE_CHECKING:
+    import polars as pl
 
 
 class Pack:
@@ -113,7 +125,17 @@ class Pack:
             self.logger.error(f"Error loading agent configuration: {e}")
             return {}
 
-    def load_data(self, trigger, table_or_query=None):
+    def load_data(self, trigger, table_or_query=None) -> List[str]:
+        """
+        Load data from source/target and return list of parquet file paths.
+        
+        Args:
+            trigger: "source" or "target"
+            table_or_query: Optional table name or SQL query
+            
+        Returns:
+            List of parquet file paths containing the loaded data.
+        """
         source_conf = self.source_config if trigger == "source" else self.target_config
         pack_conf = self.pack_config
         ds = get_data_source(source_conf)
@@ -147,6 +169,114 @@ class Pack:
             self.paths_target = paths
             self.df_target = paths
             return self.paths_target
+
+    def scan_data(self, trigger: str) -> "pl.LazyFrame":
+        """
+        Return a Polars LazyFrame for streaming data processing.
+        
+        This is the recommended method for big data (100GB+) as it uses
+        lazy evaluation and streaming to process data without loading
+        everything into memory.
+        
+        Args:
+            trigger: "source" or "target"
+            
+        Returns:
+            Polars LazyFrame for deferred/streaming execution.
+            
+        Example:
+            ```python
+            with Pack() as pack:
+                pack.load_data("source")
+                lf = pack.scan_data("source")
+                
+                # Streaming aggregation (memory efficient)
+                stats = lf.select([
+                    pl.len().alias("row_count"),
+                    pl.all().is_not_null().sum()
+                ]).collect(engine="streaming")
+            ```
+        
+        Raises:
+            ImportError: If Polars is not installed
+            RuntimeError: If data has not been loaded yet
+        """
+        if not POLARS_AVAILABLE:
+            raise ImportError(
+                "Polars is required for scan_data(). "
+                "Install with: pip install polars>=1.0.0"
+            )
+        
+        paths = self.paths_source if trigger == "source" else self.paths_target
+        if not paths:
+            raise RuntimeError(
+                f"No data loaded for trigger '{trigger}'. "
+                f"Call load_data('{trigger}') first."
+            )
+        
+        # Scan parquet files lazily (does not load into memory)
+        return pl.scan_parquet(paths)
+
+    def get_row_count(self, trigger: str) -> int:
+        """
+        Get row count efficiently without loading all data into memory.
+        
+        Uses Polars streaming if available, falls back to parquet metadata.
+        
+        Args:
+            trigger: "source" or "target"
+            
+        Returns:
+            Total number of rows across all parquet files.
+        """
+        paths = self.paths_source if trigger == "source" else self.paths_target
+        if not paths:
+            return 0
+        
+        if POLARS_AVAILABLE:
+            try:
+                lf = pl.scan_parquet(paths)
+                return lf.select(pl.len()).collect(engine="streaming").item()
+            except Exception:
+                pass
+        
+        # Fallback: read parquet metadata
+        try:
+            import pyarrow.parquet as pq
+            total = 0
+            for path in paths:
+                pf = pq.ParquetFile(path)
+                total += pf.metadata.num_rows
+            return total
+        except Exception:
+            return 0
+
+    def estimate_memory_mb(self, trigger: str) -> float:
+        """
+        Estimate memory required to load all data into memory.
+        
+        Useful for deciding whether to use streaming or full load.
+        
+        Args:
+            trigger: "source" or "target"
+            
+        Returns:
+            Estimated memory in megabytes.
+        """
+        paths = self.paths_source if trigger == "source" else self.paths_target
+        if not paths:
+            return 0.0
+        
+        # Sum file sizes as rough estimate (parquet is compressed)
+        total_bytes = 0
+        for path in paths:
+            try:
+                total_bytes += os.path.getsize(path)
+            except OSError:
+                pass
+        
+        # Multiply by ~3-5x for decompression overhead
+        return (total_bytes * 4) / (1024 * 1024)
 
 
 class ConfigLoader:

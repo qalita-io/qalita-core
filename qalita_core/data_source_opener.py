@@ -4,12 +4,27 @@
 
 import os
 import glob
+import logging
 import pandas as pd
-from typing import Optional, List, Iterable
+from typing import Optional, List, Iterable, Union
 from sqlalchemy import create_engine, inspect, text
 from abc import ABC, abstractmethod
 from pathlib import Path
 from qalita_core.utils import slugify
+
+# Polars for big data streaming (optional but recommended for 100GB+)
+try:
+    import polars as pl
+    POLARS_AVAILABLE = True
+except ImportError:
+    POLARS_AVAILABLE = False
+    pl = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# Configuration for big data mode
+USE_POLARS_BY_DEFAULT = True  # Set to False to use pandas by default
+STREAMING_THRESHOLD_BYTES = 1_000_000_000  # 1GB - use streaming above this size
 
 DEFAULT_PORTS = {
     "5432": "postgresql",
@@ -114,6 +129,208 @@ def _write_pandas_chunks(
     return paths
 
 
+# -----------------------------
+# Polars-based streaming utilities (for big data 100GB+)
+# -----------------------------
+
+
+def _should_use_polars(file_path: str, pack_config: Optional[dict] = None) -> bool:
+    """Determine if Polars should be used based on file size and configuration."""
+    if not POLARS_AVAILABLE:
+        return False
+    
+    # Check explicit configuration
+    if pack_config:
+        use_polars = pack_config.get("use_polars")
+        if use_polars is not None:
+            return bool(use_polars)
+    
+    # Check file size for automatic decision
+    if USE_POLARS_BY_DEFAULT:
+        try:
+            file_size = os.path.getsize(file_path)
+            return file_size > STREAMING_THRESHOLD_BYTES
+        except OSError:
+            pass
+    
+    return USE_POLARS_BY_DEFAULT
+
+
+def _write_polars_to_parquet(
+    lf: "pl.LazyFrame",
+    output_dir: str,
+    base_name: str,
+    chunk_rows: int = 100000,
+) -> List[str]:
+    """
+    Write a Polars LazyFrame to parquet file(s) using streaming.
+    
+    For large datasets, this uses Polars' streaming engine to avoid
+    loading everything into memory.
+    """
+    if not POLARS_AVAILABLE:
+        raise ImportError("Polars is required for streaming write")
+    
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output_path = _build_parquet_path(output_dir, base_name, 1)
+    
+    try:
+        # Use sink_parquet for streaming write (memory efficient)
+        lf.sink_parquet(
+            output_path,
+            compression="zstd",
+            row_group_size=chunk_rows,
+        )
+        return [output_path]
+    except Exception as e:
+        logger.warning(f"Streaming write failed, falling back to collect: {e}")
+        # Fallback: collect and write (uses more memory)
+        try:
+            df = lf.collect(engine="streaming")
+        except Exception:
+            df = lf.collect()
+        df.write_parquet(output_path, compression="zstd", row_group_size=chunk_rows)
+        return [output_path]
+
+
+def _load_csv_polars(
+    file_path: str,
+    output_dir: str,
+    base_name: str,
+    skip_rows: int = 0,
+    chunk_rows: int = 100000,
+) -> List[str]:
+    """
+    Load CSV file using Polars streaming for memory-efficient processing.
+    
+    This uses Polars' lazy evaluation to process files larger than memory.
+    """
+    if not POLARS_AVAILABLE:
+        raise ImportError("Polars is required for streaming CSV load")
+    
+    logger.info(f"Loading CSV with Polars streaming: {file_path}")
+    
+    # Create lazy scan (does not load data into memory)
+    lf = pl.scan_csv(
+        file_path,
+        skip_rows=skip_rows,
+        ignore_errors=True,
+        infer_schema_length=10000,
+        encoding="utf8",
+    )
+    
+    return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
+
+
+def _load_excel_polars(
+    file_path: str,
+    output_dir: str,
+    base_name: str,
+    skip_rows: int = 0,
+    chunk_rows: int = 100000,
+) -> List[str]:
+    """
+    Load Excel file using Polars.
+    
+    Note: Excel files cannot be truly streamed, but Polars is more
+    memory-efficient than pandas for the same data.
+    """
+    if not POLARS_AVAILABLE:
+        raise ImportError("Polars is required for Excel load")
+    
+    logger.info(f"Loading Excel with Polars: {file_path}")
+    
+    try:
+        # Polars read_excel
+        df = pl.read_excel(
+            file_path,
+            read_options={"skip_rows": skip_rows} if skip_rows else None,
+        )
+        lf = df.lazy()
+        return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
+    except Exception as e:
+        logger.warning(f"Polars Excel read failed: {e}, falling back to pandas")
+        raise
+
+
+def _load_json_polars(
+    file_path: str,
+    output_dir: str,
+    base_name: str,
+    ndjson: bool = False,
+    chunk_rows: int = 100000,
+) -> List[str]:
+    """
+    Load JSON/NDJSON file using Polars.
+    
+    NDJSON (newline-delimited JSON) can be streamed efficiently.
+    Regular JSON must be loaded fully.
+    """
+    if not POLARS_AVAILABLE:
+        raise ImportError("Polars is required for JSON load")
+    
+    logger.info(f"Loading JSON with Polars (ndjson={ndjson}): {file_path}")
+    
+    if ndjson:
+        # NDJSON can be scanned lazily
+        lf = pl.scan_ndjson(file_path)
+    else:
+        # Regular JSON must be read fully
+        df = pl.read_json(file_path)
+        lf = df.lazy()
+    
+    return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
+
+
+def _load_parquet_polars(
+    file_path: str,
+    output_dir: str,
+    base_name: str,
+) -> List[str]:
+    """
+    For parquet input, just return the path (no conversion needed).
+    
+    Polars and pandas can both read parquet efficiently.
+    """
+    # Parquet is already optimized, just return the path
+    return [file_path]
+
+
+def _load_database_polars(
+    connection_string: str,
+    sql: str,
+    output_dir: str,
+    base_name: str,
+    chunk_rows: int = 100000,
+) -> List[str]:
+    """
+    Load data from database using Polars for better memory efficiency.
+    
+    Polars read_database is generally more memory-efficient than pandas.
+    """
+    if not POLARS_AVAILABLE:
+        raise ImportError("Polars is required for database streaming")
+    
+    logger.info(f"Loading from database with Polars: {base_name}")
+    
+    try:
+        # Use Polars read_database (requires connectorx or adbc for best performance)
+        df = pl.read_database(sql, connection_string)
+        lf = df.lazy()
+        return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
+    except Exception as e:
+        logger.warning(f"Polars read_database failed: {e}")
+        raise
+
+
+def _get_connection_string_from_engine(engine) -> Optional[str]:
+    """Extract connection string from SQLAlchemy engine for Polars."""
+    try:
+        return str(engine.url)
+    except Exception:
+        return None
+
+
 class FileSource(DataSource):
     def __init__(self, file_path):
         self.file_path = file_path
@@ -145,8 +362,27 @@ class FileSource(DataSource):
         base_name = _build_base_name(
             "file", os.path.splitext(os.path.basename(file_path))[0]
         )
-        # CSV: stream with chunksize
+        
+        # Check if we should use Polars for big data streaming
+        use_polars = _should_use_polars(file_path, pack_config)
+        
+        # Parquet files: pass through (already optimized format)
+        if file_path.lower().endswith((".parquet", ".pq")):
+            return [file_path]
+        
+        # CSV: use Polars streaming for big files, pandas for smaller ones
         if file_path.endswith(".csv"):
+            if use_polars:
+                try:
+                    return _load_csv_polars(
+                        file_path, output_dir, base_name,
+                        skip_rows=int(skiprows),
+                        chunk_rows=int(chunk_rows),
+                    )
+                except Exception as e:
+                    logger.warning(f"Polars CSV load failed, falling back to pandas: {e}")
+            
+            # Pandas fallback (original implementation)
             df_iter = pd.read_csv(
                 file_path,
                 low_memory=False,
@@ -158,8 +394,19 @@ class FileSource(DataSource):
             )
             return _write_pandas_chunks(df_iter, output_dir, base_name)
 
-        # XLSX: stream via openpyxl read_only
+        # XLSX: use Polars if available for better memory efficiency
         if file_path.endswith(".xlsx"):
+            if use_polars:
+                try:
+                    return _load_excel_polars(
+                        file_path, output_dir, base_name,
+                        skip_rows=int(skiprows),
+                        chunk_rows=int(chunk_rows),
+                    )
+                except Exception as e:
+                    logger.warning(f"Polars Excel load failed, falling back to pandas: {e}")
+            
+            # Pandas fallback with openpyxl streaming
             try:
                 from openpyxl import load_workbook
             except Exception:
@@ -206,6 +453,28 @@ class FileSource(DataSource):
                 _write_df_to_parquet(df, path)
                 paths.append(path)
             return paths
+        
+        # JSON files
+        if file_path.lower().endswith(".json"):
+            ndjson = (pack_config or {}).get("json_lines", False)
+            if use_polars:
+                try:
+                    return _load_json_polars(
+                        file_path, output_dir, base_name,
+                        ndjson=ndjson,
+                        chunk_rows=int(chunk_rows),
+                    )
+                except Exception as e:
+                    logger.warning(f"Polars JSON load failed, falling back to pandas: {e}")
+            
+            # Pandas fallback
+            if ndjson:
+                df_iter = pd.read_json(file_path, lines=True, chunksize=int(chunk_rows))
+                return _write_pandas_chunks(df_iter, output_dir, base_name)
+            else:
+                df = pd.read_json(file_path)
+                path = _build_parquet_path(output_dir, base_name, 1)
+                return [_write_df_to_parquet(df, path)]
 
         raise ValueError(
             f"Unsupported file extension or missing 'skiprows' for file: {file_path}"
@@ -294,7 +563,7 @@ class DatabaseSource(DataSource):
             for table_name in table_names:
                 all_paths.extend(
                     self._read_table_to_parquet(
-                        table_name, schema, output_dir, chunk_rows, dialect_name
+                        table_name, schema, output_dir, chunk_rows, dialect_name, pack_config
                     )
                 )
             return all_paths
@@ -306,7 +575,7 @@ class DatabaseSource(DataSource):
             for table_name in table_names:
                 all_paths.extend(
                     self._read_table_to_parquet(
-                        table_name, schema, output_dir, chunk_rows, dialect_name
+                        table_name, schema, output_dir, chunk_rows, dialect_name, pack_config
                     )
                 )
             return all_paths
@@ -315,10 +584,24 @@ class DatabaseSource(DataSource):
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name or "db", "query")
+                
+                # Try Polars if available
+                use_polars = POLARS_AVAILABLE and (pack_config or {}).get("use_polars", USE_POLARS_BY_DEFAULT)
+                if use_polars:
+                    try:
+                        conn_str = _get_connection_string_from_engine(self.engine)
+                        if conn_str:
+                            return _load_database_polars(
+                                conn_str, table_or_query, output_dir, base_name, chunk_rows
+                            )
+                    except Exception as e:
+                        logger.warning(f"Polars query execution failed, falling back to pandas: {e}")
+                
+                # Pandas fallback
                 df_iter = pd.read_sql(table_or_query, self.engine, chunksize=chunk_rows)
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
             return self._read_table_to_parquet(
-                table_or_query, schema, output_dir, chunk_rows, dialect_name
+                table_or_query, schema, output_dir, chunk_rows, dialect_name, pack_config
             )
 
         raise TypeError(
@@ -359,6 +642,7 @@ class DatabaseSource(DataSource):
         output_dir: str,
         chunk_rows: int,
         dialect_name: Optional[str],
+        pack_config: Optional[dict] = None,
     ) -> List[str]:
         effective_schema = schema
         effective_table = table_name
@@ -375,8 +659,21 @@ class DatabaseSource(DataSource):
             else effective_table
         )
         base_name = _build_base_name(dialect_name or "db", qualified)
-        # Use streaming SQL with chunksize
         sql = f"SELECT * FROM {qualified}"
+        
+        # Try Polars if available and configured
+        use_polars = POLARS_AVAILABLE and (pack_config or {}).get("use_polars", USE_POLARS_BY_DEFAULT)
+        if use_polars:
+            try:
+                conn_str = _get_connection_string_from_engine(self.engine)
+                if conn_str:
+                    return _load_database_polars(
+                        conn_str, sql, output_dir, base_name, chunk_rows
+                    )
+            except Exception as e:
+                logger.warning(f"Polars database read failed, falling back to pandas: {e}")
+        
+        # Pandas fallback with chunksize streaming
         df_iter = pd.read_sql(sql, self.engine, chunksize=int(chunk_rows))
         return _write_pandas_chunks(df_iter, output_dir, base_name)
 
@@ -1234,14 +1531,21 @@ class ClickHouseSource(DataSource):
 
 
 class DuckDBSource(DataSource):
-    """DuckDB data source (local files or MotherDuck cloud)."""
+    """DuckDB data source (local files or MotherDuck cloud).
+    
+    Optimized for big data (100GB+) using DuckDB's native COPY TO PARQUET
+    which streams data directly to parquet without loading into memory.
+    """
 
     def __init__(self, config):
         self.config = config or {}
 
     def get_data(self, table_or_query=None, pack_config=None):
         """
-        Load data from DuckDB and write Parquet chunks.
+        Load data from DuckDB and write Parquet files using streaming export.
+        
+        IMPORTANT: Uses DuckDB's native COPY TO for memory-efficient export.
+        Does NOT load data into pandas DataFrame for large datasets.
         """
         try:
             import duckdb
@@ -1252,15 +1556,15 @@ class DuckDBSource(DataSource):
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
 
         # Connect to DuckDB
-        path = self.config.get("path") or self.config.get("database", ":memory:")
+        db_path = self.config.get("path") or self.config.get("database", ":memory:")
         motherduck_token = self.config.get("motherduck_token") or self.config.get("token")
 
         if motherduck_token:
             # MotherDuck cloud connection
-            connection_string = f"md:{path}?motherduck_token={motherduck_token}"
+            connection_string = f"md:{db_path}?motherduck_token={motherduck_token}"
             conn = duckdb.connect(connection_string)
         else:
-            conn = duckdb.connect(path)
+            conn = duckdb.connect(db_path)
 
         schema = self.config.get("schema", "main")
 
@@ -1273,17 +1577,11 @@ class DuckDBSource(DataSource):
         elif isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name("duckdb", "query")
-                result = conn.execute(table_or_query)
-                df = result.df()
-                all_paths: List[str] = []
-                # Split into chunks
-                for i in range(0, len(df), chunk_rows):
-                    chunk_df = df.iloc[i:i + chunk_rows]
-                    path = _build_parquet_path(output_dir, base_name, (i // chunk_rows) + 1)
-                    _write_df_to_parquet(chunk_df, path)
-                    all_paths.append(path)
+                paths = self._export_query_to_parquet(
+                    conn, table_or_query, output_dir, base_name, chunk_rows
+                )
                 conn.close()
-                return all_paths if all_paths else [_write_df_to_parquet(df, _build_parquet_path(output_dir, base_name, 1))]
+                return paths
             table_names = [table_or_query]
         else:
             raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
@@ -1292,22 +1590,102 @@ class DuckDBSource(DataSource):
         for table_name in table_names:
             base_name = _build_base_name("duckdb", table_name)
             qualified = f"{schema}.{table_name}" if schema != "main" else table_name
-            result = conn.execute(f"SELECT * FROM {qualified}")
-            df = result.df()
-            # Split into chunks
-            if len(df) == 0:
-                path = _build_parquet_path(output_dir, base_name, 1)
-                _write_df_to_parquet(df, path)
-                all_paths.append(path)
-            else:
-                for i in range(0, len(df), chunk_rows):
-                    chunk_df = df.iloc[i:i + chunk_rows]
-                    path = _build_parquet_path(output_dir, base_name, (i // chunk_rows) + 1)
-                    _write_df_to_parquet(chunk_df, path)
-                    all_paths.append(path)
+            paths = self._export_query_to_parquet(
+                conn, f"SELECT * FROM {qualified}", output_dir, base_name, chunk_rows
+            )
+            all_paths.extend(paths)
 
         conn.close()
         return all_paths
+
+    def _export_query_to_parquet(
+        self,
+        conn,
+        query: str,
+        output_dir: str,
+        base_name: str,
+        chunk_rows: int,
+    ) -> List[str]:
+        """
+        Export query results directly to parquet using DuckDB's COPY TO.
+        
+        This is memory-efficient as DuckDB streams data directly to parquet
+        without loading into memory first.
+        """
+        output_path = _build_parquet_path(output_dir, base_name, 1)
+        
+        try:
+            # Use DuckDB's native COPY TO for streaming export (memory efficient)
+            # This exports directly from DuckDB to parquet without loading into pandas
+            copy_sql = f"""
+                COPY ({query}) TO '{output_path}'
+                (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {chunk_rows})
+            """
+            conn.execute(copy_sql)
+            logger.info(f"DuckDB streaming export to: {output_path}")
+            return [output_path]
+            
+        except Exception as e:
+            logger.warning(f"DuckDB COPY TO failed ({e}), falling back to chunked export")
+            # Fallback: use fetch_arrow_table for more efficient memory usage than df()
+            return self._export_query_chunked(conn, query, output_dir, base_name, chunk_rows)
+
+    def _export_query_chunked(
+        self,
+        conn,
+        query: str,
+        output_dir: str,
+        base_name: str,
+        chunk_rows: int,
+    ) -> List[str]:
+        """
+        Fallback: Export query results in chunks using Arrow for better memory efficiency.
+        """
+        all_paths: List[str] = []
+        
+        try:
+            # Use Arrow tables instead of pandas for better memory efficiency
+            result = conn.execute(query)
+            arrow_table = result.fetch_arrow_table()
+            
+            # Write directly from Arrow to parquet (no pandas intermediate)
+            import pyarrow.parquet as pq
+            
+            total_rows = arrow_table.num_rows
+            if total_rows == 0:
+                output_path = _build_parquet_path(output_dir, base_name, 1)
+                pq.write_table(arrow_table, output_path, compression='zstd')
+                return [output_path]
+            
+            # Split into chunks
+            part = 1
+            for i in range(0, total_rows, chunk_rows):
+                chunk = arrow_table.slice(i, min(chunk_rows, total_rows - i))
+                output_path = _build_parquet_path(output_dir, base_name, part)
+                pq.write_table(chunk, output_path, compression='zstd', row_group_size=chunk_rows)
+                all_paths.append(output_path)
+                part += 1
+            
+            return all_paths
+            
+        except Exception as e:
+            logger.warning(f"Arrow export failed ({e}), using pandas fallback")
+            # Final fallback: pandas (not recommended for big data)
+            result = conn.execute(query)
+            df = result.df()
+            
+            if len(df) == 0:
+                output_path = _build_parquet_path(output_dir, base_name, 1)
+                _write_df_to_parquet(df, output_path)
+                return [output_path]
+            
+            for i in range(0, len(df), chunk_rows):
+                chunk_df = df.iloc[i:i + chunk_rows]
+                output_path = _build_parquet_path(output_dir, base_name, (i // chunk_rows) + 1)
+                _write_df_to_parquet(chunk_df, output_path)
+                all_paths.append(output_path)
+            
+            return all_paths
 
     def _is_sql_query(self, s: str) -> bool:
         sql = s.strip().lower()
