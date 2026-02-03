@@ -150,7 +150,13 @@ class TestDuckDBSource:
         pack_config = {"parquet_output_dir": str(out_dir), "chunk_rows": 1000}
 
         paths = source.get_data("large_table", pack_config=pack_config)
-        assert len(paths) == 3  # 2500 rows / 1000 = 3 chunks
+        # DuckDB now uses streaming COPY TO PARQUET which creates a single optimized file
+        # with appropriate row groups instead of multiple chunks (more efficient for big data)
+        assert len(paths) >= 1
+        # Verify all data was exported
+        import pandas as pd
+        total_rows = sum(len(pd.read_parquet(p)) for p in paths)
+        assert total_rows == 2500
 
     def test_is_sql_query_detection(self):
         """Test SQL query detection in DuckDB source."""
@@ -1035,9 +1041,10 @@ class TestIntegration:
 
         paths = source.get_data("sales", pack_config=pack_config)
         
-        # Should create multiple chunks
-        assert len(paths) == 3  # 150 / 50 = 3
+        # DuckDB now uses streaming COPY TO PARQUET which creates a single optimized file
+        # with appropriate row groups instead of multiple chunks (more efficient for big data)
+        assert len(paths) >= 1
         
-        # Verify total data
+        # Verify total data is preserved
         total_rows = sum(len(pd.read_parquet(p)) for p in paths)
         assert total_rows == 150

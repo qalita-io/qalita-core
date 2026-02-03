@@ -2,18 +2,39 @@
 # QALITA (c) COPYRIGHT 2025 - ALL RIGHTS RESERVED -
 
 Shared aggregation helpers for packs.
+
+This module supports both pandas DataFrames and Polars LazyFrames/DataFrames.
+For big data (100GB+), use Polars methods (add_lf, add_pl) for streaming aggregation.
 """
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Iterable, Tuple
+from typing import List, Dict, Any, Iterable, Tuple, Union, TYPE_CHECKING
 import math
 import datetime as _dt
+import logging
 
+logger = logging.getLogger(__name__)
+
+# Pandas support (legacy, for backward compatibility)
 try:
     import pandas as pd  # type: ignore
-except Exception:  # pragma: no cover - pandas is expected at runtime
+    PANDAS_AVAILABLE = True
+except ImportError:  # pragma: no cover
     pd = None  # type: ignore
+    PANDAS_AVAILABLE = False
+
+# Polars support (recommended for big data)
+try:
+    import polars as pl  # type: ignore
+    POLARS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    pl = None  # type: ignore
+    POLARS_AVAILABLE = False
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import polars as pl
 
 
 def detect_chunked_from_items(
@@ -104,7 +125,11 @@ def normalize_and_dedupe_recommendations(
 
 
 class CompletenessAggregator:
-    """Accumulate completeness signals across chunks and finalize metrics/schemas."""
+    """Accumulate completeness signals across chunks and finalize metrics/schemas.
+    
+    Supports both pandas DataFrames and Polars LazyFrames/DataFrames.
+    For big data (100GB+), use add_lf() with Polars LazyFrame for streaming aggregation.
+    """
 
     def __init__(self) -> None:
         self.total_rows: int = 0
@@ -114,8 +139,9 @@ class CompletenessAggregator:
         self.unique_columns: set[str] = set()
 
     def add_df(self, df: "pd.DataFrame") -> None:  # type: ignore[name-defined]
-        if pd is None:
-            raise RuntimeError("pandas is required for CompletenessAggregator")
+        """Add pandas DataFrame statistics (legacy method)."""
+        if not PANDAS_AVAILABLE:
+            raise RuntimeError("pandas is required for add_df()")
         rows = int(len(df))
         cols_list = list(df.columns)
         self.unique_columns.update(cols_list)
@@ -137,6 +163,80 @@ class CompletenessAggregator:
         self.total_rows += rows
         self.total_non_null_cells += non_null_cells
         self.total_cells += rows * max(len(cols_list), 1)
+
+    def add_lf(self, lf: "pl.LazyFrame", *, streaming: bool = True) -> None:
+        """Add Polars LazyFrame statistics using streaming aggregation.
+        
+        This is memory-efficient for big data (100GB+) as it processes
+        data in streaming mode without loading everything into memory.
+        
+        Args:
+            lf: Polars LazyFrame
+            streaming: Use streaming mode for collection (default: True)
+        """
+        if not POLARS_AVAILABLE:
+            raise RuntimeError("polars is required for add_lf()")
+        
+        # Get schema for column names
+        schema = lf.collect_schema()
+        cols_list = list(schema.keys())
+        self.unique_columns.update(cols_list)
+        
+        # Compute statistics in a single streaming aggregation
+        # This is much more efficient than per-column iteration
+        agg_exprs = [
+            pl.len().alias("_row_count"),
+        ]
+        for col in cols_list:
+            agg_exprs.append(pl.col(col).is_not_null().sum().alias(f"_nn_{col}"))
+        
+        try:
+            # Use engine="streaming" for Polars 1.25+
+            if streaming:
+                stats = lf.select(agg_exprs).collect(engine="streaming")
+            else:
+                stats = lf.select(agg_exprs).collect()
+        except Exception:
+            # Fallback to non-streaming
+            stats = lf.select(agg_exprs).collect()
+        
+        rows = int(stats["_row_count"][0])
+        
+        # Update per-column stats
+        total_non_null = 0
+        for col in cols_list:
+            nn = int(stats[f"_nn_{col}"][0])
+            rec = self.per_column.get(col) or {"non_null": 0, "rows": 0}
+            rec["non_null"] += nn
+            rec["rows"] += rows
+            self.per_column[col] = rec
+            total_non_null += nn
+        
+        self.total_rows += rows
+        self.total_non_null_cells += total_non_null
+        self.total_cells += rows * max(len(cols_list), 1)
+
+    def add_pl(self, df: "pl.DataFrame") -> None:
+        """Add Polars DataFrame statistics.
+        
+        For LazyFrames, use add_lf() instead for better memory efficiency.
+        """
+        if not POLARS_AVAILABLE:
+            raise RuntimeError("polars is required for add_pl()")
+        
+        # Convert to lazy and use streaming aggregation
+        self.add_lf(df.lazy(), streaming=False)
+
+    def add(self, data: Union["pd.DataFrame", "pl.DataFrame", "pl.LazyFrame"]) -> None:
+        """Add statistics from any supported data type (auto-detection)."""
+        if POLARS_AVAILABLE and isinstance(data, pl.LazyFrame):
+            self.add_lf(data)
+        elif POLARS_AVAILABLE and isinstance(data, pl.DataFrame):
+            self.add_pl(data)
+        elif PANDAS_AVAILABLE and isinstance(data, pd.DataFrame):
+            self.add_df(data)
+        else:
+            raise TypeError(f"Unsupported data type: {type(data)}")
 
     def finalize_metrics_and_schemas(
         self, dataset_scope_name: str
@@ -327,7 +427,11 @@ def _determine_recommendation_level(proportion_outliers: float) -> str:
 
 
 class DuplicateAggregator:
-    """Aggregate duplicate statistics across chunks for a set of uniqueness columns."""
+    """Aggregate duplicate statistics across chunks for a set of uniqueness columns.
+    
+    Supports both pandas DataFrames and Polars LazyFrames/DataFrames.
+    For big data (100GB+), use add_lf() with Polars LazyFrame for streaming aggregation.
+    """
 
     def __init__(self, uniqueness_columns: Iterable[str]):
         self.uniqueness_columns = list(uniqueness_columns)
@@ -341,7 +445,7 @@ class DuplicateAggregator:
                 sanitized.append(None)
                 continue
             try:
-                if pd is not None and pd.isna(v):  # type: ignore[attr-defined]
+                if PANDAS_AVAILABLE and pd.isna(v):  # type: ignore[attr-defined]
                     sanitized.append(None)
                 else:
                     sanitized.append(v)
@@ -350,8 +454,9 @@ class DuplicateAggregator:
         return tuple(sanitized)
 
     def add_df(self, df: "pd.DataFrame") -> None:  # type: ignore[name-defined]
-        if pd is None:
-            raise RuntimeError("pandas is required for DuplicateAggregator")
+        """Add pandas DataFrame statistics (legacy method)."""
+        if not PANDAS_AVAILABLE:
+            raise RuntimeError("pandas is required for add_df()")
         self.total_rows += int(len(df))
         subset = df[self.uniqueness_columns]
         # value_counts on DataFrame returns a Series with MultiIndex keys
@@ -362,6 +467,66 @@ class DuplicateAggregator:
                     key = (key,)
                 key_t = self._sanitize_key_tuple(key)
                 self.combo_to_count[key_t] = self.combo_to_count.get(key_t, 0) + int(count)
+
+    def add_lf(self, lf: "pl.LazyFrame", *, streaming: bool = True) -> None:
+        """Add Polars LazyFrame statistics using streaming aggregation.
+        
+        This uses Polars group_by().count() which is memory-efficient for big data.
+        
+        Args:
+            lf: Polars LazyFrame
+            streaming: Use streaming mode for collection (default: True)
+        """
+        if not POLARS_AVAILABLE:
+            raise RuntimeError("polars is required for add_lf()")
+        
+        # Get row count first (use engine="streaming" for Polars 1.25+)
+        try:
+            if streaming:
+                row_count = lf.select(pl.len()).collect(engine="streaming").item()
+            else:
+                row_count = lf.select(pl.len()).collect().item()
+        except Exception:
+            row_count = lf.select(pl.len()).collect().item()
+        self.total_rows += int(row_count)
+        
+        # Use group_by().count() for memory-efficient duplicate detection
+        # This aggregates without loading all unique combinations into memory
+        counts_lf = lf.select(self.uniqueness_columns).group_by(
+            self.uniqueness_columns
+        ).agg(pl.len().alias("_count"))
+        
+        try:
+            if streaming:
+                counts_df = counts_lf.collect(engine="streaming")
+            else:
+                counts_df = counts_lf.collect()
+        except Exception:
+            counts_df = counts_lf.collect()
+        
+        # Update combo counts
+        for row in counts_df.iter_rows(named=True):
+            key = tuple(row[col] for col in self.uniqueness_columns)
+            key_t = self._sanitize_key_tuple(key)
+            count = int(row["_count"])
+            self.combo_to_count[key_t] = self.combo_to_count.get(key_t, 0) + count
+
+    def add_pl(self, df: "pl.DataFrame") -> None:
+        """Add Polars DataFrame statistics."""
+        if not POLARS_AVAILABLE:
+            raise RuntimeError("polars is required for add_pl()")
+        self.add_lf(df.lazy(), streaming=False)
+
+    def add(self, data: Union["pd.DataFrame", "pl.DataFrame", "pl.LazyFrame"]) -> None:
+        """Add statistics from any supported data type (auto-detection)."""
+        if POLARS_AVAILABLE and isinstance(data, pl.LazyFrame):
+            self.add_lf(data)
+        elif POLARS_AVAILABLE and isinstance(data, pl.DataFrame):
+            self.add_pl(data)
+        elif PANDAS_AVAILABLE and isinstance(data, pd.DataFrame):
+            self.add_df(data)
+        else:
+            raise TypeError(f"Unsupported data type: {type(data)}")
 
     def finalize_metrics(
         self, dataset_scope_name: str
