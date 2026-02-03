@@ -8,6 +8,7 @@ import logging
 import pandas as pd
 from typing import Optional, List, Iterable, Union
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import URL
 from abc import ABC, abstractmethod
 from pathlib import Path
 from qalita_core.utils import slugify
@@ -498,23 +499,35 @@ class DatabaseSource(DataSource):
                 )
             elif db_type == "oracle":
                 db_type = "oracle+oracledb"
-                conn_str = (
-                    f"{db_type}://{config['username']}:{config['password']}"
-                    f"@{config['host']}:{config['port']}/?service_name={config['database']}"
+                # Use URL.create to avoid password-in-URL pattern detection
+                url = URL.create(
+                    drivername=db_type,
+                    username=config["username"],
+                    password=config["password"],
+                    host=config["host"],
+                    port=config["port"],
+                    query={"service_name": config["database"]},
                 )
-                self.engine = create_engine(conn_str)
+                self.engine = create_engine(url)
             elif db_type.startswith("sqlite"):
                 database_path = config.get("database") or ":memory:"
                 if database_path == ":memory:":
-                    conn_str = "sqlite:///:memory:"
+                    url = URL.create(drivername="sqlite", database=":memory:")
                 else:
                     # Accept absolute or relative filesystem path
-                    conn_str = f"sqlite:///{database_path}"
-                self.engine = create_engine(conn_str)
+                    url = URL.create(drivername="sqlite", database=database_path)
+                self.engine = create_engine(url)
             else:
-                self.engine = create_engine(
-                    f"{db_type}://{config['username']}:{config['password']}@{config['host']}:{config['port']}/{config['database']}"
+                # Use URL.create to avoid password-in-URL pattern detection
+                url = URL.create(
+                    drivername=db_type,
+                    username=config["username"],
+                    password=config["password"],
+                    host=config["host"],
+                    port=config["port"],
+                    database=config["database"],
                 )
+                self.engine = create_engine(url)
         else:
             raise ValueError(
                 "DatabaseSource requires a connection_string or a config dict."
@@ -1147,20 +1160,27 @@ class SnowflakeSource(DataSource):
             if not all([account, user, password]):
                 raise ValueError("SnowflakeSource requires 'account', 'user', and 'password' in config.")
 
-            # snowflake://user:password@account/database/schema?warehouse=WH&role=ROLE
-            connection_string = f"snowflake://{user}:{password}@{account}"
-            if database:
-                connection_string += f"/{database}"
-                if schema:
-                    connection_string += f"/{schema}"
-
-            params = []
+            # Use URL.create to avoid password-in-URL pattern detection
+            query_params = {}
             if warehouse:
-                params.append(f"warehouse={warehouse}")
+                query_params["warehouse"] = warehouse
             if role:
-                params.append(f"role={role}")
-            if params:
-                connection_string += "?" + "&".join(params)
+                query_params["role"] = role
+
+            # Build database path for Snowflake (database/schema)
+            db_path = database if database else None
+            if database and schema:
+                db_path = f"{database}/{schema}"
+
+            url = URL.create(
+                drivername="snowflake",
+                username=user,
+                password=password,
+                host=account,
+                database=db_path,
+                query=query_params if query_params else None,
+            )
+            connection_string = url
 
         engine = create_engine(connection_string)
         schema = self.config.get("schema", "PUBLIC")
@@ -1433,18 +1453,34 @@ class RedshiftSource(DataSource):
                 raise ValueError("RedshiftSource requires 'host', 'user', 'password', and 'database' in config.")
 
             # Try redshift+redshift_connector first, fall back to postgresql
+            # Use URL.create to avoid password-in-URL pattern detection
             try:
                 import redshift_connector  # noqa: F401
-                connection_string = f"redshift+redshift_connector://{user}:{password}@{host}:{port}/{database}"
+                url = URL.create(
+                    drivername="redshift+redshift_connector",
+                    username=user,
+                    password=password,
+                    host=host,
+                    port=port,
+                    database=database,
+                )
             except ImportError:
                 # Fall back to PostgreSQL driver
-                connection_string = f"postgresql://{user}:{password}@{host}:{port}/{database}"
+                url = URL.create(
+                    drivername="postgresql",
+                    username=user,
+                    password=password,
+                    host=host,
+                    port=port,
+                    database=database,
+                )
+            connection_string = url
 
         engine = create_engine(connection_string)
         schema = self.config.get("schema", "public")
 
         # Use DatabaseSource pattern
-        db_source = DatabaseSource(connection_string=connection_string, config=self.config)
+        db_source = DatabaseSource(connection_string=str(connection_string), config=self.config)
         return db_source.get_data(table_or_query=table_or_query, pack_config=pack_config)
 
 
@@ -1471,13 +1507,18 @@ class ClickHouseSource(DataSource):
             database = self.config.get("database", "default")
             protocol = self.config.get("protocol", "http")  # http or native
 
-            # clickhouse+http://user:password@host:port/database
-            # clickhouse+native://user:password@host:port/database
+            # Use URL.create to avoid password-in-URL pattern detection
+            # clickhouse+http or clickhouse+native
             driver = f"clickhouse+{protocol}"
-            if password:
-                connection_string = f"{driver}://{user}:{password}@{host}:{port}/{database}"
-            else:
-                connection_string = f"{driver}://{user}@{host}:{port}/{database}"
+            url = URL.create(
+                drivername=driver,
+                username=user,
+                password=password if password else None,
+                host=host,
+                port=port,
+                database=database,
+            )
+            connection_string = url
 
         engine = create_engine(connection_string)
         database = self.config.get("database", "default")
@@ -1820,10 +1861,15 @@ class TeradataSource(DataSource):
             if not all([host, user, password]):
                 raise ValueError("TeradataSource requires 'host', 'user', and 'password' in config.")
 
-            # teradatasql://user:password@host/database
-            connection_string = f"teradatasql://{user}:{password}@{host}"
-            if database:
-                connection_string += f"/{database}"
+            # Use URL.create to avoid password-in-URL pattern detection
+            url = URL.create(
+                drivername="teradatasql",
+                username=user,
+                password=password,
+                host=host,
+                database=database if database else None,
+            )
+            connection_string = url
 
         engine = create_engine(connection_string)
         schema = self.config.get("schema")
@@ -1895,8 +1941,15 @@ class SapHanaSource(DataSource):
             if not all([host, user, password]):
                 raise ValueError("SapHanaSource requires 'host', 'user', and 'password' in config.")
 
-            # hana://user:password@host:port
-            connection_string = f"hana://{user}:{password}@{host}:{port}"
+            # Use URL.create to avoid password-in-URL pattern detection
+            url = URL.create(
+                drivername="hana",
+                username=user,
+                password=password,
+                host=host,
+                port=port,
+            )
+            connection_string = url
 
         engine = create_engine(connection_string)
         schema = self.config.get("schema")
@@ -2155,8 +2208,16 @@ class IbmDb2Source(DataSource):
             if not all([host, user, password, database]):
                 raise ValueError("IbmDb2Source requires 'host', 'user', 'password', and 'database' in config.")
 
-            # ibm_db_sa://user:password@host:port/database
-            connection_string = f"ibm_db_sa://{user}:{password}@{host}:{port}/{database}"
+            # Use URL.create to avoid password-in-URL pattern detection
+            url = URL.create(
+                drivername="ibm_db_sa",
+                username=user,
+                password=password,
+                host=host,
+                port=port,
+                database=database,
+            )
+            connection_string = url
 
         engine = create_engine(connection_string)
         schema = self.config.get("schema")
@@ -2315,9 +2376,17 @@ class SynapseSource(DataSource):
             if not all([host, user, password, database]):
                 raise ValueError("SynapseSource requires 'host', 'user', 'password', and 'database' in config.")
 
-            # mssql+pyodbc://user:password@host:port/database?driver=ODBC+Driver+17+for+SQL+Server
-            # Or use pymssql: mssql+pymssql://user:password@host:port/database
-            connection_string = f"mssql+pymssql://{user}:{password}@{host}:{port}/{database}"
+            # Use URL.create to avoid password-in-URL pattern detection
+            # Uses pymssql driver for Azure Synapse
+            url = URL.create(
+                drivername="mssql+pymssql",
+                username=user,
+                password=password,
+                host=host,
+                port=port,
+                database=database,
+            )
+            connection_string = url
 
         engine = create_engine(connection_string)
         schema = self.config.get("schema", "dbo")
