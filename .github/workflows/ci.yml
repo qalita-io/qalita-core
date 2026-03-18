@@ -48,7 +48,15 @@ jobs:
             echo "No Python files to lint."
             exit 0
           fi
-          pylint --fail-under=7 $FILES
+          pylint --fail-under=8 $FILES
+      - name: Publish pylint summary
+        if: always()
+        run: |
+          {
+            echo "## Quality Gate"
+            echo ""
+            echo "- Pylint threshold: >=8"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   bandit:
     name: Bandit - Python Security Linting

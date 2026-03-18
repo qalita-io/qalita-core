@@ -1,0 +1,15 @@
+[MESSAGES CONTROL]
+disable=
+    line-too-long,
+    trailing-whitespace,
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    broad-exception-caught,
+    logging-fstring-interpolation,
+    too-many-locals,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-branches,
+    too-many-statements
+
