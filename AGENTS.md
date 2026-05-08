@@ -1,6 +1,6 @@
-# CLAUDE.md — Qalita Core
+# AGENTS.md — Qalita Core
 
-Ce fichier fournit des instructions à Claude Code et Kilo Code pour travailler sur ce dépôt.
+Ce fichier fournit des instructions aux agents IA pour travailler sur ce dépôt.
 
 ## Projet
 
