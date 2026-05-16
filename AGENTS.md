@@ -1,73 +1,88 @@
 # AGENTS.md — Qalita Core
 
-Ce fichier fournit des instructions aux agents IA pour travailler sur ce dépôt.
+Instructions for AI agents working on this repository.
 
-## Projet
+## Project
 
-**Qalita Core** — Bibliothèque Python utilisée par les packs Qalita pour charger des données multi-sources, les matérialiser en Parquet et partager des utilitaires communs.
+**Qalita Core** — Python library used by Qalita packs to load multi-source data, materialize as Parquet, and share common utilities.
 
-- **Organisation GitHub** : `qalita-io`
-- **Package PyPI** : `qalita_core`
+- **Organization** : `qalita-io`
+- **Package** : `qalita_core` (PyPI)
 - **Python** : >= 3.10
+- **Package Manager** : uv
 
-## Architecture
+## Tech Stack
 
-```
-qalita-core/
-├── qalita_core/       # Package Python principal
-│   ├── datasource/    # Abstraction DataSource + factory
-│   ├── loaders/       # Loaders par type (file, db, object storage)
-│   ├── aggregators/   # Aggregateurs partagés (completeness, outliers, duplicates, timeliness)
-│   └── utils/         # Utilitaires (sanitization, Parquet helpers)
-├── parquet/           # Données de test Parquet
-├── tests/             # Tests pytest
-└── pyproject.toml     # Dépendances (uv/hatchling)
-```
-
-## Stack technique
-
-| Composant | Technologies |
+| Component | Technologies |
 |-----------|-------------|
-| **Data processing** | Polars (principal, big data 100GB+), pandas (compatibilité legacy) |
+| **Data processing** | Polars (primary, 100GB+ datasets), pandas (legacy compat) |
 | **Formats** | pyarrow, openpyxl (Excel) |
 | **Databases** | SQLAlchemy 2, psycopg2, pymysql, pymongo, oracledb, pymssql |
 | **Data warehouses** | Snowflake, BigQuery, Databricks, Redshift, ClickHouse, DuckDB, Trino |
 | **Enterprise DB** | Teradata, SAP HANA, Cassandra, Elasticsearch, IBM DB2, Athena |
 | **Object storage** | boto3 (S3), google-cloud-storage, azure-storage-blob, hdfs, paramiko (SFTP) |
+| **Build** | hatchling |
+| **Linting** | Black, Pylint, Flake8 |
 
-## Commandes de développement
+## Dependencies
+
+See `pyproject.toml` for full dependency list. Key dependencies:
+- `polars>=1.0`, `pandas>=2.0`, `pyarrow>=14.0`
+- `sqlalchemy>=2.0`, `psycopg2-binary`, `pymongo>=4.0`
+- `boto3`, `google-cloud-storage`, `azure-storage-blob`
+
+## Build/Lint/Test Commands
 
 ```bash
-# Installer les dépendances
-uv sync
-
-# Installer avec extras dev
+# Install dependencies
 uv sync --extra dev
 
-# Lancer les tests
-uv run pytest
+# Run tests
+uv run pytest tests/ -v
 
 # Linting
-uv run black qalita_core/ tests/
+uv run black qalita_core/ tests/ --check
 uv run pylint qalita_core/
+
+# Format code
+uv run black qalita_core/ tests/
+
+# Type checking (if mypy configured)
+uv run mypy qalita_core/
 ```
 
-## Conventions de code
+## Code Conventions
 
 - **Formatter** : Black
 - **Linting** : Pylint, Flake8
-- **Tests** : pytest
-- **Data** : Préférer Polars pour le nouveau code, pandas pour la compatibilité
-- **Build** : hatchling
-- **Package manager** : uv
+- **Tests** : pytest (tests in `tests/`)
+- **Data** : Prefer Polars for new code, pandas for compatibility
+- **Imports** : Absolute imports from `qalita_core`
+- **Types** : Type hints recommended for public APIs
+- **Build** : hatchling, publish with `uv build && uv publish`
 
-## Git workflow
+## Architecture
 
-- **Tags** : Semver strict `X.Y.Z` (⚠️ PAS de préfixe `v`)
-- **Commits** : Messages en anglais, conventionnels (`feat:`, `fix:`, `chore:`)
+```
+qalita-core/
+├── qalita_core/       # Main Python package
+│   ├── datasource/    # DataSource abstraction + factory
+│   ├── loaders/       # Loaders by type (file, db, object storage)
+│   ├── aggregators/   # Shared aggregators (completeness, outliers, duplicates, timeliness)
+│   └── utils/         # Utilities (sanitization, Parquet helpers)
+├── parquet/           # Test Parquet data
+├── tests/             # pytest tests
+└── pyproject.toml     # Dependencies (uv/hatchling)
+```
 
-## Règles de sécurité
+## Git Workflow
 
-- ❌ Ne JAMAIS commiter de secrets ou credentials de base de données
-- ✅ Utiliser l'abstraction DataSource pour tout nouvel accès de données
-- ✅ Tester avec les fichiers Parquet du dossier `parquet/`
+- **Tags** : Strict semver `X.Y.Z` (⚠️ NO `v` prefix)
+- **Commits** : English, conventional commits (`feat:`, `fix:`, `chore:`)
+- **Branches** : `main` (prod), feature branches for development
+
+## Security Rules
+
+- ❌ NEVER commit secrets or database credentials
+- ✅ Use DataSource abstraction for all new data access
+- ✅ Test with Parquet files in `parquet/` directory
