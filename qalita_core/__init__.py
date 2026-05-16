@@ -1,4 +1,7 @@
-from .pandas_sanitization import install_pandas_parquet_sanitization, sanitize_dataframe_for_parquet
+from .pandas_sanitization import (
+    install_pandas_parquet_sanitization,
+    sanitize_dataframe_for_parquet,
+)
 
 # Polars-based streaming I/O for big data (100GB+)
 try:
@@ -83,5 +86,3 @@ __all__ = [
     "DuplicateAggregator",
     "TimelinessAggregator",
 ]
-
-

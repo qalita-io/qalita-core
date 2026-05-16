@@ -63,11 +63,13 @@ class TestDuckDBSource:
 
         # Create in-memory database with test data
         conn = duckdb.connect(":memory:")
-        conn.execute("CREATE TABLE test_table (id INTEGER, name VARCHAR, value DOUBLE)")
+        conn.execute(
+            "CREATE TABLE test_table (id INTEGER, name VARCHAR, value DOUBLE)"
+        )
         conn.execute("INSERT INTO test_table VALUES (1, 'Alice', 10.5)")
         conn.execute("INSERT INTO test_table VALUES (2, 'Bob', 20.3)")
         conn.execute("INSERT INTO test_table VALUES (3, 'Charlie', 30.1)")
-        
+
         # Save to file for testing
         db_path = tmp_path / "test.duckdb"
         conn.execute(f"EXPORT DATABASE '{tmp_path}/export'")
@@ -108,7 +110,9 @@ class TestDuckDBSource:
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
 
-        paths = source.get_data("SELECT * FROM items WHERE quantity > 100", pack_config=pack_config)
+        paths = source.get_data(
+            "SELECT * FROM items WHERE quantity > 100", pack_config=pack_config
+        )
         assert len(paths) > 0
 
         df = pd.read_parquet(paths[0])
@@ -155,6 +159,7 @@ class TestDuckDBSource:
         assert len(paths) >= 1
         # Verify all data was exported
         import pandas as pd
+
         total_rows = sum(len(pd.read_parquet(p)) for p in paths)
         assert total_rows == 2500
 
@@ -162,7 +167,10 @@ class TestDuckDBSource:
         """Test SQL query detection in DuckDB source."""
         source = DuckDBSource({})
         assert source._is_sql_query("SELECT * FROM table") is True
-        assert source._is_sql_query("WITH cte AS (SELECT 1) SELECT * FROM cte") is True
+        assert (
+            source._is_sql_query("WITH cte AS (SELECT 1) SELECT * FROM cte")
+            is True
+        )
         assert source._is_sql_query("PRAGMA table_info(test)") is True
         assert source._is_sql_query("my_table") is False
 
@@ -212,10 +220,12 @@ class TestParquetFileFormat:
     def test_parquet_passthrough(self, tmp_path):
         """Test that parquet files are passed through without conversion."""
         # Create a parquet file
-        df = pd.DataFrame({
-            "id": [1, 2, 3],
-            "name": ["Alice", "Bob", "Charlie"],
-        })
+        df = pd.DataFrame(
+            {
+                "id": [1, 2, 3],
+                "name": ["Alice", "Bob", "Charlie"],
+            }
+        )
         parquet_path = tmp_path / "test.parquet"
         df.to_parquet(parquet_path, engine="pyarrow")
 
@@ -241,11 +251,13 @@ class TestExcelFileFormat:
     def test_excel_file_loading(self, tmp_path):
         """Test loading Excel file."""
         excel_path = tmp_path / "test.xlsx"
-        df = pd.DataFrame({
-            "id": range(100),
-            "name": [f"Name_{i}" for i in range(100)],
-            "value": [i * 1.5 for i in range(100)],
-        })
+        df = pd.DataFrame(
+            {
+                "id": range(100),
+                "name": [f"Name_{i}" for i in range(100)],
+                "value": [i * 1.5 for i in range(100)],
+            }
+        )
         df.to_excel(excel_path, index=False, engine="openpyxl")
 
         source = FileSource(str(excel_path))
@@ -264,10 +276,12 @@ class TestExcelFileFormat:
     def test_excel_chunking(self, tmp_path):
         """Test Excel file chunking with large dataset."""
         excel_path = tmp_path / "large.xlsx"
-        df = pd.DataFrame({
-            "id": range(2500),
-            "value": [f"value_{i}" for i in range(2500)],
-        })
+        df = pd.DataFrame(
+            {
+                "id": range(2500),
+                "value": [f"value_{i}" for i in range(2500)],
+            }
+        )
         df.to_excel(excel_path, index=False, engine="openpyxl")
 
         source = FileSource(str(excel_path))
@@ -281,10 +295,12 @@ class TestExcelFileFormat:
     def test_excel_with_skiprows(self, tmp_path):
         """Test Excel loading with skiprows option."""
         excel_path = tmp_path / "test.xlsx"
-        df = pd.DataFrame({
-            "col1": ["header1", "header2", 1, 2, 3],
-            "col2": ["meta1", "meta2", "a", "b", "c"],
-        })
+        df = pd.DataFrame(
+            {
+                "col1": ["header1", "header2", 1, 2, 3],
+                "col2": ["meta1", "meta2", "a", "b", "c"],
+            }
+        )
         df.to_excel(excel_path, index=False, engine="openpyxl")
 
         source = FileSource(str(excel_path))
@@ -316,7 +332,7 @@ class TestParquetOutputValidation:
         pack_config = {"parquet_output_dir": str(out_dir)}
 
         paths = source.get_data(pack_config=pack_config)
-        
+
         # Validate with PyArrow
         for path in paths:
             table = pq.read_table(path)
@@ -357,7 +373,7 @@ class TestParquetOutputValidation:
         pack_config = {"parquet_output_dir": str(out_dir)}
 
         paths = source.get_data(pack_config=pack_config)
-        
+
         # File should have predictable naming pattern
         assert any("_part_1.parquet" in p for p in paths)
 
@@ -374,13 +390,13 @@ class TestParquetOutputValidation:
         pack_config = {"parquet_output_dir": str(out_dir), "chunk_rows": 1000}
 
         paths = source.get_data(pack_config=pack_config)
-        
+
         # Read all chunks and verify total row count
         total_rows = 0
         for path in paths:
             df = pd.read_parquet(path)
             total_rows += len(df)
-        
+
         assert total_rows == 2500
 
 
@@ -402,26 +418,32 @@ class TestErrorHandling:
         """Test error for unsupported file extension."""
         txt_path = tmp_path / "test.txt"
         txt_path.write_text("some content")
-        
+
         source = FileSource(str(txt_path))
         with pytest.raises(ValueError):
             source.get_data()
 
     def test_database_source_no_config(self):
         """Test error when DatabaseSource has no config."""
-        with pytest.raises(ValueError, match="requires a connection_string or a config"):
+        with pytest.raises(
+            ValueError, match="requires a connection_string or a config"
+        ):
             DatabaseSource()
 
     def test_s3_source_missing_path(self):
         """Test error when S3Source has no path."""
         source = S3Source({})
-        with pytest.raises(ValueError, match="requires either 'path' or 'bucket'"):
+        with pytest.raises(
+            ValueError, match="requires either 'path' or 'bucket'"
+        ):
             source.get_data()
 
     def test_gcs_source_missing_path(self):
         """Test error when GCSSource has no path."""
         source = GCSSource({})
-        with pytest.raises(ValueError, match="requires either 'path' or 'bucket'"):
+        with pytest.raises(
+            ValueError, match="requires either 'path' or 'bucket'"
+        ):
             source.get_data()
 
     def test_azure_blob_source_missing_path(self):
@@ -488,7 +510,7 @@ class TestErrorHandling:
         """Test error when directory has no supported files."""
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
-        
+
         source = FileSource(str(empty_dir))
         with pytest.raises(FileNotFoundError, match="No CSV or XLSX files"):
             source.get_data()
@@ -504,49 +526,71 @@ class TestMongoDBSourceMocked:
 
     def test_mongodb_source_init(self):
         """Test MongoDBSource initialization."""
-        config = {"connection_string": "mongodb://localhost:27017", "database": "testdb"}
+        config = {
+            "connection_string": "mongodb://localhost:27017",
+            "database": "testdb",
+        }
         source = MongoDBSource(config)
         assert source.config == config
 
     def test_mongodb_source_missing_database(self):
         """Test error when database is not specified."""
-        source = MongoDBSource({"connection_string": "mongodb://localhost:27017"})
-        
-        with patch("qalita_core.data_source_opener.MongoDBSource.get_data") as mock_get_data:
-            mock_get_data.side_effect = ValueError("MongoDBSource requires 'database' in config.")
+        source = MongoDBSource(
+            {"connection_string": "mongodb://localhost:27017"}
+        )
+
+        with patch(
+            "qalita_core.data_source_opener.MongoDBSource.get_data"
+        ) as mock_get_data:
+            mock_get_data.side_effect = ValueError(
+                "MongoDBSource requires 'database' in config."
+            )
             with pytest.raises(ValueError, match="requires 'database'"):
                 mock_get_data()
 
     def test_mongodb_get_data_mocked(self, tmp_path):
         """Test MongoDBSource data retrieval with mocked client."""
-        pytest.importorskip("pymongo", reason="pymongo not available or conflict with standalone bson")
-        
+        pytest.importorskip(
+            "pymongo",
+            reason="pymongo not available or conflict with standalone bson",
+        )
+
         with patch("pymongo.MongoClient") as mock_client_class:
             # Setup mock
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
-            
+
             mock_db = MagicMock()
             mock_client.__getitem__.return_value = mock_db
-            
+
             mock_collection = MagicMock()
             mock_db.__getitem__.return_value = mock_collection
             mock_db.list_collection_names.return_value = ["test_collection"]
-            
+
             # Mock cursor with documents - use simple dict with string _id
             mock_docs = [
-                {"_id": "507f1f77bcf86cd799439011", "name": "Alice", "value": 10},
-                {"_id": "507f1f77bcf86cd799439012", "name": "Bob", "value": 20},
+                {
+                    "_id": "507f1f77bcf86cd799439011",
+                    "name": "Alice",
+                    "value": 10,
+                },
+                {
+                    "_id": "507f1f77bcf86cd799439012",
+                    "name": "Bob",
+                    "value": 20,
+                },
             ]
             mock_collection.find.return_value = iter(mock_docs)
-            
-            source = MongoDBSource({
-                "connection_string": "mongodb://localhost:27017",
-                "database": "testdb"
-            })
+
+            source = MongoDBSource(
+                {
+                    "connection_string": "mongodb://localhost:27017",
+                    "database": "testdb",
+                }
+            )
             out_dir = tmp_path / "output"
             pack_config = {"parquet_output_dir": str(out_dir)}
-            
+
             paths = source.get_data("test_collection", pack_config=pack_config)
             assert len(paths) > 0
 
@@ -567,15 +611,17 @@ class TestSnowflakeSourceMocked:
 
     def test_snowflake_connection_string_building(self):
         """Test Snowflake connection string construction."""
-        source = SnowflakeSource({
-            "account": "myaccount",
-            "user": "myuser",
-            "password": "mypass",
-            "database": "mydb",
-            "schema": "myschema",
-            "warehouse": "mywh",
-            "role": "myrole",
-        })
+        source = SnowflakeSource(
+            {
+                "account": "myaccount",
+                "user": "myuser",
+                "password": "mypass",
+                "database": "mydb",
+                "schema": "myschema",
+                "warehouse": "mywh",
+                "role": "myrole",
+            }
+        )
         # Connection string should be built correctly
         assert source.config["account"] == "myaccount"
         assert source.config["warehouse"] == "mywh"
@@ -667,7 +713,12 @@ class TestGetDataSourceExtended:
         """Test Redshift source creation via factory."""
         source_config = {
             "type": "redshift",
-            "config": {"host": "host", "user": "user", "password": "pass", "database": "db"},
+            "config": {
+                "host": "host",
+                "user": "user",
+                "password": "pass",
+                "database": "db",
+            },
         }
         source = get_data_source(source_config)
         assert isinstance(source, RedshiftSource)
@@ -730,7 +781,12 @@ class TestGetDataSourceExtended:
         """Test IBM DB2 source creation via factory."""
         source_config = {
             "type": "ibm_db2",
-            "config": {"host": "host", "user": "user", "password": "pass", "database": "db"},
+            "config": {
+                "host": "host",
+                "user": "user",
+                "password": "pass",
+                "database": "db",
+            },
         }
         source = get_data_source(source_config)
         assert isinstance(source, IbmDb2Source)
@@ -748,7 +804,12 @@ class TestGetDataSourceExtended:
         """Test Azure Synapse source creation via factory."""
         source_config = {
             "type": "synapse",
-            "config": {"host": "host", "user": "user", "password": "pass", "database": "db"},
+            "config": {
+                "host": "host",
+                "user": "user",
+                "password": "pass",
+                "database": "db",
+            },
         }
         source = get_data_source(source_config)
         assert isinstance(source, SynapseSource)
@@ -757,7 +818,10 @@ class TestGetDataSourceExtended:
         """Test MongoDB source creation via factory."""
         source_config = {
             "type": "mongodb",
-            "config": {"connection_string": "mongodb://localhost:27017", "database": "testdb"},
+            "config": {
+                "connection_string": "mongodb://localhost:27017",
+                "database": "testdb",
+            },
         }
         source = get_data_source(source_config)
         assert isinstance(source, MongoDBSource)
@@ -766,7 +830,7 @@ class TestGetDataSourceExtended:
         """Test JSON file source creation via factory."""
         json_path = tmp_path / "test.json"
         json_path.write_text('[{"id": 1}]')
-        
+
         source_config = {
             "type": "json",
             "config": {"path": str(json_path)},
@@ -779,7 +843,7 @@ class TestGetDataSourceExtended:
         parquet_path = tmp_path / "test.parquet"
         df = pd.DataFrame({"id": [1, 2, 3]})
         df.to_parquet(parquet_path)
-        
+
         source_config = {
             "type": "parquet",
             "config": {"path": str(parquet_path)},
@@ -799,22 +863,25 @@ class TestSQLQueryDetection:
     def test_database_source_query_detection(self, tmp_path):
         """Test SQL query detection in DatabaseSource."""
         import sqlite3
-        
+
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
-        
+
         # SQL queries
         assert source._is_sql_query("SELECT * FROM table") is True
-        assert source._is_sql_query("WITH cte AS (SELECT 1) SELECT * FROM cte") is True
+        assert (
+            source._is_sql_query("WITH cte AS (SELECT 1) SELECT * FROM cte")
+            is True
+        )
         assert source._is_sql_query("SHOW TABLES") is True
         assert source._is_sql_query("DESCRIBE table") is True
         assert source._is_sql_query("PRAGMA table_info") is True
         assert source._is_sql_query("EXPLAIN SELECT * FROM t") is True
         assert source._is_sql_query("SELECT;\nmore") is True
-        
+
         # Table names
         assert source._is_sql_query("my_table") is False
         assert source._is_sql_query("schema.table") is False
@@ -873,17 +940,14 @@ class TestDataTypeHandling:
 
         paths = source.get_data(pack_config=pack_config)
         df = pd.read_parquet(paths[0])
-        
+
         assert "timestamp" in df.columns
 
     def test_null_handling(self, tmp_path):
         """Test NULL values are handled correctly."""
         csv_path = tmp_path / "test.csv"
         csv_path.write_text(
-            "id,name,value\n"
-            "1,Alice,10\n"
-            "2,,20\n"
-            "3,Charlie,\n"
+            "id,name,value\n" "1,Alice,10\n" "2,,20\n" "3,Charlie,\n"
         )
 
         source = FileSource(str(csv_path))
@@ -892,7 +956,7 @@ class TestDataTypeHandling:
 
         paths = source.get_data(pack_config=pack_config)
         df = pd.read_parquet(paths[0])
-        
+
         # Should have null values preserved
         assert df["name"].isna().sum() == 1
         assert df["value"].isna().sum() == 1
@@ -905,7 +969,7 @@ class TestDataTypeHandling:
             "1,日本語,東京\n"
             "2,Français,Paris\n"
             "3,Español,México\n",
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
         source = FileSource(str(csv_path))
@@ -914,7 +978,7 @@ class TestDataTypeHandling:
 
         paths = source.get_data(pack_config=pack_config)
         df = pd.read_parquet(paths[0])
-        
+
         assert "日本語" in df["name"].values
         assert "東京" in df["city"].values
 
@@ -930,11 +994,13 @@ class TestIntegration:
     def test_csv_to_parquet_roundtrip(self, tmp_path):
         """Test CSV to Parquet conversion preserves data."""
         csv_path = tmp_path / "test.csv"
-        original_df = pd.DataFrame({
-            "int_col": [1, 2, 3, 4, 5],
-            "float_col": [1.1, 2.2, 3.3, 4.4, 5.5],
-            "str_col": ["a", "b", "c", "d", "e"],
-        })
+        original_df = pd.DataFrame(
+            {
+                "int_col": [1, 2, 3, 4, 5],
+                "float_col": [1.1, 2.2, 3.3, 4.4, 5.5],
+                "str_col": ["a", "b", "c", "d", "e"],
+            }
+        )
         original_df.to_csv(csv_path, index=False)
 
         source = FileSource(str(csv_path))
@@ -952,12 +1018,16 @@ class TestIntegration:
     def test_database_to_parquet_roundtrip(self, tmp_path):
         """Test database to Parquet conversion preserves data."""
         import sqlite3
-        
+
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("CREATE TABLE test (id INTEGER, name TEXT, value REAL)")
-        original_data = [(1, "Alice", 10.5), (2, "Bob", 20.3), (3, "Charlie", 30.1)]
+        original_data = [
+            (1, "Alice", 10.5),
+            (2, "Bob", 20.3),
+            (3, "Charlie", 30.1),
+        ]
         cur.executemany("INSERT INTO test VALUES (?, ?, ?)", original_data)
         conn.commit()
         conn.close()
@@ -976,21 +1046,25 @@ class TestIntegration:
     def test_multiple_tables_export(self, tmp_path):
         """Test exporting multiple tables from database."""
         import sqlite3
-        
+
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        
+
         # Create multiple tables
         cur.execute("CREATE TABLE users (id INTEGER, name TEXT)")
         cur.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
-        
-        cur.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL)")
+
+        cur.execute(
+            "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL)"
+        )
         cur.execute("INSERT INTO orders VALUES (1, 1, 100.0), (2, 2, 200.0)")
-        
-        cur.execute("CREATE TABLE products (id INTEGER, name TEXT, price REAL)")
+
+        cur.execute(
+            "CREATE TABLE products (id INTEGER, name TEXT, price REAL)"
+        )
         cur.execute("INSERT INTO products VALUES (1, 'Widget', 9.99)")
-        
+
         conn.commit()
         conn.close()
 
@@ -1000,20 +1074,21 @@ class TestIntegration:
 
         # Export all tables
         paths = source.get_data("*", pack_config=pack_config)
-        
+
         # Should have parquet files for each table
         assert len(paths) >= 3
 
     def test_duckdb_full_workflow(self, tmp_path):
         """Test complete DuckDB workflow."""
         import duckdb
-        
+
         # Create database with complex data
         db_path = tmp_path / "test.duckdb"
         conn = duckdb.connect(str(db_path))
-        
+
         # Create and populate table
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE sales (
                 id INTEGER,
                 product VARCHAR,
@@ -1021,10 +1096,12 @@ class TestIntegration:
                 price DOUBLE,
                 sale_date DATE
             )
-        """)
-        
+        """
+        )
+
         for i in range(150):
-            conn.execute(f"""
+            conn.execute(
+                f"""
                 INSERT INTO sales VALUES (
                     {i},
                     'Product_{i % 10}',
@@ -1032,7 +1109,8 @@ class TestIntegration:
                     {i * 1.5},
                     DATE '2024-01-01' + INTERVAL '{i} days'
                 )
-            """)
+            """
+            )
         conn.close()
 
         source = DuckDBSource({"path": str(db_path)})
@@ -1040,11 +1118,11 @@ class TestIntegration:
         pack_config = {"parquet_output_dir": str(out_dir), "chunk_rows": 50}
 
         paths = source.get_data("sales", pack_config=pack_config)
-        
+
         # DuckDB now uses streaming COPY TO PARQUET which creates a single optimized file
         # with appropriate row groups instead of multiple chunks (more efficient for big data)
         assert len(paths) >= 1
-        
+
         # Verify total data is preserved
         total_rows = sum(len(pd.read_parquet(p)) for p in paths)
         assert total_rows == 150

@@ -5,7 +5,7 @@ DEPRECATION NOTICE:
     This module is deprecated for new code. For big data processing (100GB+),
     use Polars instead via qalita_core.polars_io which handles type conversions
     natively without the memory overhead of df.copy().
-    
+
     This module is kept for backward compatibility with existing packs that
     still use pandas DataFrames.
 """
@@ -33,7 +33,7 @@ def sanitize_dataframe_for_parquet(
 
     Returns:
         Sanitized DataFrame safe for parquet writing.
-        
+
     Operations performed:
         - Ensures column names are strings
         - Decodes bytes/bytearray to UTF-8 strings
@@ -47,7 +47,7 @@ def sanitize_dataframe_for_parquet(
             DeprecationWarning,
             stacklevel=2,
         )
-    
+
     # Avoid expensive copy for large DataFrames when possible
     if copy:
         clean_df = df.copy()
@@ -56,9 +56,13 @@ def sanitize_dataframe_for_parquet(
 
     # Ensure column names are strings
     try:
-        non_string_cols = [c for c in clean_df.columns if not isinstance(c, str)]
+        non_string_cols = [
+            c for c in clean_df.columns if not isinstance(c, str)
+        ]
         if non_string_cols:
-            clean_df.columns = [c if isinstance(c, str) else str(c) for c in clean_df.columns]
+            clean_df.columns = [
+                c if isinstance(c, str) else str(c) for c in clean_df.columns
+            ]
     except Exception:
         pass
 
@@ -70,14 +74,20 @@ def sanitize_dataframe_for_parquet(
             # Check for bytes using sampling (faster for large columns)
             try:
                 sample = series.dropna().head(1000)
-                has_bytes_like = sample.apply(lambda x: isinstance(x, (bytes, bytearray))).any()
+                has_bytes_like = sample.apply(
+                    lambda x: isinstance(x, (bytes, bytearray))
+                ).any()
             except Exception:
                 has_bytes_like = False
-            
+
             if has_bytes_like:
                 # Vectorized decode where possible
                 series = series.apply(
-                    lambda x: x.decode("utf-8", errors="replace") if isinstance(x, (bytes, bytearray)) else x
+                    lambda x: (
+                        x.decode("utf-8", errors="replace")
+                        if isinstance(x, (bytes, bytearray))
+                        else x
+                    )
                 )
 
             # Try to infer numeric type
@@ -89,7 +99,9 @@ def sanitize_dataframe_for_parquet(
                 try:
                     series = series.astype("string")
                 except Exception:
-                    series = series.apply(lambda x: None if pd.isna(x) else str(x))
+                    series = series.apply(
+                        lambda x: None if pd.isna(x) else str(x)
+                    )
 
             clean_df[column_name] = series
 
@@ -118,12 +130,12 @@ def install_pandas_parquet_sanitization() -> None:
 
         def _safe_to_parquet(self, *args, **kwargs):  # type: ignore[override]
             kwargs.setdefault("engine", "pyarrow")
-            
+
             # Skip sanitization for small DataFrames or if explicitly disabled
             skip_sanitize = kwargs.pop("_skip_sanitize", False)
             if skip_sanitize:
                 return original_to_parquet(self, *args, **kwargs)
-            
+
             try:
                 # Use copy=False for memory efficiency when writing
                 # (the original DataFrame is not modified)
@@ -134,14 +146,22 @@ def install_pandas_parquet_sanitization() -> None:
                 fallback = self.copy()
                 for column_name in fallback.columns:
                     series = fallback[column_name]
-                    if pd.api.types.is_object_dtype(series) or isinstance(series.dtype, pd.CategoricalDtype):
+                    if pd.api.types.is_object_dtype(series) or isinstance(
+                        series.dtype, pd.CategoricalDtype
+                    ):
                         series = series.apply(
-                            lambda x: x.decode("utf-8", errors="replace") if isinstance(x, (bytes, bytearray)) else x
+                            lambda x: (
+                                x.decode("utf-8", errors="replace")
+                                if isinstance(x, (bytes, bytearray))
+                                else x
+                            )
                         )
                         try:
                             series = series.astype("string")
                         except Exception:
-                            series = series.apply(lambda x: None if pd.isna(x) else str(x))
+                            series = series.apply(
+                                lambda x: None if pd.isna(x) else str(x)
+                            )
                     fallback[column_name] = series
                 return original_to_parquet(fallback, *args, **kwargs)
 
@@ -150,5 +170,3 @@ def install_pandas_parquet_sanitization() -> None:
     except Exception:
         # If monkeypatch fails for any reason, continue without it.
         pass
-
-

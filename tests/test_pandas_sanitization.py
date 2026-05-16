@@ -130,7 +130,9 @@ class TestInstallPandasParquetSanitization:
     def test_marker_attribute_set(self):
         """Test that the marker attribute is set after installation."""
         install_pandas_parquet_sanitization()
-        assert getattr(pd.DataFrame, "_qalita_safe_to_parquet_installed", False)
+        assert getattr(
+            pd.DataFrame, "_qalita_safe_to_parquet_installed", False
+        )
 
     def test_to_parquet_method_exists(self):
         """Test that to_parquet method still exists after patching."""
@@ -144,11 +146,13 @@ class TestSanitizationIntegration:
 
     def test_sanitized_df_can_write_parquet(self, tmp_path):
         """Test that sanitized dataframe can be written to parquet."""
-        df = pd.DataFrame({
-            "int_col": [1, 2, 3],
-            "str_col": ["a", "b", "c"],
-            "float_col": [1.1, 2.2, 3.3],
-        })
+        df = pd.DataFrame(
+            {
+                "int_col": [1, 2, 3],
+                "str_col": ["a", "b", "c"],
+                "float_col": [1.1, 2.2, 3.3],
+            }
+        )
         result = sanitize_dataframe_for_parquet(df)
         output_path = tmp_path / "test.parquet"
         result.to_parquet(output_path, engine="pyarrow")
@@ -157,25 +161,29 @@ class TestSanitizationIntegration:
     def test_problematic_df_can_write_after_sanitization(self, tmp_path):
         """Test that problematic dataframe can write after sanitization."""
         # Create a dataframe that might cause issues
-        df = pd.DataFrame({
-            1: [1, 2],  # Non-string column name
-            "bytes_col": [b"hello", b"world"],
-        })
+        df = pd.DataFrame(
+            {
+                1: [1, 2],  # Non-string column name
+                "bytes_col": [b"hello", b"world"],
+            }
+        )
         result = sanitize_dataframe_for_parquet(df)
         output_path = tmp_path / "test_sanitized.parquet"
         result.to_parquet(output_path, engine="pyarrow")
         assert output_path.exists()
-        
+
         # Verify data can be read back
         read_df = pd.read_parquet(output_path)
         assert len(read_df) == 2
 
     def test_categorical_df_can_write_after_sanitization(self, tmp_path):
         """Test categorical columns after sanitization."""
-        df = pd.DataFrame({
-            "cat_col": pd.Categorical(["low", "medium", "high"]),
-            "normal_col": [1, 2, 3],
-        })
+        df = pd.DataFrame(
+            {
+                "cat_col": pd.Categorical(["low", "medium", "high"]),
+                "normal_col": [1, 2, 3],
+            }
+        )
         result = sanitize_dataframe_for_parquet(df)
         output_path = tmp_path / "test_cat.parquet"
         result.to_parquet(output_path, engine="pyarrow")

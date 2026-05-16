@@ -3,7 +3,12 @@
 Tests for qalita_core.pack module
 """
 
-from qalita_core.pack import Pack, ConfigLoader, PlatformAsset, _sanitize_for_json
+from qalita_core.pack import (
+    Pack,
+    ConfigLoader,
+    PlatformAsset,
+    _sanitize_for_json,
+)
 from qalita_core.data_source_opener import cleanup_parquet_files
 import pytest
 import os
@@ -55,7 +60,9 @@ class TestPackConfigLoading:
 
     def test_pack_load_pack_config(self, pack):
         pack_config = pack.pack_config
-        assert isinstance(pack_config, dict), "Failed to load pack configuration"
+        assert isinstance(
+            pack_config, dict
+        ), "Failed to load pack configuration"
 
         expected_config = {
             "job": {"id_columns": [], "source": {"skiprows": 0}},
@@ -97,7 +104,9 @@ class TestPackConfigLoading:
 
     def test_pack_load_source_config(self, pack):
         source_config = pack.source_config
-        assert isinstance(source_config, dict), "Failed to load source configuration"
+        assert isinstance(
+            source_config, dict
+        ), "Failed to load source configuration"
 
         expected_config = {
             "config": {"path": "./tests/data/METABRIC_RNA_Mutation.xlsx"},
@@ -118,7 +127,9 @@ class TestPackConfigLoading:
 
     def test_pack_load_target_config(self, pack):
         target_config = pack.target_config
-        assert isinstance(target_config, dict), "Failed to load target configuration"
+        assert isinstance(
+            target_config, dict
+        ), "Failed to load target configuration"
 
         expected_config = {
             "config": {"path": "./tests/data/ref_bio_data.xlsx"},
@@ -141,7 +152,9 @@ class TestPackConfigLoading:
     def test_pack_load_agent_config(self, pack):
         agent_config = pack.agent_config
 
-        assert isinstance(agent_config, dict), "Failed to load agent configuration"
+        assert isinstance(
+            agent_config, dict
+        ), "Failed to load agent configuration"
 
         expected_config = {
             "user": {
@@ -222,7 +235,7 @@ class TestConfigLoader:
         config_file = tmp_path / "config.json"
         config_data = {"key": "value", "number": 42}
         config_file.write_text(json.dumps(config_data))
-        
+
         result = ConfigLoader.load_config(str(config_file))
         assert result == config_data
 
@@ -233,7 +246,7 @@ class TestConfigLoader:
     def test_load_empty_config(self, tmp_path):
         config_file = tmp_path / "empty.json"
         config_file.write_text("{}")
-        
+
         result = ConfigLoader.load_config(str(config_file))
         assert result == {}
 
@@ -330,7 +343,7 @@ class TestSanitizeForJson:
         class CustomClass:
             def __str__(self):
                 return "custom_object"
-        
+
         result = _sanitize_for_json(CustomClass())
         assert result == "custom_object"
 
@@ -364,10 +377,10 @@ class TestPlatformAsset:
         asset = PlatformAsset("metrics")
         asset.data = [{"key": "test", "value": 42}]
         asset.save()
-        
+
         output_file = tmp_path / "metrics.json"
         assert output_file.exists()
-        
+
         with open(output_file) as f:
             saved_data = json.load(f)
         assert saved_data == [{"key": "test", "value": 42}]
@@ -378,10 +391,10 @@ class TestPlatformAsset:
         # Add data with non-JSON-serializable values
         asset.data = [{"value": float("nan")}, {"date": dt.date(2024, 1, 15)}]
         asset.save()
-        
+
         output_file = tmp_path / "metrics.json"
         assert output_file.exists()
-        
+
         with open(output_file) as f:
             saved_data = json.load(f)
         # NaN should be sanitized to None
@@ -393,10 +406,10 @@ class TestPlatformAsset:
         monkeypatch.chdir(tmp_path)
         asset = PlatformAsset("schemas")
         asset.save()
-        
+
         output_file = tmp_path / "schemas.json"
         assert output_file.exists()
-        
+
         with open(output_file) as f:
             saved_data = json.load(f)
         assert saved_data == []
@@ -411,23 +424,34 @@ class TestPackWithMissingConfigs:
         source_conf = tmp_path / "source_conf.json"
         target_conf = tmp_path / "target_conf.json"
         agent_file = tmp_path / ".worker"
-        
+
         pack_conf.write_text('{"job": {}}')
         source_conf.write_text('{"config": {}}')  # Missing 'type'
-        target_conf.write_text('{"type": "file", "config": {"path": "test.csv"}}')
-        
+        target_conf.write_text(
+            '{"type": "file", "config": {"path": "test.csv"}}'
+        )
+
         # Create a valid agent file
         import base64
-        agent_data = json.dumps({"user": {}, "context": {"local": {}, "remote": {}}, "registries": []})
+
+        agent_data = json.dumps(
+            {
+                "user": {},
+                "context": {"local": {}, "remote": {}},
+                "registries": [],
+            }
+        )
         agent_file.write_text(base64.b64encode(agent_data.encode()).decode())
-        
+
         # Should not crash, just log error
-        pack = Pack(configs={
-            "pack_conf": str(pack_conf),
-            "source_conf": str(source_conf),
-            "target_conf": str(target_conf),
-            "agent_file": str(agent_file),
-        })
+        pack = Pack(
+            configs={
+                "pack_conf": str(pack_conf),
+                "source_conf": str(source_conf),
+                "target_conf": str(target_conf),
+                "agent_file": str(agent_file),
+            }
+        )
         assert pack.source_config == {"config": {}}
 
     def test_pack_with_empty_source_config(self, tmp_path):
@@ -435,21 +459,32 @@ class TestPackWithMissingConfigs:
         source_conf = tmp_path / "source_conf.json"
         target_conf = tmp_path / "target_conf.json"
         agent_file = tmp_path / ".worker"
-        
+
         pack_conf.write_text('{"job": {}}')
-        source_conf.write_text('{}')  # Empty
-        target_conf.write_text('{"type": "file", "config": {"path": "test.csv"}}')
-        
+        source_conf.write_text("{}")  # Empty
+        target_conf.write_text(
+            '{"type": "file", "config": {"path": "test.csv"}}'
+        )
+
         import base64
-        agent_data = json.dumps({"user": {}, "context": {"local": {}, "remote": {}}, "registries": []})
+
+        agent_data = json.dumps(
+            {
+                "user": {},
+                "context": {"local": {}, "remote": {}},
+                "registries": [],
+            }
+        )
         agent_file.write_text(base64.b64encode(agent_data.encode()).decode())
-        
-        pack = Pack(configs={
-            "pack_conf": str(pack_conf),
-            "source_conf": str(source_conf),
-            "target_conf": str(target_conf),
-            "agent_file": str(agent_file),
-        })
+
+        pack = Pack(
+            configs={
+                "pack_conf": str(pack_conf),
+                "source_conf": str(source_conf),
+                "target_conf": str(target_conf),
+                "agent_file": str(agent_file),
+            }
+        )
         assert pack.source_config == {}
 
 
@@ -463,14 +498,14 @@ class TestCleanupParquetFiles:
             f = tmp_path / f"test_part_{i}.parquet"
             f.write_text("fake parquet content")
             files.append(str(f))
-        
+
         # Verify files exist
         for f in files:
             assert os.path.exists(f)
-        
+
         # Cleanup
         removed = cleanup_parquet_files(files)
-        
+
         # Verify files are removed
         assert removed == 3
         for f in files:
@@ -481,7 +516,7 @@ class TestCleanupParquetFiles:
             str(tmp_path / "nonexistent1.parquet"),
             str(tmp_path / "nonexistent2.parquet"),
         ]
-        
+
         # Should not raise an error
         removed = cleanup_parquet_files(files)
         assert removed == 0
@@ -498,12 +533,12 @@ class TestCleanupParquetFiles:
         # Create one real file
         real_file = tmp_path / "real.parquet"
         real_file.write_text("content")
-        
+
         files = [
             str(real_file),
             str(tmp_path / "nonexistent.parquet"),
         ]
-        
+
         removed = cleanup_parquet_files(files)
         assert removed == 1
         assert not os.path.exists(real_file)
@@ -515,18 +550,18 @@ class TestPackCleanup:
     def test_cleanup_method(self, config_paths, tmp_path):
         pack = Pack(configs=config_paths)
         pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
-        
+
         # Load data
         pack.load_data("source")
-        
+
         # Verify parquet files exist
         assert pack.paths_source is not None
         for p in pack.paths_source:
             assert os.path.exists(p)
-        
+
         # Cleanup
         removed = pack.cleanup()
-        
+
         # Verify files are removed
         assert removed > 0
         for p in pack.paths_source:
@@ -535,19 +570,19 @@ class TestPackCleanup:
     def test_cleanup_source_and_target(self, config_paths, tmp_path):
         pack = Pack(configs=config_paths)
         pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
-        
+
         # Load both source and target
         pack.load_data("source")
         pack.load_data("target")
-        
+
         # Verify parquet files exist
         all_paths = pack.paths_source + pack.paths_target
         for p in all_paths:
             assert os.path.exists(p)
-        
+
         # Cleanup
         removed = pack.cleanup()
-        
+
         # Verify all files are removed
         assert removed == len(all_paths)
         for p in all_paths:
@@ -555,45 +590,47 @@ class TestPackCleanup:
 
     def test_cleanup_without_loading_data(self, config_paths):
         pack = Pack(configs=config_paths)
-        
+
         # Should not raise an error
         removed = pack.cleanup()
         assert removed == 0
 
     def test_context_manager_cleanup(self, config_paths, tmp_path):
         paths_to_check = None
-        
+
         with Pack(configs=config_paths) as pack:
             pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
             pack.load_data("source")
             paths_to_check = list(pack.paths_source)
-            
+
             # Verify files exist inside the context
             for p in paths_to_check:
                 assert os.path.exists(p)
-        
+
         # After exiting context, files should be cleaned up
         for p in paths_to_check:
             assert not os.path.exists(p)
 
-    def test_context_manager_cleanup_on_exception(self, config_paths, tmp_path):
+    def test_context_manager_cleanup_on_exception(
+        self, config_paths, tmp_path
+    ):
         paths_to_check = None
-        
+
         try:
             with Pack(configs=config_paths) as pack:
                 pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
                 pack.load_data("source")
                 paths_to_check = list(pack.paths_source)
-                
+
                 # Verify files exist inside the context
                 for p in paths_to_check:
                     assert os.path.exists(p)
-                
+
                 # Raise an exception
                 raise ValueError("Test exception")
         except ValueError:
             pass
-        
+
         # After exception, files should still be cleaned up
         for p in paths_to_check:
             assert not os.path.exists(p)
@@ -602,11 +639,11 @@ class TestPackCleanup:
         pack = Pack(configs=config_paths)
         pack.pack_config["job"]["parquet_output_dir"] = str(tmp_path)
         pack.load_data("source")
-        
+
         # First cleanup
         removed1 = pack.cleanup()
         assert removed1 > 0
-        
+
         # Second cleanup should be safe (files already removed)
         removed2 = pack.cleanup()
         assert removed2 == 0

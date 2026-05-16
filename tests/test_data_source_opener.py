@@ -119,11 +119,11 @@ class TestFileSource:
     def test_get_data_csv(self, tmp_path):
         csv_path = tmp_path / "test.csv"
         csv_path.write_text("col1,col2\n1,2\n3,4\n5,6\n")
-        
+
         source = FileSource(str(csv_path))
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
-        
+
         paths = source.get_data(pack_config=pack_config)
         assert isinstance(paths, list)
         assert len(paths) > 0
@@ -136,14 +136,14 @@ class TestFileSource:
             f.write("id,value\n")
             for i in range(2500):
                 f.write(f"{i},{i*2}\n")
-        
+
         source = FileSource(str(csv_path))
         out_dir = tmp_path / "output"
         pack_config = {
             "parquet_output_dir": str(out_dir),
             "chunk_rows": 1000,
         }
-        
+
         paths = source.get_data(pack_config=pack_config)
         assert len(paths) == 3  # 2500 rows / 1000 chunks = 3 files
 
@@ -151,11 +151,11 @@ class TestFileSource:
         """Test loading from directory."""
         csv_path = tmp_path / "test.csv"
         csv_path.write_text("col1,col2\n1,2\n3,4\n")
-        
+
         source = FileSource(str(tmp_path))
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
-        
+
         paths = source.get_data(pack_config=pack_config)
         assert len(paths) > 0
 
@@ -167,7 +167,7 @@ class TestFileSource:
     def test_get_data_unsupported_extension(self, tmp_path):
         txt_path = tmp_path / "test.txt"
         txt_path.write_text("some text content")
-        
+
         source = FileSource(str(txt_path))
         with pytest.raises(ValueError):
             source.get_data()
@@ -181,7 +181,7 @@ class TestDatabaseSource:
         # Create an empty database
         conn = sqlite3.connect(db_path)
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
         assert source.engine is not None
 
@@ -189,7 +189,7 @@ class TestDatabaseSource:
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
         conn.close()
-        
+
         config = {
             "port": "5000",  # SQLite port in DEFAULT_PORTS
             "database": str(db_path),
@@ -206,14 +206,16 @@ class TestDatabaseSource:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, val TEXT)")
-        cur.executemany("INSERT INTO items(val) VALUES (?)", [("a",), ("b",), ("c",)])
+        cur.executemany(
+            "INSERT INTO items(val) VALUES (?)", [("a",), ("b",), ("c",)]
+        )
         conn.commit()
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
-        
+
         paths = source.get_data("items", pack_config=pack_config)
         assert len(paths) > 0
         assert all(p.endswith(".parquet") for p in paths)
@@ -223,15 +225,19 @@ class TestDatabaseSource:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)")
-        cur.executemany("INSERT INTO t(val) VALUES (?)", [(i,) for i in range(100)])
+        cur.executemany(
+            "INSERT INTO t(val) VALUES (?)", [(i,) for i in range(100)]
+        )
         conn.commit()
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
-        
-        paths = source.get_data("SELECT * FROM t WHERE val > 50", pack_config=pack_config)
+
+        paths = source.get_data(
+            "SELECT * FROM t WHERE val > 50", pack_config=pack_config
+        )
         assert len(paths) > 0
 
     def test_get_data_all_tables(self, tmp_path):
@@ -244,11 +250,11 @@ class TestDatabaseSource:
         cur.execute("INSERT INTO table2 VALUES (2)")
         conn.commit()
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
-        
+
         paths = source.get_data("*", pack_config=pack_config)
         assert len(paths) >= 2
 
@@ -256,11 +262,14 @@ class TestDatabaseSource:
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
-        
+
         assert source._is_sql_query("SELECT * FROM table") is True
-        assert source._is_sql_query("WITH cte AS (SELECT 1) SELECT * FROM cte") is True
+        assert (
+            source._is_sql_query("WITH cte AS (SELECT 1) SELECT * FROM cte")
+            is True
+        )
         assert source._is_sql_query("my_table") is False
         assert source._is_sql_query("SELECT;multiple") is True
 
@@ -271,7 +280,7 @@ class TestGetDataSource:
     def test_file_source(self, tmp_path):
         csv_path = tmp_path / "test.csv"
         csv_path.write_text("col1\n1\n")
-        
+
         source_config = {"type": "file", "config": {"path": str(csv_path)}}
         source = get_data_source(source_config)
         assert isinstance(source, FileSource)
@@ -279,7 +288,7 @@ class TestGetDataSource:
     def test_csv_source(self, tmp_path):
         csv_path = tmp_path / "test.csv"
         csv_path.write_text("col1\n1\n")
-        
+
         source_config = {"type": "csv", "config": {"path": str(csv_path)}}
         source = get_data_source(source_config)
         assert isinstance(source, FileSource)
@@ -308,7 +317,7 @@ class TestGetDataSource:
         db_path = tmp_path / "test.db"
         conn = sqlite3.connect(db_path)
         conn.close()
-        
+
         source_config = {
             "type": "sqlite",
             "config": {"connection_string": f"sqlite:///{db_path}"},
@@ -335,7 +344,9 @@ class TestGetDataSource:
     def test_azure_blob_source(self):
         source_config = {
             "type": "azure_blob",
-            "config": {"path": "abfs://container@account.dfs.core.windows.net/key.csv"},
+            "config": {
+                "path": "abfs://container@account.dfs.core.windows.net/key.csv"
+            },
         }
         source = get_data_source(source_config)
         assert isinstance(source, AzureBlobSource)
@@ -396,7 +407,9 @@ class TestAzureBlobSource:
     """Tests for AzureBlobSource class."""
 
     def test_init(self):
-        config = {"path": "abfs://container@account.dfs.core.windows.net/key.csv"}
+        config = {
+            "path": "abfs://container@account.dfs.core.windows.net/key.csv"
+        }
         source = AzureBlobSource(config)
         assert source.config == config
 
@@ -444,7 +457,9 @@ class TestMongoDBSource:
 
     def test_get_data_requires_database(self):
         """Test that MongoDBSource requires database in config."""
-        source = MongoDBSource({"connection_string": "mongodb://localhost:27017"})
+        source = MongoDBSource(
+            {"connection_string": "mongodb://localhost:27017"}
+        )
         with pytest.raises((ImportError, ValueError)):
             # Will raise ImportError if pymongo not available, or ValueError if database missing
             source.get_data()
@@ -475,7 +490,7 @@ class TestDatabaseSourceSchemaHandling:
         cur.execute("INSERT INTO t VALUES (1)")
         conn.commit()
         conn.close()
-        
+
         config = {"schema": "main"}  # SQLite default schema
         source = DatabaseSource(
             connection_string=f"sqlite:///{db_path}",
@@ -492,11 +507,11 @@ class TestDatabaseSourceSchemaHandling:
         cur.execute("INSERT INTO items VALUES (1)")
         conn.commit()
         conn.close()
-        
+
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
         out_dir = tmp_path / "output"
         pack_config = {"parquet_output_dir": str(out_dir)}
-        
+
         # SQLite doesn't really support schemas the same way, but we test parsing
         # This should split "main.items" into schema="main", table="items"
         paths = source.get_data("items", pack_config=pack_config)

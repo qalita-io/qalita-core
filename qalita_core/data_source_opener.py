@@ -16,6 +16,7 @@ from qalita_core.utils import slugify
 # Polars for big data streaming (optional but recommended for 100GB+)
 try:
     import polars as pl
+
     POLARS_AVAILABLE = True
 except ImportError:
     POLARS_AVAILABLE = False
@@ -25,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 # Configuration for big data mode
 USE_POLARS_BY_DEFAULT = True  # Set to False to use pandas by default
-STREAMING_THRESHOLD_BYTES = 1_000_000_000  # 1GB - use streaming above this size
+STREAMING_THRESHOLD_BYTES = (
+    1_000_000_000  # 1GB - use streaming above this size
+)
 
 DEFAULT_PORTS = {
     "5432": "postgresql",
@@ -79,7 +82,9 @@ def _build_base_name(source_type: str, object_identifier: str) -> str:
     return f"{normalized_source}_{normalized_object}"
 
 
-def _build_parquet_path(output_dir: str, base_name: str, part_index: int) -> str:
+def _build_parquet_path(
+    output_dir: str, base_name: str, part_index: int
+) -> str:
     return os.path.join(output_dir, f"{base_name}_part_{part_index}.parquet")
 
 
@@ -135,17 +140,19 @@ def _write_pandas_chunks(
 # -----------------------------
 
 
-def _should_use_polars(file_path: str, pack_config: Optional[dict] = None) -> bool:
+def _should_use_polars(
+    file_path: str, pack_config: Optional[dict] = None
+) -> bool:
     """Determine if Polars should be used based on file size and configuration."""
     if not POLARS_AVAILABLE:
         return False
-    
+
     # Check explicit configuration
     if pack_config:
         use_polars = pack_config.get("use_polars")
         if use_polars is not None:
             return bool(use_polars)
-    
+
     # Check file size for automatic decision
     if USE_POLARS_BY_DEFAULT:
         try:
@@ -153,7 +160,7 @@ def _should_use_polars(file_path: str, pack_config: Optional[dict] = None) -> bo
             return file_size > STREAMING_THRESHOLD_BYTES
         except OSError:
             pass
-    
+
     return USE_POLARS_BY_DEFAULT
 
 
@@ -165,16 +172,16 @@ def _write_polars_to_parquet(
 ) -> List[str]:
     """
     Write a Polars LazyFrame to parquet file(s) using streaming.
-    
+
     For large datasets, this uses Polars' streaming engine to avoid
     loading everything into memory.
     """
     if not POLARS_AVAILABLE:
         raise ImportError("Polars is required for streaming write")
-    
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     output_path = _build_parquet_path(output_dir, base_name, 1)
-    
+
     try:
         # Use sink_parquet for streaming write (memory efficient)
         lf.sink_parquet(
@@ -190,7 +197,9 @@ def _write_polars_to_parquet(
             df = lf.collect(engine="streaming")
         except Exception:
             df = lf.collect()
-        df.write_parquet(output_path, compression="zstd", row_group_size=chunk_rows)
+        df.write_parquet(
+            output_path, compression="zstd", row_group_size=chunk_rows
+        )
         return [output_path]
 
 
@@ -203,14 +212,14 @@ def _load_csv_polars(
 ) -> List[str]:
     """
     Load CSV file using Polars streaming for memory-efficient processing.
-    
+
     This uses Polars' lazy evaluation to process files larger than memory.
     """
     if not POLARS_AVAILABLE:
         raise ImportError("Polars is required for streaming CSV load")
-    
+
     logger.info(f"Loading CSV with Polars streaming: {file_path}")
-    
+
     # Create lazy scan (does not load data into memory)
     lf = pl.scan_csv(
         file_path,
@@ -219,7 +228,7 @@ def _load_csv_polars(
         infer_schema_length=10000,
         encoding="utf8",
     )
-    
+
     return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
 
 
@@ -232,15 +241,15 @@ def _load_excel_polars(
 ) -> List[str]:
     """
     Load Excel file using Polars.
-    
+
     Note: Excel files cannot be truly streamed, but Polars is more
     memory-efficient than pandas for the same data.
     """
     if not POLARS_AVAILABLE:
         raise ImportError("Polars is required for Excel load")
-    
+
     logger.info(f"Loading Excel with Polars: {file_path}")
-    
+
     try:
         # Polars read_excel
         df = pl.read_excel(
@@ -250,7 +259,9 @@ def _load_excel_polars(
         lf = df.lazy()
         return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
     except Exception as e:
-        logger.warning(f"Polars Excel read failed: {e}, falling back to pandas")
+        logger.warning(
+            f"Polars Excel read failed: {e}, falling back to pandas"
+        )
         raise
 
 
@@ -263,15 +274,15 @@ def _load_json_polars(
 ) -> List[str]:
     """
     Load JSON/NDJSON file using Polars.
-    
+
     NDJSON (newline-delimited JSON) can be streamed efficiently.
     Regular JSON must be loaded fully.
     """
     if not POLARS_AVAILABLE:
         raise ImportError("Polars is required for JSON load")
-    
+
     logger.info(f"Loading JSON with Polars (ndjson={ndjson}): {file_path}")
-    
+
     if ndjson:
         # NDJSON can be scanned lazily
         lf = pl.scan_ndjson(file_path)
@@ -279,7 +290,7 @@ def _load_json_polars(
         # Regular JSON must be read fully
         df = pl.read_json(file_path)
         lf = df.lazy()
-    
+
     return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
 
 
@@ -290,7 +301,7 @@ def _load_parquet_polars(
 ) -> List[str]:
     """
     For parquet input, just return the path (no conversion needed).
-    
+
     Polars and pandas can both read parquet efficiently.
     """
     # Parquet is already optimized, just return the path
@@ -306,14 +317,14 @@ def _load_database_polars(
 ) -> List[str]:
     """
     Load data from database using Polars for better memory efficiency.
-    
+
     Polars read_database is generally more memory-efficient than pandas.
     """
     if not POLARS_AVAILABLE:
         raise ImportError("Polars is required for database streaming")
-    
+
     logger.info(f"Loading from database with Polars: {base_name}")
-    
+
     try:
         # Use Polars read_database (requires connectorx or adbc for best performance)
         df = pl.read_database(sql, connection_string)
@@ -341,9 +352,9 @@ class FileSource(DataSource):
         if os.path.isfile(self.file_path):
             return self._load_file(self.file_path, pack_config, output_dir)
         if os.path.isdir(self.file_path):
-            data_files = glob.glob(os.path.join(self.file_path, "*.csv")) + glob.glob(
-                os.path.join(self.file_path, "*.xlsx")
-            )
+            data_files = glob.glob(
+                os.path.join(self.file_path, "*.csv")
+            ) + glob.glob(os.path.join(self.file_path, "*.xlsx"))
             if not data_files:
                 raise FileNotFoundError(
                     "No CSV or XLSX files found in the provided path."
@@ -358,31 +369,37 @@ class FileSource(DataSource):
         skiprows = 0
         chunk_rows = (pack_config or {}).get("chunk_rows", 100000)
         if pack_config:
-            skiprows = pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
+            skiprows = (
+                pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
+            )
 
         base_name = _build_base_name(
             "file", os.path.splitext(os.path.basename(file_path))[0]
         )
-        
+
         # Check if we should use Polars for big data streaming
         use_polars = _should_use_polars(file_path, pack_config)
-        
+
         # Parquet files: pass through (already optimized format)
         if file_path.lower().endswith((".parquet", ".pq")):
             return [file_path]
-        
+
         # CSV: use Polars streaming for big files, pandas for smaller ones
         if file_path.endswith(".csv"):
             if use_polars:
                 try:
                     return _load_csv_polars(
-                        file_path, output_dir, base_name,
+                        file_path,
+                        output_dir,
+                        base_name,
                         skip_rows=int(skiprows),
                         chunk_rows=int(chunk_rows),
                     )
                 except Exception as e:
-                    logger.warning(f"Polars CSV load failed, falling back to pandas: {e}")
-            
+                    logger.warning(
+                        f"Polars CSV load failed, falling back to pandas: {e}"
+                    )
+
             # Pandas fallback (original implementation)
             df_iter = pd.read_csv(
                 file_path,
@@ -400,27 +417,37 @@ class FileSource(DataSource):
             if use_polars:
                 try:
                     return _load_excel_polars(
-                        file_path, output_dir, base_name,
+                        file_path,
+                        output_dir,
+                        base_name,
                         skip_rows=int(skiprows),
                         chunk_rows=int(chunk_rows),
                     )
                 except Exception as e:
-                    logger.warning(f"Polars Excel load failed, falling back to pandas: {e}")
-            
+                    logger.warning(
+                        f"Polars Excel load failed, falling back to pandas: {e}"
+                    )
+
             # Pandas fallback with openpyxl streaming
             try:
                 from openpyxl import load_workbook
             except Exception:
                 # Fallback: load entire file (may be memory heavy)
-                df = pd.read_excel(file_path, engine="openpyxl", skiprows=int(skiprows))
+                df = pd.read_excel(
+                    file_path, engine="openpyxl", skiprows=int(skiprows)
+                )
                 path = _build_parquet_path(output_dir, base_name, 1)
                 return [_write_df_to_parquet(df, path)]
 
-            wb = load_workbook(filename=file_path, read_only=True, data_only=True)
+            wb = load_workbook(
+                filename=file_path, read_only=True, data_only=True
+            )
             ws = wb.active
             if ws is None:
                 # Fallback: load entire file
-                df = pd.read_excel(file_path, engine="openpyxl", skiprows=int(skiprows))
+                df = pd.read_excel(
+                    file_path, engine="openpyxl", skiprows=int(skiprows)
+                )
                 path = _build_parquet_path(output_dir, base_name, 1)
                 return [_write_df_to_parquet(df, path)]
 
@@ -454,23 +481,29 @@ class FileSource(DataSource):
                 _write_df_to_parquet(df, path)
                 paths.append(path)
             return paths
-        
+
         # JSON files
         if file_path.lower().endswith(".json"):
             ndjson = (pack_config or {}).get("json_lines", False)
             if use_polars:
                 try:
                     return _load_json_polars(
-                        file_path, output_dir, base_name,
+                        file_path,
+                        output_dir,
+                        base_name,
                         ndjson=ndjson,
                         chunk_rows=int(chunk_rows),
                     )
                 except Exception as e:
-                    logger.warning(f"Polars JSON load failed, falling back to pandas: {e}")
-            
+                    logger.warning(
+                        f"Polars JSON load failed, falling back to pandas: {e}"
+                    )
+
             # Pandas fallback
             if ndjson:
-                df_iter = pd.read_json(file_path, lines=True, chunksize=int(chunk_rows))
+                df_iter = pd.read_json(
+                    file_path, lines=True, chunksize=int(chunk_rows)
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
             else:
                 df = pd.read_json(file_path)
@@ -515,7 +548,9 @@ class DatabaseSource(DataSource):
                     url = URL.create(drivername="sqlite", database=":memory:")
                 else:
                     # Accept absolute or relative filesystem path
-                    url = URL.create(drivername="sqlite", database=database_path)
+                    url = URL.create(
+                        drivername="sqlite", database=database_path
+                    )
                 self.engine = create_engine(url)
             else:
                 # Use URL.create to avoid password-in-URL pattern detection
@@ -576,7 +611,12 @@ class DatabaseSource(DataSource):
             for table_name in table_names:
                 all_paths.extend(
                     self._read_table_to_parquet(
-                        table_name, schema, output_dir, chunk_rows, dialect_name, pack_config
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                        pack_config,
                     )
                 )
             return all_paths
@@ -588,7 +628,12 @@ class DatabaseSource(DataSource):
             for table_name in table_names:
                 all_paths.extend(
                     self._read_table_to_parquet(
-                        table_name, schema, output_dir, chunk_rows, dialect_name, pack_config
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                        pack_config,
                     )
                 )
             return all_paths
@@ -597,24 +642,41 @@ class DatabaseSource(DataSource):
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name or "db", "query")
-                
+
                 # Try Polars if available
-                use_polars = POLARS_AVAILABLE and (pack_config or {}).get("use_polars", USE_POLARS_BY_DEFAULT)
+                use_polars = POLARS_AVAILABLE and (pack_config or {}).get(
+                    "use_polars", USE_POLARS_BY_DEFAULT
+                )
                 if use_polars:
                     try:
-                        conn_str = _get_connection_string_from_engine(self.engine)
+                        conn_str = _get_connection_string_from_engine(
+                            self.engine
+                        )
                         if conn_str:
                             return _load_database_polars(
-                                conn_str, table_or_query, output_dir, base_name, chunk_rows
+                                conn_str,
+                                table_or_query,
+                                output_dir,
+                                base_name,
+                                chunk_rows,
                             )
                     except Exception as e:
-                        logger.warning(f"Polars query execution failed, falling back to pandas: {e}")
-                
+                        logger.warning(
+                            f"Polars query execution failed, falling back to pandas: {e}"
+                        )
+
                 # Pandas fallback
-                df_iter = pd.read_sql(table_or_query, self.engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, self.engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
             return self._read_table_to_parquet(
-                table_or_query, schema, output_dir, chunk_rows, dialect_name, pack_config
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+                pack_config,
             )
 
         raise TypeError(
@@ -673,9 +735,11 @@ class DatabaseSource(DataSource):
         )
         base_name = _build_base_name(dialect_name or "db", qualified)
         sql = f"SELECT * FROM {qualified}"
-        
+
         # Try Polars if available and configured
-        use_polars = POLARS_AVAILABLE and (pack_config or {}).get("use_polars", USE_POLARS_BY_DEFAULT)
+        use_polars = POLARS_AVAILABLE and (pack_config or {}).get(
+            "use_polars", USE_POLARS_BY_DEFAULT
+        )
         if use_polars:
             try:
                 conn_str = _get_connection_string_from_engine(self.engine)
@@ -684,8 +748,10 @@ class DatabaseSource(DataSource):
                         conn_str, sql, output_dir, base_name, chunk_rows
                     )
             except Exception as e:
-                logger.warning(f"Polars database read failed, falling back to pandas: {e}")
-        
+                logger.warning(
+                    f"Polars database read failed, falling back to pandas: {e}"
+                )
+
         # Pandas fallback with chunksize streaming
         df_iter = pd.read_sql(sql, self.engine, chunksize=int(chunk_rows))
         return _write_pandas_chunks(df_iter, output_dir, base_name)
@@ -766,7 +832,9 @@ class DatabaseSource(DataSource):
             try:
                 with self.engine.connect() as conn:
                     result = conn.execute(
-                        text("SELECT sys_context('USERENV','CURRENT_SCHEMA') FROM dual")
+                        text(
+                            "SELECT sys_context('USERENV','CURRENT_SCHEMA') FROM dual"
+                        )
                     )
                     row = result.fetchone()
                     current_schema = row[0] if row and row[0] else None
@@ -820,7 +888,9 @@ class DatabaseSource(DataSource):
         return any(sql.startswith(token) for token in starters)
 
 
-def _infer_format_from_path(path: str, explicit_format: Optional[str] = None) -> str:
+def _infer_format_from_path(
+    path: str, explicit_format: Optional[str] = None
+) -> str:
     if explicit_format:
         return explicit_format.lower()
     lower = path.lower()
@@ -849,9 +919,13 @@ def _materialize_remote_to_parquet(
     chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
     skiprows = 0
     if pack_config:
-        skiprows = pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
+        skiprows = (
+            pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
+        )
 
-    base_name = _build_base_name("remote", os.path.splitext(os.path.basename(path))[0])
+    base_name = _build_base_name(
+        "remote", os.path.splitext(os.path.basename(path))[0]
+    )
 
     if fmt == "csv":
         df_iter = pd.read_csv(
@@ -870,12 +944,19 @@ def _materialize_remote_to_parquet(
         lines = bool((pack_config or {}).get("json_lines", False))
         if lines:
             df_iter = pd.read_json(
-                path, storage_options=storage_options, lines=True, chunksize=chunk_rows
+                path,
+                storage_options=storage_options,
+                lines=True,
+                chunksize=chunk_rows,
             )
             return _write_pandas_chunks(df_iter, output_dir, base_name)
         # Fallback: load once, write once (may be memory heavy)
         df = pd.read_json(path, storage_options=storage_options)
-        return [_write_df_to_parquet(df, _build_parquet_path(output_dir, base_name, 1))]
+        return [
+            _write_df_to_parquet(
+                df, _build_parquet_path(output_dir, base_name, 1)
+            )
+        ]
     if fmt == "excel":
         # Excel streaming from remote is complex; fallback to single load
         df = pd.read_excel(
@@ -884,9 +965,15 @@ def _materialize_remote_to_parquet(
             engine="openpyxl",
             skiprows=int(skiprows),
         )
-        return [_write_df_to_parquet(df, _build_parquet_path(output_dir, base_name, 1))]
+        return [
+            _write_df_to_parquet(
+                df, _build_parquet_path(output_dir, base_name, 1)
+            )
+        ]
     # Fallback to CSV behavior
-    df_iter = pd.read_csv(path, storage_options=storage_options, chunksize=chunk_rows)
+    df_iter = pd.read_csv(
+        path, storage_options=storage_options, chunksize=chunk_rows
+    )
     return _write_pandas_chunks(df_iter, output_dir, base_name)
 
 
@@ -1050,7 +1137,9 @@ class MongoDBSource(DataSource):
         try:
             from pymongo import MongoClient
         except ImportError:
-            raise ImportError("pymongo is required for MongoDBSource. Install with: pip install pymongo")
+            raise ImportError(
+                "pymongo is required for MongoDBSource. Install with: pip install pymongo"
+            )
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
@@ -1084,14 +1173,18 @@ class MongoDBSource(DataSource):
         db = client[database_name]
 
         # Determine collections to process
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             collections = db.list_collection_names()
         elif isinstance(table_or_query, (list, tuple, set)):
             collections = list(table_or_query)
         elif isinstance(table_or_query, str):
             collections = [table_or_query]
         else:
-            raise TypeError("table_or_query must be None, '*', a string, or a list of collection names.")
+            raise TypeError(
+                "table_or_query must be None, '*', a string, or a list of collection names."
+            )
 
         all_paths: List[str] = []
         for collection_name in collections:
@@ -1158,7 +1251,9 @@ class SnowflakeSource(DataSource):
             role = self.config.get("role")
 
             if not all([account, user, password]):
-                raise ValueError("SnowflakeSource requires 'account', 'user', and 'password' in config.")
+                raise ValueError(
+                    "SnowflakeSource requires 'account', 'user', and 'password' in config."
+                )
 
             # Use URL.create to avoid password-in-URL pattern detection
             query_params = {}
@@ -1185,17 +1280,36 @@ class SnowflakeSource(DataSource):
         engine = create_engine(connection_string)
         schema = self.config.get("schema", "PUBLIC")
 
-        return self._load_data(engine, table_or_query, schema, output_dir, chunk_rows, "snowflake")
+        return self._load_data(
+            engine, table_or_query, schema, output_dir, chunk_rows, "snowflake"
+        )
 
-    def _load_data(self, engine, table_or_query, schema, output_dir, chunk_rows, dialect_name):
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name,
+    ):
         """Common data loading logic for SQL-based sources."""
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             table_names = inspector.get_table_names(schema=schema)
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
@@ -1203,20 +1317,40 @@ class SnowflakeSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, schema, output_dir, chunk_rows, dialect_name):
+    def _read_table_to_parquet(
+        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
+    ):
         qualified = f"{schema}.{table_name}" if schema else table_name
         base_name = _build_base_name(dialect_name, qualified)
         sql = f"SELECT * FROM {qualified}"
@@ -1254,10 +1388,14 @@ class BigQuerySource(DataSource):
         if not connection_string:
             project = self.config.get("project")
             dataset = self.config.get("dataset")
-            credentials_path = self.config.get("credentials_json") or self.config.get("credentials")
+            credentials_path = self.config.get(
+                "credentials_json"
+            ) or self.config.get("credentials")
 
             if not project:
-                raise ValueError("BigQuerySource requires 'project' in config.")
+                raise ValueError(
+                    "BigQuerySource requires 'project' in config."
+                )
 
             # bigquery://project/dataset
             connection_string = f"bigquery://{project}"
@@ -1271,7 +1409,9 @@ class BigQuerySource(DataSource):
         dataset = self.config.get("dataset")
 
         # Use similar pattern to SnowflakeSource
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             try:
                 table_names = inspector.get_table_names(schema=dataset)
@@ -1280,7 +1420,9 @@ class BigQuerySource(DataSource):
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, dataset, output_dir, chunk_rows)
+                    self._read_table_to_parquet(
+                        engine, table_name, dataset, output_dir, chunk_rows
+                    )
                 )
             return all_paths
 
@@ -1288,20 +1430,30 @@ class BigQuerySource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, dataset, output_dir, chunk_rows)
+                    self._read_table_to_parquet(
+                        engine, table_name, dataset, output_dir, chunk_rows
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name("bigquery", "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, dataset, output_dir, chunk_rows)
+            return self._read_table_to_parquet(
+                engine, table_or_query, dataset, output_dir, chunk_rows
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, dataset, output_dir, chunk_rows):
+    def _read_table_to_parquet(
+        self, engine, table_name, dataset, output_dir, chunk_rows
+    ):
         qualified = f"{dataset}.{table_name}" if dataset else table_name
         base_name = _build_base_name("bigquery", qualified)
         sql = f"SELECT * FROM `{qualified}`"
@@ -1329,19 +1481,27 @@ class DatabricksSource(DataSource):
         try:
             from databricks import sql as databricks_sql
         except ImportError:
-            raise ImportError("databricks-sql-connector is required for DatabricksSource. Install with: pip install databricks-sql-connector")
+            raise ImportError(
+                "databricks-sql-connector is required for DatabricksSource. Install with: pip install databricks-sql-connector"
+            )
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
 
-        server_hostname = self.config.get("server_hostname") or self.config.get("host")
+        server_hostname = self.config.get(
+            "server_hostname"
+        ) or self.config.get("host")
         http_path = self.config.get("http_path")
-        access_token = self.config.get("access_token") or self.config.get("token")
+        access_token = self.config.get("access_token") or self.config.get(
+            "token"
+        )
         catalog = self.config.get("catalog")
         schema = self.config.get("schema")
 
         if not all([server_hostname, http_path, access_token]):
-            raise ValueError("DatabricksSource requires 'server_hostname', 'http_path', and 'access_token' in config.")
+            raise ValueError(
+                "DatabricksSource requires 'server_hostname', 'http_path', and 'access_token' in config."
+            )
 
         connection = databricks_sql.connect(
             server_hostname=server_hostname,
@@ -1358,9 +1518,13 @@ class DatabricksSource(DataSource):
             cursor.execute(f"USE SCHEMA {schema}")
 
         # Determine tables to process
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             cursor.execute("SHOW TABLES")
-            tables = [row[1] for row in cursor.fetchall()]  # table name is typically second column
+            tables = [
+                row[1] for row in cursor.fetchall()
+            ]  # table name is typically second column
         elif isinstance(table_or_query, (list, tuple, set)):
             tables = list(table_or_query)
         elif isinstance(table_or_query, str):
@@ -1391,7 +1555,9 @@ class DatabricksSource(DataSource):
                 return all_paths
             tables = [table_or_query]
         else:
-            raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+            raise TypeError(
+                "table_or_query must be None, '*', a string, or a list of table names."
+            )
 
         all_paths: List[str] = []
         for table_name in tables:
@@ -1450,12 +1616,15 @@ class RedshiftSource(DataSource):
             database = self.config.get("database")
 
             if not all([host, user, password, database]):
-                raise ValueError("RedshiftSource requires 'host', 'user', 'password', and 'database' in config.")
+                raise ValueError(
+                    "RedshiftSource requires 'host', 'user', 'password', and 'database' in config."
+                )
 
             # Try redshift+redshift_connector first, fall back to postgresql
             # Use URL.create to avoid password-in-URL pattern detection
             try:
                 import redshift_connector  # noqa: F401
+
                 url = URL.create(
                     drivername="redshift+redshift_connector",
                     username=user,
@@ -1480,8 +1649,12 @@ class RedshiftSource(DataSource):
         schema = self.config.get("schema", "public")
 
         # Use DatabaseSource pattern
-        db_source = DatabaseSource(connection_string=str(connection_string), config=self.config)
-        return db_source.get_data(table_or_query=table_or_query, pack_config=pack_config)
+        db_source = DatabaseSource(
+            connection_string=str(connection_string), config=self.config
+        )
+        return db_source.get_data(
+            table_or_query=table_or_query, pack_config=pack_config
+        )
 
 
 class ClickHouseSource(DataSource):
@@ -1502,7 +1675,9 @@ class ClickHouseSource(DataSource):
         if not connection_string:
             host = self.config.get("host", "localhost")
             port = self.config.get("port", 8123)
-            user = self.config.get("user") or self.config.get("username", "default")
+            user = self.config.get("user") or self.config.get(
+                "username", "default"
+            )
             password = self.config.get("password", "")
             database = self.config.get("database", "default")
             protocol = self.config.get("protocol", "http")  # http or native
@@ -1524,7 +1699,9 @@ class ClickHouseSource(DataSource):
         database = self.config.get("database", "default")
 
         # Get tables
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             try:
                 table_names = inspector.get_table_names()
@@ -1536,7 +1713,9 @@ class ClickHouseSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, output_dir, chunk_rows)
+                    self._read_table_to_parquet(
+                        engine, table_name, output_dir, chunk_rows
+                    )
                 )
             return all_paths
 
@@ -1544,20 +1723,30 @@ class ClickHouseSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, output_dir, chunk_rows)
+                    self._read_table_to_parquet(
+                        engine, table_name, output_dir, chunk_rows
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name("clickhouse", "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, output_dir, chunk_rows)
+            return self._read_table_to_parquet(
+                engine, table_or_query, output_dir, chunk_rows
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, output_dir, chunk_rows):
+    def _read_table_to_parquet(
+        self, engine, table_name, output_dir, chunk_rows
+    ):
         base_name = _build_base_name("clickhouse", table_name)
         sql = f"SELECT * FROM {table_name}"
         df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
@@ -1573,7 +1762,7 @@ class ClickHouseSource(DataSource):
 
 class DuckDBSource(DataSource):
     """DuckDB data source (local files or MotherDuck cloud).
-    
+
     Optimized for big data (100GB+) using DuckDB's native COPY TO PARQUET
     which streams data directly to parquet without loading into memory.
     """
@@ -1584,25 +1773,33 @@ class DuckDBSource(DataSource):
     def get_data(self, table_or_query=None, pack_config=None):
         """
         Load data from DuckDB and write Parquet files using streaming export.
-        
+
         IMPORTANT: Uses DuckDB's native COPY TO for memory-efficient export.
         Does NOT load data into pandas DataFrame for large datasets.
         """
         try:
             import duckdb
         except ImportError:
-            raise ImportError("duckdb is required for DuckDBSource. Install with: pip install duckdb")
+            raise ImportError(
+                "duckdb is required for DuckDBSource. Install with: pip install duckdb"
+            )
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
 
         # Connect to DuckDB
-        db_path = self.config.get("path") or self.config.get("database", ":memory:")
-        motherduck_token = self.config.get("motherduck_token") or self.config.get("token")
+        db_path = self.config.get("path") or self.config.get(
+            "database", ":memory:"
+        )
+        motherduck_token = self.config.get(
+            "motherduck_token"
+        ) or self.config.get("token")
 
         if motherduck_token:
             # MotherDuck cloud connection
-            connection_string = f"md:{db_path}?motherduck_token={motherduck_token}"
+            connection_string = (
+                f"md:{db_path}?motherduck_token={motherduck_token}"
+            )
             conn = duckdb.connect(connection_string)
         else:
             conn = duckdb.connect(db_path)
@@ -1610,8 +1807,12 @@ class DuckDBSource(DataSource):
         schema = self.config.get("schema", "main")
 
         # Get tables
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
-            result = conn.execute(f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'")
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
+            result = conn.execute(
+                f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
+            )
             table_names = [row[0] for row in result.fetchall()]
         elif isinstance(table_or_query, (list, tuple, set)):
             table_names = list(table_or_query)
@@ -1625,14 +1826,22 @@ class DuckDBSource(DataSource):
                 return paths
             table_names = [table_or_query]
         else:
-            raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+            raise TypeError(
+                "table_or_query must be None, '*', a string, or a list of table names."
+            )
 
         all_paths: List[str] = []
         for table_name in table_names:
             base_name = _build_base_name("duckdb", table_name)
-            qualified = f"{schema}.{table_name}" if schema != "main" else table_name
+            qualified = (
+                f"{schema}.{table_name}" if schema != "main" else table_name
+            )
             paths = self._export_query_to_parquet(
-                conn, f"SELECT * FROM {qualified}", output_dir, base_name, chunk_rows
+                conn,
+                f"SELECT * FROM {qualified}",
+                output_dir,
+                base_name,
+                chunk_rows,
             )
             all_paths.extend(paths)
 
@@ -1649,12 +1858,12 @@ class DuckDBSource(DataSource):
     ) -> List[str]:
         """
         Export query results directly to parquet using DuckDB's COPY TO.
-        
+
         This is memory-efficient as DuckDB streams data directly to parquet
         without loading into memory first.
         """
         output_path = _build_parquet_path(output_dir, base_name, 1)
-        
+
         try:
             # Use DuckDB's native COPY TO for streaming export (memory efficient)
             # This exports directly from DuckDB to parquet without loading into pandas
@@ -1665,11 +1874,15 @@ class DuckDBSource(DataSource):
             conn.execute(copy_sql)
             logger.info(f"DuckDB streaming export to: {output_path}")
             return [output_path]
-            
+
         except Exception as e:
-            logger.warning(f"DuckDB COPY TO failed ({e}), falling back to chunked export")
+            logger.warning(
+                f"DuckDB COPY TO failed ({e}), falling back to chunked export"
+            )
             # Fallback: use fetch_arrow_table for more efficient memory usage than df()
-            return self._export_query_chunked(conn, query, output_dir, base_name, chunk_rows)
+            return self._export_query_chunked(
+                conn, query, output_dir, base_name, chunk_rows
+            )
 
     def _export_query_chunked(
         self,
@@ -1683,49 +1896,56 @@ class DuckDBSource(DataSource):
         Fallback: Export query results in chunks using Arrow for better memory efficiency.
         """
         all_paths: List[str] = []
-        
+
         try:
             # Use Arrow tables instead of pandas for better memory efficiency
             result = conn.execute(query)
             arrow_table = result.fetch_arrow_table()
-            
+
             # Write directly from Arrow to parquet (no pandas intermediate)
             import pyarrow.parquet as pq
-            
+
             total_rows = arrow_table.num_rows
             if total_rows == 0:
                 output_path = _build_parquet_path(output_dir, base_name, 1)
-                pq.write_table(arrow_table, output_path, compression='zstd')
+                pq.write_table(arrow_table, output_path, compression="zstd")
                 return [output_path]
-            
+
             # Split into chunks
             part = 1
             for i in range(0, total_rows, chunk_rows):
                 chunk = arrow_table.slice(i, min(chunk_rows, total_rows - i))
                 output_path = _build_parquet_path(output_dir, base_name, part)
-                pq.write_table(chunk, output_path, compression='zstd', row_group_size=chunk_rows)
+                pq.write_table(
+                    chunk,
+                    output_path,
+                    compression="zstd",
+                    row_group_size=chunk_rows,
+                )
                 all_paths.append(output_path)
                 part += 1
-            
+
             return all_paths
-            
+
         except Exception as e:
             logger.warning(f"Arrow export failed ({e}), using pandas fallback")
             # Final fallback: pandas (not recommended for big data)
             result = conn.execute(query)
             df = result.df()
-            
+
             if len(df) == 0:
                 output_path = _build_parquet_path(output_dir, base_name, 1)
                 _write_df_to_parquet(df, output_path)
                 return [output_path]
-            
+
             for i in range(0, len(df), chunk_rows):
-                chunk_df = df.iloc[i:i + chunk_rows]
-                output_path = _build_parquet_path(output_dir, base_name, (i // chunk_rows) + 1)
+                chunk_df = df.iloc[i : i + chunk_rows]
+                output_path = _build_parquet_path(
+                    output_dir, base_name, (i // chunk_rows) + 1
+                )
                 _write_df_to_parquet(chunk_df, output_path)
                 all_paths.append(output_path)
-            
+
             return all_paths
 
     def _is_sql_query(self, s: str) -> bool:
@@ -1749,7 +1969,9 @@ class TrinoSource(DataSource):
         try:
             from trino.dbapi import connect as trino_connect
         except ImportError:
-            raise ImportError("trino is required for TrinoSource. Install with: pip install trino")
+            raise ImportError(
+                "trino is required for TrinoSource. Install with: pip install trino"
+            )
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
@@ -1772,7 +1994,9 @@ class TrinoSource(DataSource):
         cursor = conn.cursor()
 
         # Get tables
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             cursor.execute("SHOW TABLES")
             table_names = [row[0] for row in cursor.fetchall()]
         elif isinstance(table_or_query, (list, tuple, set)):
@@ -1804,7 +2028,9 @@ class TrinoSource(DataSource):
                 return all_paths
             table_names = [table_or_query]
         else:
-            raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+            raise TypeError(
+                "table_or_query must be None, '*', a string, or a list of table names."
+            )
 
         all_paths: List[str] = []
         for table_name in table_names:
@@ -1859,7 +2085,9 @@ class TeradataSource(DataSource):
             database = self.config.get("database")
 
             if not all([host, user, password]):
-                raise ValueError("TeradataSource requires 'host', 'user', and 'password' in config.")
+                raise ValueError(
+                    "TeradataSource requires 'host', 'user', and 'password' in config."
+                )
 
             # Use URL.create to avoid password-in-URL pattern detection
             url = URL.create(
@@ -1874,16 +2102,35 @@ class TeradataSource(DataSource):
         engine = create_engine(connection_string)
         schema = self.config.get("schema")
 
-        return self._load_data(engine, table_or_query, schema, output_dir, chunk_rows, "teradata")
+        return self._load_data(
+            engine, table_or_query, schema, output_dir, chunk_rows, "teradata"
+        )
 
-    def _load_data(self, engine, table_or_query, schema, output_dir, chunk_rows, dialect_name):
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name,
+    ):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             table_names = inspector.get_table_names(schema=schema)
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
@@ -1891,20 +2138,40 @@ class TeradataSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, schema, output_dir, chunk_rows, dialect_name):
+    def _read_table_to_parquet(
+        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
+    ):
         qualified = f"{schema}.{table_name}" if schema else table_name
         base_name = _build_base_name(dialect_name, qualified)
         sql = f"SELECT * FROM {qualified}"
@@ -1939,7 +2206,9 @@ class SapHanaSource(DataSource):
             database = self.config.get("database")
 
             if not all([host, user, password]):
-                raise ValueError("SapHanaSource requires 'host', 'user', and 'password' in config.")
+                raise ValueError(
+                    "SapHanaSource requires 'host', 'user', and 'password' in config."
+                )
 
             # Use URL.create to avoid password-in-URL pattern detection
             url = URL.create(
@@ -1954,16 +2223,35 @@ class SapHanaSource(DataSource):
         engine = create_engine(connection_string)
         schema = self.config.get("schema")
 
-        return self._load_data(engine, table_or_query, schema, output_dir, chunk_rows, "sap_hana")
+        return self._load_data(
+            engine, table_or_query, schema, output_dir, chunk_rows, "sap_hana"
+        )
 
-    def _load_data(self, engine, table_or_query, schema, output_dir, chunk_rows, dialect_name):
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name,
+    ):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             table_names = inspector.get_table_names(schema=schema)
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
@@ -1971,22 +2259,46 @@ class SapHanaSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, schema, output_dir, chunk_rows, dialect_name):
-        qualified = f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
-        base_name = _build_base_name(dialect_name, f"{schema}.{table_name}" if schema else table_name)
+    def _read_table_to_parquet(
+        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
+    ):
+        qualified = (
+            f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
+        )
+        base_name = _build_base_name(
+            dialect_name, f"{schema}.{table_name}" if schema else table_name
+        )
         sql = f"SELECT * FROM {qualified}"
         df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
         return _write_pandas_chunks(df_iter, output_dir, base_name)
@@ -2011,19 +2323,25 @@ class CassandraSource(DataSource):
             from cassandra.cluster import Cluster
             from cassandra.auth import PlainTextAuthProvider
         except ImportError:
-            raise ImportError("cassandra-driver is required for CassandraSource. Install with: pip install cassandra-driver")
+            raise ImportError(
+                "cassandra-driver is required for CassandraSource. Install with: pip install cassandra-driver"
+            )
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
 
-        hosts = self.config.get("hosts") or [self.config.get("host", "localhost")]
+        hosts = self.config.get("hosts") or [
+            self.config.get("host", "localhost")
+        ]
         port = int(self.config.get("port", 9042))
         username = self.config.get("username")
         password = self.config.get("password")
         keyspace = self.config.get("keyspace") or self.config.get("database")
 
         if username and password:
-            auth_provider = PlainTextAuthProvider(username=username, password=password)
+            auth_provider = PlainTextAuthProvider(
+                username=username, password=password
+            )
             cluster = Cluster(hosts, port=port, auth_provider=auth_provider)
         else:
             cluster = Cluster(hosts, port=port)
@@ -2031,8 +2349,12 @@ class CassandraSource(DataSource):
         session = cluster.connect(keyspace)
 
         # Get tables
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
-            rows = session.execute(f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{keyspace}'")
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
+            rows = session.execute(
+                f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{keyspace}'"
+            )
             table_names = [row.table_name for row in rows]
         elif isinstance(table_or_query, (list, tuple, set)):
             table_names = list(table_or_query)
@@ -2062,7 +2384,9 @@ class CassandraSource(DataSource):
                 return all_paths
             table_names = [table_or_query]
         else:
-            raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+            raise TypeError(
+                "table_or_query must be None, '*', a string, or a list of table names."
+            )
 
         all_paths: List[str] = []
         for table_name in table_names:
@@ -2108,12 +2432,16 @@ class ElasticsearchSource(DataSource):
         try:
             from elasticsearch import Elasticsearch
         except ImportError:
-            raise ImportError("elasticsearch is required for ElasticsearchSource. Install with: pip install elasticsearch")
+            raise ImportError(
+                "elasticsearch is required for ElasticsearchSource. Install with: pip install elasticsearch"
+            )
 
         output_dir = _ensure_output_dir(pack_config)
         chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
 
-        hosts = self.config.get("hosts") or [self.config.get("host", "localhost")]
+        hosts = self.config.get("hosts") or [
+            self.config.get("host", "localhost")
+        ]
         port = int(self.config.get("port", 9200))
         username = self.config.get("username")
         password = self.config.get("password")
@@ -2123,21 +2451,39 @@ class ElasticsearchSource(DataSource):
         cloud_id = self.config.get("cloud_id")
 
         # Build hosts with port
-        if isinstance(hosts, list) and hosts and not any(":" in str(h) for h in hosts):
+        if (
+            isinstance(hosts, list)
+            and hosts
+            and not any(":" in str(h) for h in hosts)
+        ):
             scheme = "https" if use_ssl else "http"
             hosts = [f"{scheme}://{h}:{port}" for h in hosts]
 
         if cloud_id:
-            es = Elasticsearch(cloud_id=cloud_id, api_key=api_key) if api_key else Elasticsearch(cloud_id=cloud_id, basic_auth=(username, password))
+            es = (
+                Elasticsearch(cloud_id=cloud_id, api_key=api_key)
+                if api_key
+                else Elasticsearch(
+                    cloud_id=cloud_id, basic_auth=(username, password)
+                )
+            )
         elif api_key:
-            es = Elasticsearch(hosts=hosts, api_key=api_key, verify_certs=verify_certs)
+            es = Elasticsearch(
+                hosts=hosts, api_key=api_key, verify_certs=verify_certs
+            )
         elif username and password:
-            es = Elasticsearch(hosts=hosts, basic_auth=(username, password), verify_certs=verify_certs)
+            es = Elasticsearch(
+                hosts=hosts,
+                basic_auth=(username, password),
+                verify_certs=verify_certs,
+            )
         else:
             es = Elasticsearch(hosts=hosts, verify_certs=verify_certs)
 
         # Get indices (table_or_query is the index pattern)
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             indices = list(es.indices.get(index="*").keys())
             # Filter out system indices
             indices = [i for i in indices if not i.startswith(".")]
@@ -2146,13 +2492,20 @@ class ElasticsearchSource(DataSource):
         elif isinstance(table_or_query, str):
             indices = [table_or_query]
         else:
-            raise TypeError("table_or_query must be None, '*', a string (index name), or a list of index names.")
+            raise TypeError(
+                "table_or_query must be None, '*', a string (index name), or a list of index names."
+            )
 
         all_paths: List[str] = []
         for index in indices:
             base_name = _build_base_name("elasticsearch", index)
             # Use scroll API for large datasets
-            resp = es.search(index=index, scroll="2m", size=min(chunk_rows, 10000), body={"query": {"match_all": {}}})
+            resp = es.search(
+                index=index,
+                scroll="2m",
+                size=min(chunk_rows, 10000),
+                body={"query": {"match_all": {}}},
+            )
             scroll_id = resp["_scroll_id"]
             hits = resp["hits"]["hits"]
 
@@ -2206,7 +2559,9 @@ class IbmDb2Source(DataSource):
             database = self.config.get("database")
 
             if not all([host, user, password, database]):
-                raise ValueError("IbmDb2Source requires 'host', 'user', 'password', and 'database' in config.")
+                raise ValueError(
+                    "IbmDb2Source requires 'host', 'user', 'password', and 'database' in config."
+                )
 
             # Use URL.create to avoid password-in-URL pattern detection
             url = URL.create(
@@ -2222,16 +2577,35 @@ class IbmDb2Source(DataSource):
         engine = create_engine(connection_string)
         schema = self.config.get("schema")
 
-        return self._load_data(engine, table_or_query, schema, output_dir, chunk_rows, "ibm_db2")
+        return self._load_data(
+            engine, table_or_query, schema, output_dir, chunk_rows, "ibm_db2"
+        )
 
-    def _load_data(self, engine, table_or_query, schema, output_dir, chunk_rows, dialect_name):
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name,
+    ):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             table_names = inspector.get_table_names(schema=schema)
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
@@ -2239,20 +2613,40 @@ class IbmDb2Source(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, schema, output_dir, chunk_rows, dialect_name):
+    def _read_table_to_parquet(
+        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
+    ):
         qualified = f"{schema}.{table_name}" if schema else table_name
         base_name = _build_base_name(dialect_name, qualified)
         sql = f"SELECT * FROM {qualified}"
@@ -2283,18 +2677,26 @@ class AthenaSource(DataSource):
             region = self.config.get("region", "us-east-1")
             s3_staging_dir = self.config.get("s3_staging_dir")
             database = self.config.get("database")
-            access_key = self.config.get("access_key") or self.config.get("aws_access_key_id")
-            secret_key = self.config.get("secret_key") or self.config.get("aws_secret_access_key")
+            access_key = self.config.get("access_key") or self.config.get(
+                "aws_access_key_id"
+            )
+            secret_key = self.config.get("secret_key") or self.config.get(
+                "aws_secret_access_key"
+            )
             workgroup = self.config.get("workgroup")
 
             if not s3_staging_dir:
-                raise ValueError("AthenaSource requires 's3_staging_dir' in config.")
+                raise ValueError(
+                    "AthenaSource requires 's3_staging_dir' in config."
+                )
 
             # awsathena+rest://access_key:secret_key@athena.region.amazonaws.com:443/database?s3_staging_dir=s3://...
             if access_key and secret_key:
                 connection_string = f"awsathena+rest://{access_key}:{secret_key}@athena.{region}.amazonaws.com:443/"
             else:
-                connection_string = f"awsathena+rest://:@athena.{region}.amazonaws.com:443/"
+                connection_string = (
+                    f"awsathena+rest://:@athena.{region}.amazonaws.com:443/"
+                )
 
             if database:
                 connection_string += database
@@ -2306,10 +2708,22 @@ class AthenaSource(DataSource):
         engine = create_engine(connection_string)
         schema = self.config.get("schema") or self.config.get("database")
 
-        return self._load_data(engine, table_or_query, schema, output_dir, chunk_rows, "athena")
+        return self._load_data(
+            engine, table_or_query, schema, output_dir, chunk_rows, "athena"
+        )
 
-    def _load_data(self, engine, table_or_query, schema, output_dir, chunk_rows, dialect_name):
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name,
+    ):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             try:
                 table_names = inspector.get_table_names(schema=schema)
@@ -2318,7 +2732,14 @@ class AthenaSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
@@ -2326,22 +2747,46 @@ class AthenaSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, schema, output_dir, chunk_rows, dialect_name):
-        qualified = f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
-        base_name = _build_base_name(dialect_name, f"{schema}.{table_name}" if schema else table_name)
+    def _read_table_to_parquet(
+        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
+    ):
+        qualified = (
+            f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
+        )
+        base_name = _build_base_name(
+            dialect_name, f"{schema}.{table_name}" if schema else table_name
+        )
         sql = f"SELECT * FROM {qualified}"
         df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
         return _write_pandas_chunks(df_iter, output_dir, base_name)
@@ -2374,7 +2819,9 @@ class SynapseSource(DataSource):
             database = self.config.get("database")
 
             if not all([host, user, password, database]):
-                raise ValueError("SynapseSource requires 'host', 'user', 'password', and 'database' in config.")
+                raise ValueError(
+                    "SynapseSource requires 'host', 'user', 'password', and 'database' in config."
+                )
 
             # Use URL.create to avoid password-in-URL pattern detection
             # Uses pymssql driver for Azure Synapse
@@ -2391,16 +2838,35 @@ class SynapseSource(DataSource):
         engine = create_engine(connection_string)
         schema = self.config.get("schema", "dbo")
 
-        return self._load_data(engine, table_or_query, schema, output_dir, chunk_rows, "synapse")
+        return self._load_data(
+            engine, table_or_query, schema, output_dir, chunk_rows, "synapse"
+        )
 
-    def _load_data(self, engine, table_or_query, schema, output_dir, chunk_rows, dialect_name):
-        if table_or_query is None or (isinstance(table_or_query, str) and table_or_query.strip() == "*"):
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name,
+    ):
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
             inspector = inspect(engine)
             table_names = inspector.get_table_names(schema=schema)
             all_paths: List[str] = []
             for table_name in table_names:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
@@ -2408,22 +2874,46 @@ class SynapseSource(DataSource):
             all_paths: List[str] = []
             for table_name in table_or_query:
                 all_paths.extend(
-                    self._read_table_to_parquet(engine, table_name, schema, output_dir, chunk_rows, dialect_name)
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                    )
                 )
             return all_paths
 
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
                 base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(table_or_query, engine, chunksize=chunk_rows)
+                df_iter = pd.read_sql(
+                    table_or_query, engine, chunksize=chunk_rows
+                )
                 return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(engine, table_or_query, schema, output_dir, chunk_rows, dialect_name)
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+            )
 
-        raise TypeError("table_or_query must be None, '*', a string, or a list of table names.")
+        raise TypeError(
+            "table_or_query must be None, '*', a string, or a list of table names."
+        )
 
-    def _read_table_to_parquet(self, engine, table_name, schema, output_dir, chunk_rows, dialect_name):
-        qualified = f"[{schema}].[{table_name}]" if schema else f"[{table_name}]"
-        base_name = _build_base_name(dialect_name, f"{schema}.{table_name}" if schema else table_name)
+    def _read_table_to_parquet(
+        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
+    ):
+        qualified = (
+            f"[{schema}].[{table_name}]" if schema else f"[{table_name}]"
+        )
+        base_name = _build_base_name(
+            dialect_name, f"{schema}.{table_name}" if schema else table_name
+        )
         sql = f"SELECT * FROM {qualified}"
         df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
         return _write_pandas_chunks(df_iter, output_dir, base_name)

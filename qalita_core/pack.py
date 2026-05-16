@@ -7,7 +7,10 @@ import json
 import base64
 import logging
 from typing import List, Optional, Union, TYPE_CHECKING
-from qalita_core.data_source_opener import get_data_source, cleanup_parquet_files
+from qalita_core.data_source_opener import (
+    get_data_source,
+    cleanup_parquet_files,
+)
 from urllib.parse import urlsplit
 import math
 from decimal import Decimal
@@ -16,6 +19,7 @@ import datetime as _dt
 # Polars support for big data (100GB+)
 try:
     import polars as pl
+
     POLARS_AVAILABLE = True
 except ImportError:
     pl = None  # type: ignore
@@ -46,10 +50,18 @@ class Pack:
 
         # Update default paths with any provided configurations
         self.config_paths = {**self.default_configs, **configs}
-        self.pack_config = ConfigLoader.load_config(self.config_paths["pack_conf"])
-        self.source_config = ConfigLoader.load_config(self.config_paths["source_conf"])
-        self.target_config = ConfigLoader.load_config(self.config_paths["target_conf"])
-        self.agent_config = self.load_agent_config(self.config_paths["agent_file"])
+        self.pack_config = ConfigLoader.load_config(
+            self.config_paths["pack_conf"]
+        )
+        self.source_config = ConfigLoader.load_config(
+            self.config_paths["source_conf"]
+        )
+        self.target_config = ConfigLoader.load_config(
+            self.config_paths["target_conf"]
+        )
+        self.agent_config = self.load_agent_config(
+            self.config_paths["agent_file"]
+        )
         self.metrics = PlatformAsset("metrics")
         self.recommendations = PlatformAsset("recommendations")
         self.schemas = PlatformAsset("schemas")
@@ -64,7 +76,9 @@ class Pack:
         if not self.source_config:
             self.logger.error("Source configuration is empty.")
         elif "type" not in self.source_config:
-            self.logger.error("Source configuration is missing the 'type' key.")
+            self.logger.error(
+                "Source configuration is missing the 'type' key."
+            )
 
     def __enter__(self):
         """Context manager entry - returns self for use in 'with' statements."""
@@ -96,7 +110,9 @@ class Pack:
             self.logger.debug(f"Cleaned up {removed} target parquet file(s)")
             total_removed += removed
         if total_removed > 0:
-            self.logger.info(f"Cleaned up {total_removed} temporary parquet file(s)")
+            self.logger.info(
+                f"Cleaned up {total_removed} temporary parquet file(s)"
+            )
         return total_removed
 
     def load_agent_config(self, agent_file_path):
@@ -106,7 +122,9 @@ class Pack:
             )  # Resolve any user-relative paths
             with open(abs_agent_file_path, "r") as agent_file:
                 encoded_content = agent_file.read()
-                decoded_content = base64.b64decode(encoded_content).decode("utf-8")
+                decoded_content = base64.b64decode(encoded_content).decode(
+                    "utf-8"
+                )
                 data = json.loads(decoded_content)
                 # Normalize local context URL to scheme://host without trailing API paths
                 try:
@@ -128,21 +146,27 @@ class Pack:
     def load_data(self, trigger, table_or_query=None) -> List[str]:
         """
         Load data from source/target and return list of parquet file paths.
-        
+
         Args:
             trigger: "source" or "target"
             table_or_query: Optional table name or SQL query
-            
+
         Returns:
             List of parquet file paths containing the loaded data.
         """
-        source_conf = self.source_config if trigger == "source" else self.target_config
+        source_conf = (
+            self.source_config if trigger == "source" else self.target_config
+        )
         pack_conf = self.pack_config
         ds = get_data_source(source_conf)
-        table_or_query = table_or_query or source_conf.get("config", {}).get("table_or_query")
+        table_or_query = table_or_query or source_conf.get("config", {}).get(
+            "table_or_query"
+        )
         # Enrich pack_config with deterministic output directory and chunking hints
         job_cfg = (pack_conf or {}).get("job", {})
-        trigger_cfg = (job_cfg.get(trigger) or {}) if isinstance(job_cfg, dict) else {}
+        trigger_cfg = (
+            (job_cfg.get(trigger) or {}) if isinstance(job_cfg, dict) else {}
+        )
         parquet_output_dir = (
             trigger_cfg.get("parquet_output_dir")
             or job_cfg.get("parquet_output_dir")
@@ -173,30 +197,30 @@ class Pack:
     def scan_data(self, trigger: str) -> "pl.LazyFrame":
         """
         Return a Polars LazyFrame for streaming data processing.
-        
+
         This is the recommended method for big data (100GB+) as it uses
         lazy evaluation and streaming to process data without loading
         everything into memory.
-        
+
         Args:
             trigger: "source" or "target"
-            
+
         Returns:
             Polars LazyFrame for deferred/streaming execution.
-            
+
         Example:
             ```python
             with Pack() as pack:
                 pack.load_data("source")
                 lf = pack.scan_data("source")
-                
+
                 # Streaming aggregation (memory efficient)
                 stats = lf.select([
                     pl.len().alias("row_count"),
                     pl.all().is_not_null().sum()
                 ]).collect(engine="streaming")
             ```
-        
+
         Raises:
             ImportError: If Polars is not installed
             RuntimeError: If data has not been loaded yet
@@ -206,43 +230,44 @@ class Pack:
                 "Polars is required for scan_data(). "
                 "Install with: pip install polars>=1.0.0"
             )
-        
+
         paths = self.paths_source if trigger == "source" else self.paths_target
         if not paths:
             raise RuntimeError(
                 f"No data loaded for trigger '{trigger}'. "
                 f"Call load_data('{trigger}') first."
             )
-        
+
         # Scan parquet files lazily (does not load into memory)
         return pl.scan_parquet(paths)
 
     def get_row_count(self, trigger: str) -> int:
         """
         Get row count efficiently without loading all data into memory.
-        
+
         Uses Polars streaming if available, falls back to parquet metadata.
-        
+
         Args:
             trigger: "source" or "target"
-            
+
         Returns:
             Total number of rows across all parquet files.
         """
         paths = self.paths_source if trigger == "source" else self.paths_target
         if not paths:
             return 0
-        
+
         if POLARS_AVAILABLE:
             try:
                 lf = pl.scan_parquet(paths)
                 return lf.select(pl.len()).collect(engine="streaming").item()
             except Exception:
                 pass
-        
+
         # Fallback: read parquet metadata
         try:
             import pyarrow.parquet as pq
+
             total = 0
             for path in paths:
                 pf = pq.ParquetFile(path)
@@ -254,19 +279,19 @@ class Pack:
     def estimate_memory_mb(self, trigger: str) -> float:
         """
         Estimate memory required to load all data into memory.
-        
+
         Useful for deciding whether to use streaming or full load.
-        
+
         Args:
             trigger: "source" or "target"
-            
+
         Returns:
             Estimated memory in megabytes.
         """
         paths = self.paths_source if trigger == "source" else self.paths_target
         if not paths:
             return 0.0
-        
+
         # Sum file sizes as rough estimate (parquet is compressed)
         total_bytes = 0
         for path in paths:
@@ -274,7 +299,7 @@ class Pack:
                 total_bytes += os.path.getsize(path)
             except OSError:
                 pass
-        
+
         # Multiply by ~3-5x for decompression overhead
         return (total_bytes * 4) / (1024 * 1024)
 

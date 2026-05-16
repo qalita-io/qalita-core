@@ -31,7 +31,10 @@ def _mk_pack(tmp_path: Path, source_conf_obj: dict) -> Pack:
         },
     )
     _write_json(source_conf_path, source_conf_obj)
-    _write_json(target_conf_path, {"type": "file", "config": {"path": str(tmp_path / "empty.csv")}})
+    _write_json(
+        target_conf_path,
+        {"type": "file", "config": {"path": str(tmp_path / "empty.csv")}},
+    )
     (tmp_path / "empty.csv").write_text("col\n", encoding="utf-8")
 
     # Reuse existing agent file in tests data
@@ -83,7 +86,9 @@ def test_sqlite_table_chunked_parquet(tmp_path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, val INTEGER)")
-    cur.executemany("INSERT INTO items(val) VALUES (?)", [(i,) for i in range(2500)])
+    cur.executemany(
+        "INSERT INTO items(val) VALUES (?)", [(i,) for i in range(2500)]
+    )
     conn.commit()
     conn.close()
 
@@ -112,13 +117,18 @@ def test_sqlite_query_chunked_parquet(tmp_path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)")
-    cur.executemany("INSERT INTO t(val) VALUES (?)", [(i,) for i in range(1500)])
+    cur.executemany(
+        "INSERT INTO t(val) VALUES (?)", [(i,) for i in range(1500)]
+    )
     conn.commit()
     conn.close()
 
     pack = _mk_pack(
         tmp_path,
-        {"type": "sqlite", "config": {"connection_string": f"sqlite:///{db_path}"}},
+        {
+            "type": "sqlite",
+            "config": {"connection_string": f"sqlite:///{db_path}"},
+        },
     )
     out_dir = tmp_path / "parquet_query"
     pack.pack_config.setdefault("job", {})
@@ -131,4 +141,3 @@ def test_sqlite_query_chunked_parquet(tmp_path):
     assert all(os.path.exists(p) for p in paths)
     # query naming
     assert paths[0].endswith("sqlite_query_part_1.parquet")
-

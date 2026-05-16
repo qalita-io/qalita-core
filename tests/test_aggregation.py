@@ -26,7 +26,9 @@ class TestDetectChunkedFromItems:
         assert result == (False, False, False)
 
     def test_single_item(self):
-        result = detect_chunked_from_items(["file.parquet"], ["name"], "dataset")
+        result = detect_chunked_from_items(
+            ["file.parquet"], ["name"], "dataset"
+        )
         assert result == (False, False, False)
 
     def test_auto_named_chunks(self):
@@ -110,7 +112,10 @@ class TestNormalizeAndDedupeRecommendations:
                 "scope": {
                     "perimeter": "column",
                     "value": "col1",
-                    "parent_scope": {"perimeter": "dataset", "value": "old_dataset"},
+                    "parent_scope": {
+                        "perimeter": "dataset",
+                        "value": "old_dataset",
+                    },
                 },
             }
         ]
@@ -119,8 +124,16 @@ class TestNormalizeAndDedupeRecommendations:
 
     def test_deduplicate_by_content_type_scope(self):
         records = [
-            {"content": "duplicate", "type": "warning", "scope": {"value": "ds1"}},
-            {"content": "duplicate", "type": "warning", "scope": {"value": "ds1"}},
+            {
+                "content": "duplicate",
+                "type": "warning",
+                "scope": {"value": "ds1"},
+            },
+            {
+                "content": "duplicate",
+                "type": "warning",
+                "scope": {"value": "ds1"},
+            },
             {"content": "unique", "type": "info", "scope": {"value": "ds1"}},
         ]
         result = normalize_and_dedupe_recommendations(records, "ds1")
@@ -167,10 +180,10 @@ class TestCompletenessAggregator:
         df = pd.DataFrame({"col1": [1, 2, 3], "col2": [4, None, 6]})
         agg.add_df(df)
         metrics, schemas = agg.finalize_metrics_and_schemas("test_dataset")
-        
+
         assert len(metrics) > 0
         assert len(schemas) > 0
-        
+
         # Check for expected metric keys
         metric_keys = [m["key"] for m in metrics]
         assert "n" in metric_keys
@@ -183,8 +196,12 @@ class TestCompletenessAggregator:
         df = pd.DataFrame({"col1": [1, None]})
         agg.add_df(df)
         metrics, _ = agg.finalize_metrics_and_schemas("test")
-        
-        col_metrics = [m for m in metrics if m.get("scope", {}).get("perimeter") == "column"]
+
+        col_metrics = [
+            m
+            for m in metrics
+            if m.get("scope", {}).get("perimeter") == "column"
+        ]
         assert len(col_metrics) > 0
 
     def test_empty_df(self):
@@ -209,7 +226,9 @@ class TestOutlierAggregator:
 
     def test_add_column_stats(self):
         agg = OutlierAggregator()
-        agg.add_column_stats("col1", mean_normality=0.9, outlier_count=5, rows=100)
+        agg.add_column_stats(
+            "col1", mean_normality=0.9, outlier_count=5, rows=100
+        )
         assert agg.col_outliers["col1"] == 5
         assert agg.col_rows["col1"] == 100
 
@@ -222,7 +241,9 @@ class TestOutlierAggregator:
 
     def test_add_dataset_stats(self):
         agg = OutlierAggregator()
-        agg.add_dataset_stats(mean_normality=0.85, rows=100, multivariate_outliers_count=10)
+        agg.add_dataset_stats(
+            mean_normality=0.85, rows=100, multivariate_outliers_count=10
+        )
         assert agg.dataset_outliers == 10
         assert agg.total_rows == 100
 
@@ -230,11 +251,11 @@ class TestOutlierAggregator:
         agg = OutlierAggregator()
         agg.add_column_stats("col1", 0.9, 5, 100)
         agg.add_dataset_stats(0.85, 100, 10)
-        
+
         metrics, recommendations = agg.finalize_metrics_and_recommendations(
             "test_dataset", normality_threshold=0.8
         )
-        
+
         assert len(metrics) > 0
         metric_keys = [m["key"] for m in metrics]
         assert "outliers" in metric_keys
@@ -244,11 +265,11 @@ class TestOutlierAggregator:
         agg = OutlierAggregator()
         agg.add_column_stats("col1", 0.5, 50, 100)  # Low normality
         agg.add_dataset_stats(0.5, 100, 50)
-        
+
         metrics, recommendations = agg.finalize_metrics_and_recommendations(
             "test_dataset", normality_threshold=0.8
         )
-        
+
         # Should generate recommendations for low normality
         assert len(recommendations) > 0
 
@@ -284,9 +305,9 @@ class TestDuplicateAggregator:
         agg = DuplicateAggregator(["col1"])
         df = pd.DataFrame({"col1": [1, 1, 2, 3]})  # 1 duplicate
         agg.add_df(df)
-        
+
         metrics, recommendations = agg.finalize_metrics("test_dataset")
-        
+
         assert len(metrics) > 0
         metric_keys = [m["key"] for m in metrics]
         assert "score" in metric_keys
@@ -296,7 +317,7 @@ class TestDuplicateAggregator:
         agg = DuplicateAggregator(["col1"])
         df = pd.DataFrame({"col1": [1, 1, 2, 3, 3]})
         agg.add_df(df)
-        
+
         dup_keys = agg.get_duplicate_keys()
         assert (1,) in dup_keys
         assert (3,) in dup_keys
@@ -304,10 +325,12 @@ class TestDuplicateAggregator:
 
     def test_multi_column_uniqueness(self):
         agg = DuplicateAggregator(["col1", "col2"])
-        df = pd.DataFrame({
-            "col1": [1, 1, 2],
-            "col2": ["a", "b", "a"],
-        })
+        df = pd.DataFrame(
+            {
+                "col1": [1, 1, 2],
+                "col2": ["a", "b", "a"],
+            }
+        )
         agg.add_df(df)
         # All combinations are unique
         dup_keys = agg.get_duplicate_keys()
@@ -365,16 +388,16 @@ class TestTimelinessAggregator:
     def test_finalize_metrics_year(self):
         agg = TimelinessAggregator()
         agg.add_year_obs("year_col", 2020, 2024)
-        
+
         def calc_score(days):
             return max(0, 1 - (days / 365))
-        
+
         metrics, recommendations = agg.finalize_metrics(
             "test_dataset",
             compute_score_columns=None,
             calc_timeliness_score=calc_score,
         )
-        
+
         metric_keys = [m["key"] for m in metrics]
         assert "earliest_year" in metric_keys
         assert "latest_year" in metric_keys
@@ -383,16 +406,16 @@ class TestTimelinessAggregator:
         agg = TimelinessAggregator()
         recent_date = dt.date.today() - dt.timedelta(days=30)
         agg.add_date_obs("date_col", dt.date(2020, 1, 1), recent_date)
-        
+
         def calc_score(days):
             return max(0, 1 - (days / 365))
-        
+
         metrics, recommendations = agg.finalize_metrics(
             "test_dataset",
             compute_score_columns=None,
             calc_timeliness_score=calc_score,
         )
-        
+
         metric_keys = [m["key"] for m in metrics]
         assert "earliest_date" in metric_keys
         assert "latest_date" in metric_keys
@@ -403,16 +426,16 @@ class TestTimelinessAggregator:
         recent_dt = dt.datetime.today() - dt.timedelta(days=30)
         earliest_dt = dt.datetime(2020, 1, 1)
         agg.add_date_obs("date_col", earliest_dt, recent_dt)
-        
+
         def calc_score(days):
             return max(0, 1 - (days / 365))
-        
+
         metrics, recommendations = agg.finalize_metrics(
             "test_dataset",
             compute_score_columns=None,
             calc_timeliness_score=calc_score,
         )
-        
+
         metric_keys = [m["key"] for m in metrics]
         assert "earliest_date" in metric_keys
         assert "latest_date" in metric_keys
@@ -421,16 +444,16 @@ class TestTimelinessAggregator:
         agg = TimelinessAggregator()
         # Very old data (more than 1 year)
         agg.add_year_obs("old_col", 2015, 2018)
-        
+
         def calc_score(days):
             return max(0, 1 - (days / 365))
-        
+
         metrics, recommendations = agg.finalize_metrics(
             "test_dataset",
             compute_score_columns=None,
             calc_timeliness_score=calc_score,
         )
-        
+
         # Should generate recommendations for old data
         assert len(recommendations) > 0
 
@@ -438,17 +461,17 @@ class TestTimelinessAggregator:
         agg = TimelinessAggregator()
         agg.add_year_obs("col1", 2020, 2024)
         agg.add_year_obs("col2", 2015, 2018)  # Old column
-        
+
         def calc_score(days):
             return max(0, 1 - (days / 365))
-        
+
         # Only compute score for col1
         metrics, _ = agg.finalize_metrics(
             "test_dataset",
             compute_score_columns=["col1"],
             calc_timeliness_score=calc_score,
         )
-        
+
         score_metric = [m for m in metrics if m["key"] == "score"]
         assert len(score_metric) == 1
 
