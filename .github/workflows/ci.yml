@@ -1,4 +1,4 @@
-name: Build and push package to PyPI
+name: "CI: Build and Push"
 
 on:
   push:
