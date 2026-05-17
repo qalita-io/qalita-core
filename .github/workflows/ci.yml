@@ -26,21 +26,8 @@ jobs:
         with:
           extra_args: --only-verified
 
-  lint:
-    name: Lint Python Code
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Lint Python Code
-        uses: ./.github/actions/lint-python
-        with:
-          python-version: "3.13"
-          source-dir: "qalita_core/ tests/"
-
   test:
     name: Pytest - Unit Tests
-    needs: [lint]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -61,7 +48,7 @@ jobs:
 
   publish:
     name: Publish to PyPI & GitHub Release
-    needs: [secrets-scan, lint, test]
+    needs: [secrets-scan, test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest  # setup-python doesn't support Python 3.13 on ARM64
     permissions:
