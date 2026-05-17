@@ -12,4 +12,3 @@ disable=
     too-many-positional-arguments,
     too-many-branches,
     too-many-statements
-
