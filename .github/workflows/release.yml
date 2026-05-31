@@ -1,0 +1,44 @@
+name: "Release Notes"
+
+# Crée automatiquement une Release GitHub à chaque tag semver poussé.
+# Les notes sont générées à partir des commits conventionnels (feat:, fix:, ...)
+# entre ce tag et le tag précédent.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+# Droit d'écriture nécessaire pour créer la Release et son tag.
+permissions:
+  contents: write
+
+jobs:
+  release-notes:
+    name: Generate release notes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          # Historique complet requis pour comparer avec le tag précédent.
+          fetch-depth: 0
+
+      - name: Build changelog from conventional commits
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          # Même config qu'en local pour un format strictement identique.
+          config: cliff.toml
+          # --latest = section du tag le plus récent (plage [tag précédent -> ce tag]).
+          args: --latest --strip all
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          # Contenu généré par git-cliff-action.
+          body: ${{ steps.changelog.outputs.content }}
+          # Marque comme pré-release si le tag contient un suffixe (-rc, -beta...).
+          prerelease: ${{ contains(github.ref_name, '-') }}
