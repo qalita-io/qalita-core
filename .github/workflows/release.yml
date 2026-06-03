@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history + tags)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Historique complet requis pour comparer avec le tag précédent.
           fetch-depth: 0
