@@ -19,5 +19,7 @@ jobs:
           package-name: ${{ github.event.repository.name }}
           package-type: container
           min-versions-to-keep: 10
-          delete-only-untagged-versions: false
+          # Never delete tagged versions: release images are client deliverables
+          # (registry.qalita.io mirror). `false` wiped tagged versions weekly.
+          delete-only-untagged-versions: true
           token: ${{ secrets.GITHUB_TOKEN }}
