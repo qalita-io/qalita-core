@@ -2,7 +2,7 @@ name: "Maintenance: Cleanup Packages"
 
 on:
   schedule:
-    - cron: '0 3 * * 0'  # Weekly on Sunday at 3am
+    - cron: "0 3 * * 0" # Weekly on Sunday at 3am
   workflow_dispatch:
 
 permissions:
@@ -13,13 +13,19 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Delete old container versions
-        uses: actions/delete-package-versions@v5
+      # Cleanup must be multi-arch aware: per-arch child manifests and cosign
+      # signatures are "untagged" GHCR versions, so version-count cleanup
+      # (actions/delete-package-versions) deletes them out from under tagged
+      # release images even with delete-only-untagged-versions: true
+      # (qalita-cli 2026-06-12, website:2.4.7 2026-07-07). This action resolves
+      # manifest lists and referrers first and only deletes truly orphaned
+      # versions; tagged releases (client deliverables served via
+      # registry.qalita.io) are never touched.
+      - name: Delete orphaned container versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
         with:
-          package-name: ${{ github.event.repository.name }}
-          package-type: container
-          min-versions-to-keep: 10
-          # Never delete tagged versions: release images are client deliverables
-          # (registry.qalita.io mirror). `false` wiped tagged versions weekly.
-          delete-only-untagged-versions: true
+          delete-untagged: true
+          delete-ghost-images: true
+          delete-partial-images: true
+          validate: true
           token: ${{ secrets.GITHUB_TOKEN }}
