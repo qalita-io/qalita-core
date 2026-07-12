@@ -6,7 +6,7 @@ Instructions for AI agents working on this repository.
 
 **Qalita Core** — Python library used by Qalita packs to load multi-source data, materialize as Parquet, and share common utilities.
 
-- **Organization** : `qalita-io`
+- **Organization** : `qalita`
 - **Package** : `qalita_core` (PyPI)
 - **Python** : >= 3.10
 - **Package Manager** : uv
