@@ -42,6 +42,14 @@ def _to_records(frame, columns):
 
     if records:
         available = set(records[0].keys())
+    elif hasattr(
+        frame, "columns"
+    ):  # DataFrame pandas/polars vide : colonnes connues même sans lignes
+        available = set(frame.columns)
+    else:  # liste de dicts vide : aucune colonne déclarée à vérifier
+        available = None
+
+    if available is not None:
         for col in columns:
             if col not in available:
                 raise ValueError(f"Colonne '{col}' absente du frame")
