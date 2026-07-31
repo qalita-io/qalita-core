@@ -66,6 +66,12 @@ class Pack:
         self.recommendations = PlatformAsset("recommendations")
         self.schemas = PlatformAsset("schemas")
 
+        # Import local : figures.py dérive de PlatformAsset, défini plus bas
+        # dans ce même module — un import en tête créerait un cycle.
+        from qalita_core.figures import FiguresAsset
+
+        self.figures = FiguresAsset()
+
         # Initialize paths for cleanup tracking
         self.paths_source = None
         self.paths_target = None
