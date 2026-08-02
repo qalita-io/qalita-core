@@ -218,20 +218,34 @@ class FiguresAsset(PlatformAsset):
         mesure, et exactement une ligne par tuple de dimensions. Une figure
         explique un chiffre, elle ne transporte pas les lignes de la source —
         y déverser des lignes brutes ferait sortir des données individuelles
-        de chez le client. Les trois règles sont vérifiées ici.
+        de chez le client.
+
+        Ces trois règles sont vérifiées ici, mais **ne couvrent pas tout** : des
+        lignes brutes clés par un identifiant unique n'ont, par construction,
+        aucun tuple de dimensions en double. `dims=["patient_id"],
+        measures=["age"]` passe les trois garde-fous et expédie 5000 lignes
+        patient marquées `truncated: true`. Aucun contrôle automatique ne
+        remplace la règle : ne passez à `add` qu'un frame que vous avez
+        vous-même agrégé.
         """
+        # Lier une fois pour toutes : `dims` et `measures` sont re-parcourus
+        # plusieurs fois plus bas, et un itérateur à usage unique serait
+        # consommé par le premier garde-fou.
+        dims = list(dims)
+        measures = list(measures)
+
         if intent not in INTENTS:
             raise ValueError(
                 f"intent '{intent}' inconnu — attendus : {', '.join(INTENTS)}"
             )
 
-        if not list(dims):
+        if not dims:
             raise ValueError(
                 f"figure '{key}' : `dims` est vide — une figure décrit un "
                 "agrégat, qui a au moins une dimension"
             )
 
-        if not list(measures):
+        if not measures:
             raise ValueError(
                 f"figure '{key}' : `measures` est vide — une figure décrit un "
                 "agrégat, qui a au moins une mesure ; sans mesure, `add` "
@@ -249,12 +263,16 @@ class FiguresAsset(PlatformAsset):
                 )
             normalized_dims.append({"name": name, "type": dim_type})
 
-        columns = [d["name"] for d in normalized_dims] + list(measures)
+        columns = [d["name"] for d in normalized_dims] + measures
         # Une ligne de plus que le plafond suffit à savoir qu'il est dépassé :
         # un frame de 50M de lignes passé par erreur ne doit pas faire tomber
         # le worker avant même d'être marqué tronqué.
         rows = _to_records(_limit(frame, max_rows + 1), columns)
 
+        # Assainir AVANT le contrôle de doublons : deux valeurs distinctes en
+        # entrée (None et NaN, np.int64(1) et 1) deviennent une seule valeur
+        # expédiée, et le contrôle doit voir ce qui part, pas ce qui entre.
+        rows = _sanitize_for_json(rows)
         _reject_duplicate_dim_tuples(key, rows, len(normalized_dims))
 
         truncated = len(rows) > max_rows
@@ -270,7 +288,7 @@ class FiguresAsset(PlatformAsset):
                 "title": title,
                 "dims": normalized_dims,
                 "measures": list(measures),
-                "rows": _sanitize_for_json(rows),
+                "rows": rows,
                 "truncated": truncated,
             }
         )

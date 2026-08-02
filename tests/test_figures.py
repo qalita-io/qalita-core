@@ -305,6 +305,71 @@ def test_add_documents_the_aggregate_constraint_at_the_call_site():
     assert "agrégat" in FiguresAsset.add.__doc__
 
 
+def test_add_documents_what_the_guards_do_not_catch():
+    # Des lignes brutes clés par identifiant unique n'ont aucun tuple en
+    # double : elles passent les trois garde-fous. Le docstring doit le dire.
+    assert "identifiant" in FiguresAsset.add.__doc__
+
+
+def test_add_accepts_a_generator_for_measures():
+    fig = FiguresAsset()
+    fig.add(
+        "x",
+        intent="breakdown",
+        frame=pd.DataFrame({"patient_id": ["a", "b"], "v": [1, 2]}),
+        dims=["patient_id"],
+        measures=(m for m in ["v"]),
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    figure = fig.data["figures"][0]
+    assert figure["measures"] == ["v"]
+    assert figure["rows"] == [["a", 1], ["b", 2]]
+
+
+def test_add_accepts_a_generator_for_dims():
+    fig = FiguresAsset()
+    fig.add(
+        "x",
+        intent="breakdown",
+        frame=pd.DataFrame({"c": ["a", "b"], "v": [1, 2]}),
+        dims=(d for d in ["c"]),
+        measures=["v"],
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    figure = fig.data["figures"][0]
+    assert figure["dims"] == [{"name": "c", "type": "nominal"}]
+    assert figure["rows"] == [["a", 1], ["b", 2]]
+
+
+def test_add_detects_duplicate_dims_that_only_collapse_after_sanitisation():
+    # None et NaN sont deux valeurs distinctes en entrée, une seule en sortie.
+    fig = FiguresAsset()
+    with pytest.raises(ValueError, match="agrégat"):
+        fig.add(
+            "x",
+            intent="breakdown",
+            frame=[{"d": None, "v": 1}, {"d": float("nan"), "v": 2}],
+            dims=["d"],
+            measures=["v"],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
+def test_add_detects_duplicate_dims_across_numpy_and_python_scalars():
+    import numpy as np
+
+    fig = FiguresAsset()
+    with pytest.raises(ValueError, match="agrégat"):
+        fig.add(
+            "x",
+            intent="breakdown",
+            frame=[{"d": np.int64(1), "v": 1}, {"d": 1, "v": 2}],
+            dims=["d"],
+            measures=["v"],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
 def test_top_n_folds_tail_into_other():
     df = pd.DataFrame({"column": list("abcde"), "v": [10, 8, 6, 4, 2]})
     out = top_n(df, by="v", n=3, other=True)
