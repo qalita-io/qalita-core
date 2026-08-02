@@ -431,6 +431,101 @@ def test_save_writes_contract_to_disk(tmp_path, monkeypatch):
     assert payload["figures"][0]["key"] == "f"
 
 
+def _assert_json_scalars(rows):
+    for row in rows:
+        for value in row:
+            assert value is None or type(value) in (
+                bool,
+                int,
+                float,
+                str,
+            ), f"{value!r} ({type(value).__name__}) n'est pas un scalaire JSON"
+
+
+def test_add_sanitises_pandas_scalars_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import numpy as np
+
+    fig = FiguresAsset()
+    fig.declare_measure("n", unit="count")
+    fig.declare_measure("ratio", unit="ratio")
+    frame = pd.DataFrame(
+        {
+            "day": pd.to_datetime(["2026-01-01", "2026-01-02", None]),
+            "n": np.array([3, 7, 1], dtype="int64"),
+            "ratio": np.array([0.25, float("nan"), 0.5], dtype="float64"),
+        }
+    )
+    fig.add(
+        "admissions",
+        intent="trend",
+        frame=frame,
+        dims=[("day", "temporal")],
+        measures=["n", "ratio"],
+        scope={"perimeter": "dataset", "value": "patients"},
+    )
+    rows = fig.data["figures"][0]["rows"]
+    _assert_json_scalars(rows)
+    # une date manquante est nulle, jamais la catégorie "NaT"
+    assert rows == [
+        ["2026-01-01T00:00:00", 3, 0.25],
+        ["2026-01-02T00:00:00", 7, None],
+        [None, 1, 0.5],
+    ]
+    fig.save()
+    payload = json.loads(
+        (tmp_path / "figures.json").read_text(encoding="utf-8")
+    )
+    assert payload["figures"][0]["rows"] == rows
+
+
+def test_add_sanitises_polars_scalars_end_to_end():
+    import datetime as dt
+
+    fig = FiguresAsset()
+    frame = pl.DataFrame(
+        {
+            "day": [dt.date(2026, 1, 1), None],
+            "n": pl.Series([3, 7], dtype=pl.Int32),
+            "ratio": pl.Series([0.25, None], dtype=pl.Float32),
+        }
+    )
+    fig.add(
+        "admissions",
+        intent="trend",
+        frame=frame,
+        dims=[("day", "temporal")],
+        measures=["n", "ratio"],
+        scope={"perimeter": "dataset", "value": "patients"},
+    )
+    rows = fig.data["figures"][0]["rows"]
+    _assert_json_scalars(rows)
+    assert rows[0][0] == "2026-01-01"
+    assert rows[1][0] is None
+    assert rows[1][2] is None
+
+
+def test_add_sanitises_decimals_from_a_sql_aggregate():
+    from decimal import Decimal
+
+    fig = FiguresAsset()
+    frame = [
+        {"service": "cardio", "total": Decimal("1234.50")},
+        {"service": "uro", "total": Decimal("7.25")},
+    ]
+    fig.add(
+        "totaux",
+        intent="breakdown",
+        frame=frame,
+        dims=["service"],
+        measures=["total"],
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    rows = fig.data["figures"][0]["rows"]
+    _assert_json_scalars(rows)
+    assert rows == [["cardio", 1234.5], ["uro", 7.25]]
+
+
 def test_add_tells_a_lazyframe_author_to_collect():
     # scan_data() est l'idiom big-data documenté de la librairie : passer le
     # résultat d'un group_by lazy est du code de pack naturel.
