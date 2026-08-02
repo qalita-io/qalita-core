@@ -118,6 +118,16 @@ OPERATIONS: dict[str, str] = {
     "value_counts": """
         result = analytics.value_counts(scan(), "key", 20, other=True).height
     """,
+    # The near-unique column, which is what the fixture was built for. Grouping
+    # it exactly is what exhausts the machine, so the guard must refuse it —
+    # and refusing must itself stay under the ceiling, not blow up on the way.
+    "value_counts_high_cardinality": """
+        try:
+            analytics.value_counts(scan(), "uid", 20)
+            result = "NOT REFUSED"
+        except analytics.CardinalityTooHigh:
+            result = "refused"
+    """,
     "profile": "result = len(profiling.profile(scan(), top_k=0))",
     "sink_partitioned": """
         import tempfile

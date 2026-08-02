@@ -38,6 +38,14 @@ DEFAULT_QUANTILES = (0.05, 0.25, 0.5, 0.75, 0.95)
 # very wide table it would dominate the whole profile.
 DEFAULT_MAX_TOPK_COLUMNS = 200
 
+# Rows drawn when top values have to be estimated rather than counted exactly.
+#
+# 0 — do not estimate, report nothing — because drawing the sample costs more
+# than the statistic is worth: with sampling enabled a profile of a 160M-row
+# source peaked at 4.0 GiB and grew to 7.4 GiB when the source doubled, against
+# a flat 0.4 GiB with it off. Set it to a row count to trade that back.
+DEFAULT_TOPK_SAMPLE_ROWS = 0
+
 
 def profile(
     lf: "pl.LazyFrame",
@@ -47,6 +55,8 @@ def profile(
     top_k: int = 10,
     quantiles: Sequence[float] = DEFAULT_QUANTILES,
     max_topk_columns: int = DEFAULT_MAX_TOPK_COLUMNS,
+    max_groups: int = analytics.DEFAULT_MAX_GROUPS,
+    sample_rows: int = DEFAULT_TOPK_SAMPLE_ROWS,
 ) -> dict[str, dict[str, Any]]:
     """Profile every column of a LazyFrame in a bounded number of passes.
 
@@ -60,6 +70,10 @@ def profile(
             disables the per-column pass entirely.
         quantiles: probabilities to report for numeric columns.
         max_topk_columns: skip top-K when the table has more columns than this.
+        max_groups: above this many distinct values, top-K is estimated from a
+            sample rather than counted exactly. Grouping is what blows the
+            memory budget, and it does so well below this cardinality.
+        sample_rows: size of that sample.
 
     Returns:
         ``{column: {statistic: value}}``. Each column dict carries a ``methods``
@@ -151,7 +165,18 @@ def profile(
 
     if top_k and len(names) <= max_topk_columns:
         for name in names:
-            result[name]["top_values"] = _top_values(lf, name, top_k)
+            values, method = _top_values(
+                lf,
+                name,
+                top_k,
+                result[name]["n_distinct"],
+                max_groups,
+                total_rows,
+                sample_rows,
+            )
+            result[name]["top_values"] = values
+            if method:
+                result[name]["methods"]["top_values"] = method
 
     return result
 
@@ -200,10 +225,56 @@ def _scalar_pass(
 
 
 def _top_values(
-    lf: "pl.LazyFrame", column: str, k: int
-) -> list[dict[str, Any]]:
-    """The k most frequent values of a column, as JSON-ready records."""
-    counts = analytics.value_counts(lf, column, k)
+    lf: "pl.LazyFrame",
+    column: str,
+    k: int,
+    n_distinct: int,
+    max_groups: int,
+    total_rows: int,
+    sample_rows: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """The k most frequent values of a column, and how they were obtained.
+
+    An exact group_by is only affordable at low cardinality: Polars 1.37 has no
+    spilling, so past a small group count the cost of grouping tracks the row
+    count rather than the group count. Above ``max_groups`` the counts are taken
+    from a bounded random sample instead, which caps memory at the sample size
+    whatever the source.
+
+    Sampling is the right trade here: top-K is a statement about the FREQUENT
+    values, and frequent values are exactly what survives a random sample. The
+    counts become estimates, so the caller is told the method and can label it.
+
+    Returns ``(records, method)`` where method is ``None`` for an exact count.
+    """
+    if n_distinct <= max_groups:
+        counts = analytics.value_counts(lf, column, k, max_groups=max_groups)
+        return _records(counts, column), None
+
+    if sample_rows <= 0:
+        # Estimating is off: say nothing rather than report a number whose cost
+        # is proportional to the source.
+        return [], "skipped-high-cardinality"
+
+    if total_rows <= sample_rows:
+        # Small enough to count exactly regardless of cardinality.
+        counts = analytics.value_counts(lf, column, k, max_groups=None)
+        return _records(counts, column), None
+
+    drawn = analytics.sample(lf, sample_rows, total_rows=total_rows).select(
+        column
+    )
+    counts = analytics.value_counts(drawn, column, k, max_groups=None)
+    # Scale the sample counts back up so they are comparable with the row count
+    # reported next to them.
+    factor = total_rows / drawn.height if drawn.height else 1.0
+    return [
+        {"value": rec["value"], "count": int(round(rec["count"] * factor))}
+        for rec in _records(counts, column)
+    ], "sampled"
+
+
+def _records(counts: "pl.DataFrame", column: str) -> list[dict[str, Any]]:
     return [
         {"value": row[0], "count": int(row[1])}
         for row in counts.select(column, "count").iter_rows()

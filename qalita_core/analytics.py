@@ -30,29 +30,65 @@ from typing import Any, Iterable, Mapping, Sequence
 import polars as pl
 
 __all__ = [
+    "CardinalityTooHigh",
     "StreamingCollectError",
     "agg",
     "approx_n_unique",
+    "estimate_groups",
     "failures",
     "quantiles",
     "row_count",
     "sample",
     "sink",
+    "skew_kurtosis",
     "top_k",
     "value_counts",
 ]
 
 
-# Default number of histogram buckets used for approximate quantiles. The
-# absolute error on a quantile is bounded by (max - min) / DEFAULT_QUANTILE_BINS
-# and memory is O(bins) per column regardless of the row count.
-DEFAULT_QUANTILE_BINS = 10_000
+# Histogram buckets used for approximate quantiles. The absolute error on a
+# quantile is bounded by (max - min) / DEFAULT_QUANTILE_BINS.
+#
+# 1000, not more: the bucket counting is a group_by, and past roughly a thousand
+# groups this Polars build stops keeping the aggregation bounded and its cost
+# starts tracking the row count instead. Measured over a 160M-row source
+# (320M in brackets):
+#
+#     bins =    512 ->     1 MiB (    1 MiB)
+#     bins =  1,000 ->     9 MiB (   12 MiB)
+#     bins = 10,000 -> 1,746 MiB (3,471 MiB)
+#
+# So the last option buys three extra digits of quantile precision at the price
+# of the memory budget.
+DEFAULT_QUANTILE_BINS = 1_000
 
 # Default bound for row-returning helpers.
 DEFAULT_ROW_LIMIT = 1_000
 
 # Default bound for sampling.
 DEFAULT_SAMPLE_ROWS = 100_000
+
+# Largest group count for which an EXACT group_by is affordable.
+#
+# Deliberately small, and measured rather than reasoned. Polars 1.37's streaming
+# group_by does not keep memory bounded by the group count: past a low
+# cardinality its cost tracks the SOURCE ROW COUNT instead. On a 160M-row source
+# (doubling to 320M in brackets):
+#
+#     1,025 groups ->     0 MiB (    0 MiB)
+#     2,000 groups ->   194 MiB (  343 MiB)
+#     8,000 groups -> 1,708 MiB (3,548 MiB)
+#   102,054 groups -> 3,298 MiB (6,775 MiB)
+#
+# Only the first row is genuinely flat, so that is where the ceiling goes.
+# Above it, callers must sample rather than aggregate exactly — which is what
+# qalita_core.profiling does for top values.
+DEFAULT_MAX_GROUPS = 1_000
+
+# Relative error allowed for the HyperLogLog group-count estimate when it is
+# compared against DEFAULT_MAX_GROUPS. Observed within 6% on the test fixtures;
+# 20% leaves room for a sketch retune without turning it into a test failure.
+HLL_OVERSHOOT = 0.20
 
 
 class StreamingCollectError(RuntimeError):
@@ -143,17 +179,26 @@ def sample(
 ) -> "pl.DataFrame":
     """Return at most ``n`` rows, drawn from the WHOLE dataset by default.
 
-    ``method="reservoir"`` (the default) hashes a row index to draw a uniform
-    pseudo-random sample in a single streaming pass. It is deterministic for a
-    given ``seed``.
+    ``method="reservoir"`` (the default) hashes the row content to draw a
+    uniform pseudo-random sample in one pass. It is deterministic for a given
+    ``seed``, and unbiased across part files — verified by the mean of a
+    monotonic id column landing on the dataset midpoint.
 
     ``method="head"`` takes the first ``n`` rows and must be requested
     explicitly. It is not a sample: on a chunked source it reads only the first
     parts, so every distribution derived from it describes one partition rather
     than the dataset. It exists for previews, not for statistics.
 
-    The return type is eager on purpose: a bounded row count is what makes the
-    memory bounded.
+    MEMORY: the OUTPUT is bounded by ``n``, but the draw itself is not free on
+    this Polars build. Measured drawing 1M rows, peak grew from 3.2 GiB on a
+    160M-row source to 3.8 GiB on a 320M-row one — sub-linear, but not flat.
+    Prefer a scalar :func:`agg` wherever a sample is not genuinely required, and
+    treat this as the escape hatch for algorithms that cannot be expressed as an
+    aggregation at all (a pandas-only third-party engine, a model fit).
+
+    Identical rows share a hash, so they are drawn or skipped together. That is
+    immaterial for distributions and matters only for a source that is mostly
+    exact duplicates.
     """
     if n <= 0:
         raise ValueError(f"sample size must be positive, got {n}")
@@ -172,17 +217,19 @@ def sample(
         return _collect(lazy)
 
     # Keep the draw spread across every part file rather than the first ones:
-    # hash a row index, which is uniform, and admit rows below a threshold.
+    # hash each row and admit the ones below a threshold. Hashing the CONTENT
+    # rather than a row index is deliberate — with_row_index needs a global
+    # counter, which this engine cannot do incrementally, and it measured 5.9 GiB
+    # against 3.8 GiB for the content hash on the same 320M-row draw.
+    #
     # Oversample slightly so the draw is very unlikely to fall short, then trim
     # with an eager uniform sample — trimming with head() would truncate the
     # tail of the dataset and bias every statistic derived from the result.
     fraction = min(1.0, (n / total) * 1.2)
     threshold = int(fraction * (2**32))
-    index = "__qalita_row_index"
+    columns = list(lazy.collect_schema().keys())
     drawn = _collect(
-        lazy.with_row_index(index)
-        .filter((pl.col(index).hash(seed=seed) % (2**32)) < threshold)
-        .drop(index)
+        lazy.filter((pl.struct(columns).hash(seed=seed) % (2**32)) < threshold)
     )
     if drawn.height <= n:
         return drawn
@@ -215,6 +262,67 @@ def approx_n_unique(
     }
 
 
+def skew_kurtosis(
+    lf: "pl.LazyFrame | pl.DataFrame",
+    columns: Sequence[str],
+) -> dict[str, dict[str, float]]:
+    """Sample skewness and excess kurtosis, in two streaming passes.
+
+    Polars' own ``Expr.skew`` / ``Expr.kurtosis`` are not streaming
+    aggregations: they materialize the column. Measured on 160M rows, asking for
+    them on four numeric columns peaked at 6.6 GiB, against 594 MiB here.
+
+    Both statistics are functions of the central moments, so they come from a
+    pass for the means followed by a pass for the centered power sums. Centering
+    in the second pass rather than expanding raw power sums is what keeps this
+    numerically usable: a column of large values would lose most of its
+    precision to cancellation in a Sum(x^4) formulation.
+
+    Matches ``bias=False`` (the adjusted Fisher-Pearson definitions, which is
+    what pandas' ``.skew()`` / ``.kurt()`` report) to about six significant
+    figures. Columns with fewer than 4 rows or zero variance are omitted.
+
+    Returns:
+        ``{column: {"skew": float, "kurtosis": float}}``.
+    """
+    if not columns:
+        return {}
+
+    lazy = _as_lazy(lf)
+    means = agg(lazy, {col: pl.col(col).mean() for col in columns})
+
+    usable = [c for c in columns if means.get(c) is not None]
+    if not usable:
+        return {}
+
+    exprs: dict[str, pl.Expr] = {}
+    for col in usable:
+        centered = pl.col(col).cast(pl.Float64) - float(means[col])
+        exprs[f"n|{col}"] = pl.col(col).count()
+        exprs[f"m2|{col}"] = (centered**2).sum()
+        exprs[f"m3|{col}"] = (centered**3).sum()
+        exprs[f"m4|{col}"] = (centered**4).sum()
+    sums = agg(lazy, exprs)
+
+    out: dict[str, dict[str, float]] = {}
+    for col in usable:
+        n = int(sums.get(f"n|{col}") or 0)
+        if n < 4:
+            continue
+        m2 = float(sums[f"m2|{col}"] or 0.0) / n
+        m3 = float(sums[f"m3|{col}"] or 0.0) / n
+        m4 = float(sums[f"m4|{col}"] or 0.0) / n
+        if m2 <= 0:
+            continue
+        g1 = m3 / (m2**1.5)
+        g2 = m4 / (m2**2) - 3.0
+        out[col] = {
+            "skew": g1 * ((n * (n - 1)) ** 0.5) / (n - 2),
+            "kurtosis": ((n + 1) * g2 + 6) * (n - 1) / ((n - 2) * (n - 3)),
+        }
+    return out
+
+
 def quantiles(
     lf: "pl.LazyFrame | pl.DataFrame",
     columns: Sequence[str],
@@ -231,8 +339,10 @@ def quantiles(
     width, ``(max - min) / bins``.
 
     ``exact=True`` delegates to Polars' exact quantile, which needs to order the
-    column. The streaming engine spills to disk rather than to RAM, so it stays
-    within the memory budget, but it is markedly slower and needs scratch space.
+    whole column. Polars 1.37 has no out-of-core execution — the old
+    ``polars-pipe`` engine is gone and the binary contains no spill path — so
+    that ordering happens in RAM and its cost follows the row count. Use it only
+    when the column is known to fit.
 
     Returns:
         ``{column: {q: value}}``. Columns that are entirely null are omitted.
@@ -321,15 +431,17 @@ def _histogram_quantiles(
         alias = f"b|{i}"
         if alias not in bucket_exprs:
             continue
+        # The sort happens AFTER collecting, on at most `bins` rows. Putting it
+        # in the lazy plan instead defeats the streaming group_by: measured on a
+        # 160M-row column, sorting inside the plan cost 1756 MiB against 121 MiB
+        # here, and it grew with the row count rather than staying flat.
         counts = _collect(
-            lf.select(bucket_exprs[alias].alias("bucket"))
-            .drop_nulls()
-            .group_by("bucket")
-            .agg(pl.len().alias("n"))
-            .sort("bucket")
-        )
+            lf.group_by(bucket_exprs[alias].alias("bucket")).agg(
+                pl.len().alias("n")
+            )
+        ).drop_nulls("bucket")
         resolved[col] = _quantiles_from_histogram(
-            counts, widths[col], probabilities
+            counts.sort("bucket"), widths[col], probabilities
         )
 
     return resolved
@@ -374,22 +486,29 @@ def top_k(
 ) -> "pl.DataFrame":
     """The ``k`` rows of an aggregate frame with the largest ``by`` value.
 
-    The ordering happens inside the engine, so the caller never materializes the
-    full frame. When ``other`` is set, the tail is folded into a single extra
-    row whose ``by`` value is the sum of everything not in the top ``k`` and
-    whose other columns are null.
+    Intended for a frame that is already an aggregate — one row per group, not
+    one per source row. When ``other`` is set, the tail is folded into a single
+    extra row whose ``by`` value is the sum of everything not in the top ``k``
+    and whose other columns are null.
+
+    The input is materialized before the sort. Leaving the sort in the lazy plan
+    would look cheaper but is not: a sort node upstream of a streaming group_by
+    defeats it, and the cost then grows with the SOURCE row count rather than
+    with the group count — measured at 1756 MiB against 121 MiB on a 160M-row
+    column, and doubling when the source doubled. Callers that group first must
+    bound the group count themselves; :func:`value_counts` does.
     """
     if k <= 0:
         raise ValueError(f"k must be positive, got {k}")
 
-    lazy = _as_lazy(lf)
-    ranked = lazy.sort(by, descending=descending, nulls_last=True)
-    head = _collect(ranked.head(k))
+    frame = lf if isinstance(lf, pl.DataFrame) else _collect(_as_lazy(lf))
+    ranked = frame.sort(by, descending=descending, nulls_last=True)
+    head = ranked.head(k)
 
     if not other:
         return head
 
-    tail_total = _collect(ranked.slice(k).select(pl.col(by).sum().alias(by)))
+    tail_total = ranked.slice(k).select(pl.col(by).sum().alias(by))
     if tail_total.height == 0 or tail_total[by][0] in (None, 0):
         return head
 
@@ -403,23 +522,84 @@ def top_k(
     )
 
 
+class CardinalityTooHigh(RuntimeError):
+    """A grouped aggregation was refused because it would not fit in memory.
+
+    Raised before the work starts, from a cheap estimate, so the caller gets a
+    diagnosable error instead of an OOM kill.
+    """
+
+    def __init__(self, column: str, estimated: int, limit: int) -> None:
+        super().__init__(
+            f"{column!r} has about {estimated:,} distinct values, above the "
+            f"{limit:,} group limit. Grouping it would hold one entry per "
+            f"distinct value in memory. Raise max_groups if you have the RAM, "
+            f"or skip this column — the most frequent values of a near-unique "
+            f"column carry no information."
+        )
+        self.column = column
+        self.estimated = estimated
+        self.limit = limit
+
+
+def estimate_groups(
+    lf: "pl.LazyFrame | pl.DataFrame",
+    keys: str | Sequence[str],
+) -> int:
+    """Estimate how many groups a group_by on ``keys`` would produce.
+
+    HyperLogLog over the keys, so this costs constant memory and one streaming
+    pass whatever the cardinality. Use it to decide whether the grouped
+    aggregation is affordable BEFORE running it.
+    """
+    if isinstance(keys, str):
+        expr = pl.col(keys)
+    else:
+        columns = list(keys)
+        if len(columns) == 1:
+            expr = pl.col(columns[0])
+        else:
+            expr = pl.concat_str(
+                [pl.col(c).cast(pl.String).fill_null("\x00") for c in columns],
+                separator="\x1f",
+            ).hash()
+    return int(agg(lf, {"n": expr.approx_n_unique()})["n"] or 0)
+
+
 def value_counts(
     lf: "pl.LazyFrame | pl.DataFrame",
     column: str,
     k: int = 50,
     *,
     other: bool = False,
+    max_groups: int | None = DEFAULT_MAX_GROUPS,
 ) -> "pl.DataFrame":
     """The ``k`` most frequent values of ``column``, with their counts.
 
-    Replaces the full ``value_counts`` / ``.unique()`` calls that build one
-    Python entry per distinct value. The grouping runs inside the streaming
-    engine, which spills group state to disk instead of RAM.
+    The RESULT is bounded by ``k``, but the group table that produces it is not:
+    a group_by holds one entry per distinct value, and Polars' streaming engine
+    does not spill it. Measured on 160M rows, grouping a column with one
+    distinct value per row peaked at 9.7 GiB; grouping a 1000-value column
+    peaked at 74 MiB. Cardinality, not row count, is what costs memory here.
+
+    So the cardinality is estimated first — constant memory, one pass — and a
+    column above ``max_groups`` raises :class:`CardinalityTooHigh` instead of
+    being attempted. Pass ``max_groups=None`` to skip the guard when you already
+    know the column is coarse.
 
     Returns a frame with columns ``[column, "count"]``, at most ``k`` rows
     (``k + 1`` when ``other`` is set and the tail is non-empty).
     """
-    grouped = _as_lazy(lf).group_by(column).agg(pl.len().alias("count"))
+    lazy = _as_lazy(lf)
+    if max_groups is not None:
+        estimated = estimate_groups(lazy, column)
+        # The estimate is a HyperLogLog sketch and overshoots by a few percent,
+        # so comparing it raw would refuse a column that sits exactly on the
+        # limit. The slack is the sketch's error, not extra memory budget.
+        if estimated > max_groups * (1 + HLL_OVERSHOOT):
+            raise CardinalityTooHigh(column, estimated, max_groups)
+
+    grouped = lazy.group_by(column).agg(pl.len().alias("count"))
     return top_k(grouped, "count", k, other=other)
 
 

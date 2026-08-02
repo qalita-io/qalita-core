@@ -391,9 +391,10 @@ def streaming_outliers(
             ``q3 + threshold * IQR``; ``"zscore"`` at ``mean ± threshold * std``.
         threshold: defaults to ``1.5`` for ``"iqr"`` and ``3.0`` for
             ``"zscore"``.
-        exact: compute the quartiles exactly instead of from a histogram. Costs
-            an ordering of each column (the streaming engine spills to disk, so
-            it stays within the memory budget but is markedly slower).
+        exact: compute the quartiles exactly instead of from a histogram. That
+            orders each column in RAM — Polars 1.37 has no out-of-core
+            execution — so its cost follows the row count. Use it only when the
+            columns are known to fit.
 
     Returns:
         ``{column: {...}}`` with, per column:
@@ -697,10 +698,15 @@ class DuplicateAggregator:
     """Count duplicated key combinations over a whole dataset.
 
     Polars owns the counting state: every frame added is registered in a single
-    lazy plan, grouped once at the end, and the engine spills the group state to
-    disk. The previous shape collected the group-by result into a Python dict
-    with one entry per distinct key combination — on a primary key that is one
-    tuple per row, which is precisely the case this class exists to answer.
+    lazy plan and grouped once at the end, instead of the previous shape, which
+    collected the group-by result into a Python dict with one entry per distinct
+    key combination.
+
+    That removes the Python-side copy but not the underlying limit: the engine
+    keeps its own hash table, and this Polars build has no spilling, so a
+    near-unique key still costs memory proportional to the source. Callers that
+    may face one should check ``analytics.estimate_groups`` first —
+    duplicates_finder_pack does — and fall back to the approximate count.
 
     ``add_df`` (pandas) still fills :attr:`combo_to_count`, because the frames
     it is handed are already in memory; do not use it on a large source.

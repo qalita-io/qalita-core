@@ -335,9 +335,22 @@ def test_value_counts_is_bounded_and_totals_the_dataset(small_dataset):
     assert counts["count"].sum() == small_dataset.rows
 
 
-def test_value_counts_on_a_unique_column_stays_bounded(small_dataset):
-    """One distinct value per row must still produce k rows, not `rows` rows."""
-    counts = analytics.value_counts(small_dataset.scan(), "uid", 10)
+def test_value_counts_refuses_a_near_unique_column(small_dataset):
+    """The guard fires BEFORE the work, so the caller gets an error not an OOM.
+
+    Bounding the k rows that come out is not enough: the group table that
+    produces them holds one entry per distinct value, and this Polars build has
+    no spilling at all, so grouping a near-unique column is what actually
+    exhausts the machine.
+    """
+    with pytest.raises(analytics.CardinalityTooHigh) as excinfo:
+        analytics.value_counts(small_dataset.scan(), "uid", 10)
+    assert "uid" in str(excinfo.value)
+
+    # Opting out is possible, and then the result is still capped at k.
+    counts = analytics.value_counts(
+        small_dataset.scan(), "uid", 10, max_groups=None
+    )
     assert counts.height == 10
     assert counts["count"].to_list() == [1] * 10
 
