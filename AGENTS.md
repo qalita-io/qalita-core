@@ -27,7 +27,9 @@ Instructions for AI agents working on this repository.
 ## Dependencies
 
 See `pyproject.toml` for full dependency list. Key dependencies:
-- `polars>=1.0`, `pyarrow>=19.0`
+- `polars>=1.30`, `pyarrow>=19.0` — 1.30 is a hard floor, not a courtesy: below
+  1.25 `collect(engine="streaming")` is silently ignored and 1.27-1.29 panic in
+  the streaming parquet reader
 - `sqlalchemy>=2.0`, `psycopg2-binary`, `pymongo>=4.0`
 - `boto3`, `google-cloud-storage`, `azure-storage-blob`
 
@@ -126,6 +128,24 @@ qalita-core/
 - **Tags** : Strict semver `X.Y.Z` (⚠️ NO `v` prefix)
 - **Commits** : English, conventional commits (`feat:`, `fix:`, `chore:`)
 - **Branches** : `main` (prod), feature branches for development
+
+### Release order: core before packs
+
+`version` in `pyproject.toml` is literally `0.0.0-dev`; a real version only
+exists once a human pushes the tag, and `ci.yml` publishes to PyPI from the tag.
+Every pack in `qalita/packs` now declares `qalita-core>=2.0.0` because it uses
+the streaming API (`analytics`, `Pack.scan_data`), and `scripts/run.sh` runs
+`uv lock` on the worker for every job. So the order is not optional:
+
+1. Merge core to `main`.
+2. Push tag `2.0.0` on `main`, wait for `ci.yml` to publish it to PyPI.
+3. Only then merge the matching work into `packs/main`.
+
+Merging packs first publishes packs that no worker can install — `uv lock`
+fails with `No solution found ... qalita-core>=2.0.0` and every analysis job on
+every source fails until core is tagged. The `resolve` job in
+`packs/.github/workflows/publish.yml` blocks that merge, so a packs PR staying
+red on `resolve` usually means step 2 has not happened yet.
 
 ## Security Rules
 

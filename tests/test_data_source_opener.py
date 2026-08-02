@@ -632,6 +632,48 @@ class TestObjectPaths:
         )
         assert list(source.object_paths) == ["file_people"]
 
+    def test_two_tables_with_the_same_slug_stay_two_objects(self, tmp_path):
+        """``slugify`` folds the accent, so both tables shared one base name.
+
+        The base name is both the ``object_paths`` key and the part-file
+        prefix, so the second table used to truncate the first one's
+        ``_part_1`` and the two path lists were merged: one table disappeared
+        from ``tables()`` and the survivor's rows were counted twice. Mongo
+        collections and ES indices hit this with ``-`` and ``.``; SQL hits it
+        with accents and with case.
+        """
+        db_path = tmp_path / "collide.db"
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        for name, count in (("données", 5), ("donnees", 2)):
+            cursor.execute(f'CREATE TABLE "{name}"(id INTEGER, v TEXT)')
+            cursor.executemany(
+                f'INSERT INTO "{name}" VALUES (?,?)',
+                [(i, f"{name}-{i}") for i in range(count)],
+            )
+        conn.commit()
+        conn.close()
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        paths = source.get_data(
+            "*",
+            pack_config={
+                "parquet_output_dir": str(tmp_path / "out"),
+                # Forces several parts, so a collision overwrites part 1 while
+                # part 2 survives — the shape that silently loses rows.
+                "chunk_rows": 3,
+            },
+        )
+
+        assert len(source.object_paths) == 2
+        # No part file is claimed by two objects, hence none was overwritten.
+        assert len(set(paths)) == len(paths)
+        rows = sum(
+            pl.scan_parquet(parts).select(pl.len()).collect().item()
+            for parts in source.object_paths.values()
+        )
+        assert rows == 7
+
 
 class TestStreamingFileFormats:
     """Files always go through the Polars streaming path now."""

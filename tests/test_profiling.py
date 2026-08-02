@@ -185,6 +185,65 @@ def test_top_values_report_the_real_frequencies(profiled, small_dataset):
         )
 
 
+def test_profile_survives_a_column_named_count():
+    """A dataset is allowed to have a column called "count".
+
+    Nothing here is exotic — an inventory export with `sku,count` used to
+    abort the whole profile instead of profiling the other columns.
+    """
+    lf = pl.LazyFrame({"sku": ["a", "b", "a"], "count": [3, 4, 5]})
+    profiled = profiling.profile(lf, top_k=3)
+
+    assert profiled["sku"]["top_values"][0] == {"value": "a", "count": 2}
+    assert {entry["value"] for entry in profiled["count"]["top_values"]} == {
+        3,
+        4,
+        5,
+    }
+
+
+def test_profile_survives_columns_named_after_internal_aliases():
+    """A dataset is allowed to have a column called anything.
+
+    Every internal alias — the row counter, the histogram bucket/size pair,
+    the reserved frequency column — has to be immune to a user column of the
+    same name, not merely unlikely to meet one.
+    """
+    lf = pl.LazyFrame(
+        {
+            "__rows": [1.0, 2.0, 3.0, 4.0],
+            "bucket": [10.0, 20.0, 30.0, 40.0],
+            "n": ["a", "b", "a", "c"],
+            analytics.COUNT_COLUMN: [1, 1, 2, 2],
+        }
+    )
+    profiled = profiling.profile(lf, top_k=2)
+
+    assert set(profiled) == {"__rows", "bucket", "n", analytics.COUNT_COLUMN}
+    # The row counter still describes the frame, not the column named "__rows".
+    assert profiled["bucket"]["n"] == 4
+    # The histogram ran on the column, not on an alias of the same name.
+    assert 10.0 <= profiled["bucket"]["quantiles"]["0.5"] <= 40.0
+    assert profiled["n"]["top_values"][0] == {"value": "a", "count": 2}
+
+
+def test_profile_survives_nan_and_inf_in_a_numeric_column():
+    """One NaN or Inf must degrade a statistic, not lose the analysis."""
+    values = [float(i) for i in range(1, 1_001)]
+    values += [float("nan"), float("inf")]
+    lf = pl.LazyFrame({"price": values, "sku": ["a"] * len(values)})
+
+    profiled = profiling.profile(lf, top_k=2)
+
+    assert profiled["price"]["quantiles"]["0.5"] == pytest.approx(
+        500.0, abs=2.0
+    )
+    # Non-finite values are excluded from the histogram, not from the row
+    # accounting: they are values, not missing data.
+    assert profiled["price"]["n"] == len(values)
+    assert profiled["price"]["n_missing"] == 0
+
+
 def test_top_k_zero_skips_the_per_column_pass(small_dataset):
     without = profiling.profile(small_dataset.scan(), top_k=0)
     assert all("top_values" not in column for column in without.values())

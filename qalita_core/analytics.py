@@ -30,6 +30,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import polars as pl
 
 __all__ = [
+    "COUNT_COLUMN",
     "CardinalityTooHigh",
     "StreamingCollectError",
     "agg",
@@ -89,6 +90,15 @@ DEFAULT_MAX_GROUPS = 1_000
 # compared against DEFAULT_MAX_GROUPS. Observed within 6% on the test fixtures;
 # 20% leaves room for a sketch retune without turning it into a test failure.
 HLL_OVERSHOOT = 0.20
+
+# Name of the frequency column produced by :func:`value_counts`.
+#
+# Prefixed rather than the obvious "count" because the group key keeps the
+# user's column name, and Polars refuses a group key and an aggregate output
+# that share a name: a dataset with a column literally called "count" used to
+# abort the whole job. Readers must use this constant rather than a literal,
+# and :func:`value_counts` renames it back to "count" whenever that is free.
+COUNT_COLUMN = "__qalita_count"
 
 
 class StreamingCollectError(RuntimeError):
@@ -323,6 +333,23 @@ def skew_kurtosis(
     return out
 
 
+def _as_float(column: str) -> "pl.Expr":
+    """``column`` as Float64.
+
+    The cast comes FIRST everywhere non-finite values are tested, because
+    ``is_finite`` is not implemented for Decimal (nor for temporal dtypes) and
+    :func:`numeric_columns` reports Decimal as numeric — so guarding with a
+    bare ``pl.col(c).is_finite()`` would trade a NaN crash for a Decimal one.
+    """
+    return pl.col(column).cast(pl.Float64)
+
+
+def _finite(column: str) -> "pl.Expr":
+    """``column`` as Float64, with NaN and +/-Inf dropped."""
+    as_float = _as_float(column)
+    return as_float.filter(as_float.is_finite())
+
+
 def quantiles(
     lf: "pl.LazyFrame | pl.DataFrame",
     columns: Sequence[str],
@@ -344,8 +371,17 @@ def quantiles(
     that ordering happens in RAM and its cost follows the row count. Use it only
     when the column is known to fit.
 
+    NaN and +/-Inf are excluded from both paths, which is what the pandas
+    implementation this replaced did (``dropna()`` before ``.quantile()``).
+    They are not missing data, but they have no place on a number line: a
+    single NaN would otherwise abort the histogram, and a single Inf would
+    stretch the bucket width to infinity and collapse every quantile onto the
+    minimum. Both paths exclude them so that flipping ``exact`` does not
+    silently change the numbers.
+
     Returns:
-        ``{column: {q: value}}``. Columns that are entirely null are omitted.
+        ``{column: {q: value}}``. Columns with no finite value (entirely null,
+        or entirely NaN/Inf) are omitted.
     """
     if not columns or not qs:
         return {}
@@ -359,7 +395,7 @@ def quantiles(
         flat = agg(
             lf,
             {
-                f"{i}|{j}": pl.col(col).quantile(q)
+                f"{i}|{j}": _finite(col).quantile(q)
                 for i, col in enumerate(columns)
                 for j, q in enumerate(probabilities)
             },
@@ -388,13 +424,20 @@ def _histogram_quantiles(
     if bins < 2:
         raise ValueError(f"bins must be at least 2, got {bins}")
 
+    # Bounds come from the FINITE values only. Taking them raw would let a
+    # single +Inf make `hi - lo` infinite, and then every finite value lands in
+    # bucket 0 and every quantile collapses onto `lo`.
     bounds = agg(
         lf,
         {
-            **{f"min|{i}": pl.col(col).min() for i, col in enumerate(columns)},
-            **{f"max|{i}": pl.col(col).max() for i, col in enumerate(columns)},
             **{
-                f"cnt|{i}": pl.col(col).count()
+                f"min|{i}": _finite(col).min() for i, col in enumerate(columns)
+            },
+            **{
+                f"max|{i}": _finite(col).max() for i, col in enumerate(columns)
+            },
+            **{
+                f"cnt|{i}": _finite(col).count()
                 for i, col in enumerate(columns)
             },
         },
@@ -417,10 +460,15 @@ def _histogram_quantiles(
             continue
         width = (hi - lo) / bins
         widths[col] = (lo, width)
+        # The cast to Int32 is strict, and NaN has no integer image, so a
+        # non-finite value has to become NULL BEFORE it reaches the cast —
+        # hence the cast sits outside the when/then. The nulls are removed by
+        # the drop_nulls below, which also keeps them out of the histogram
+        # denominator in _quantiles_from_histogram.
+        as_float = _as_float(col)
         bucket_exprs[f"b|{i}"] = (
-            ((pl.col(col).cast(pl.Float64) - lo) / width)
-            .floor()
-            .clip(0, bins - 1)
+            pl.when(as_float.is_finite())
+            .then(((as_float - lo) / width).floor().clip(0, bins - 1))
             .cast(pl.Int32)
         )
 
@@ -588,7 +636,11 @@ def value_counts(
     know the column is coarse.
 
     Returns a frame with columns ``[column, "count"]``, at most ``k`` rows
-    (``k + 1`` when ``other`` is set and the tail is non-empty).
+    (``k + 1`` when ``other`` is set and the tail is non-empty). When
+    ``column`` is itself called ``"count"`` the frequency column keeps its
+    reserved name :data:`COUNT_COLUMN` instead — Polars cannot hold two
+    columns of the same name, so one of them has to give. The frequency is
+    always the SECOND column; read it positionally rather than by name.
     """
     lazy = _as_lazy(lf)
     if max_groups is not None:
@@ -599,8 +651,16 @@ def value_counts(
         if estimated > max_groups * (1 + HLL_OVERSHOOT):
             raise CardinalityTooHigh(column, estimated, max_groups)
 
-    grouped = lazy.group_by(column).agg(pl.len().alias("count"))
-    return top_k(grouped, "count", k, other=other)
+    # Group and sort under a name the group key cannot already have. The
+    # grouped frame holds exactly [key, aggregate], so avoiding `column` is
+    # enough — and it has to be avoided, because Polars refuses two columns of
+    # the same name and a dataset is allowed to call a column anything.
+    alias = COUNT_COLUMN if column != COUNT_COLUMN else COUNT_COLUMN + "_"
+    grouped = lazy.group_by(column).agg(pl.len().alias(alias))
+    ranked = top_k(grouped, alias, k, other=other)
+    if column == "count":
+        return ranked
+    return ranked.rename({alias: "count"})
 
 
 def failures(

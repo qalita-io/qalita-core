@@ -280,6 +280,76 @@ def test_quantiles_omit_an_all_null_column():
     assert analytics.quantiles(lf, ["a"], [0.5]) == {}
 
 
+def test_quantiles_ignore_nan_values():
+    """A single NaN must not take the whole column with it.
+
+    NaN is not null in Polars: a literal `NaN` token in a CSV, or a Parquet
+    file written by polars/pyarrow/Spark, lands as a float NaN. It used to
+    reach the strict Int32 cast of the bucket index and abort the job.
+    """
+    values = [float(i) for i in range(1, 1_001)] + [float("nan")]
+    lf = pl.LazyFrame({"a": values})
+
+    approximate = analytics.quantiles(lf, ["a"], [0.5])
+    exact = analytics.quantiles(lf, ["a"], [0.5], exact=True)
+
+    # NaN is excluded from the sample, so the median is the median of 1..1000.
+    assert approximate["a"][0.5] == pytest.approx(500.0, abs=2.0)
+    assert exact["a"][0.5] == pytest.approx(500.0, abs=1.0)
+
+
+def test_quantiles_ignore_infinite_values():
+    """+/-Inf poisons the bucket WIDTH, not just one row.
+
+    With Inf in the bounds the width is inf, every finite value falls in
+    bucket 0 and every quantile collapses to the minimum — so excluding
+    non-finite values from min/max is the load-bearing half of the fix.
+    """
+    values = [float(i) for i in range(1, 1_001)]
+    values += [float("inf"), float("-inf")]
+    lf = pl.LazyFrame({"a": values})
+
+    approximate = analytics.quantiles(lf, ["a"], [0.5])
+    exact = analytics.quantiles(lf, ["a"], [0.5], exact=True)
+
+    assert approximate["a"][0.5] == pytest.approx(500.0, abs=2.0)
+    assert exact["a"][0.5] == pytest.approx(500.0, abs=1.0)
+
+
+def test_quantiles_omit_an_all_nan_column():
+    """Same convention as an all-null column: omitted, not crashed."""
+    lf = pl.LazyFrame({"a": [float("nan")] * 10})
+    assert analytics.quantiles(lf, ["a"], [0.5]) == {}
+    assert analytics.quantiles(lf, ["a"], [0.5], exact=True) == {}
+
+
+def test_quantiles_still_work_on_a_decimal_column():
+    """`is_finite` is not implemented for Decimal, so the cast comes first.
+
+    `numeric_columns` reports Decimal as numeric, so guarding non-finite
+    values with a naive `pl.col(c).is_finite()` would trade the NaN crash for
+    a Decimal crash.
+    """
+    lf = pl.LazyFrame({"a": [str(i) for i in range(1, 1_001)]}).with_columns(
+        pl.col("a").cast(pl.Decimal(12, 2))
+    )
+
+    approximate = analytics.quantiles(lf, ["a"], [0.5])
+    exact = analytics.quantiles(lf, ["a"], [0.5], exact=True)
+
+    assert approximate["a"][0.5] == pytest.approx(500.0, abs=2.0)
+    assert exact["a"][0.5] == pytest.approx(500.0, abs=1.0)
+
+
+def test_quantiles_of_a_column_named_like_the_bucket_alias():
+    """The histogram's internal aliases must not shadow a user column."""
+    for name in ("bucket", "n"):
+        lf = pl.LazyFrame({name: [float(i) for i in range(1, 1_001)]})
+        assert analytics.quantiles(lf, [name], [0.5])[name][0.5] == (
+            pytest.approx(500.0, abs=2.0)
+        )
+
+
 def test_quantiles_reject_probabilities_outside_zero_one(small_dataset):
     with pytest.raises(ValueError, match=r"within \[0, 1\]"):
         analytics.quantiles(small_dataset.scan(), ["id"], [1.5])
@@ -333,6 +403,30 @@ def test_value_counts_is_bounded_and_totals_the_dataset(small_dataset):
     counts = analytics.value_counts(small_dataset.scan(), "key", 5, other=True)
     assert counts.height == 6  # 5 values plus the folded tail
     assert counts["count"].sum() == small_dataset.rows
+
+
+def test_value_counts_survives_a_column_named_count():
+    """A dataset is allowed to have a column called "count".
+
+    The frequency column used to be aliased "count" too, and Polars refuses a
+    group key and an aggregate output that share a name.
+    """
+    lf = pl.LazyFrame({"count": [3, 4, 3, 5]})
+    counts = analytics.value_counts(lf, "count", 10)
+
+    # The group key keeps the user's name, so the frequency column has to be
+    # the reserved one — they cannot both be called "count".
+    assert counts.columns == ["count", analytics.COUNT_COLUMN]
+    assert dict(counts.iter_rows()) == {3: 2, 4: 1, 5: 1}
+
+
+def test_value_counts_survives_a_column_named_after_the_reserved_alias():
+    """Even the reserved name itself is a legal column name."""
+    lf = pl.LazyFrame({analytics.COUNT_COLUMN: [3, 4, 3, 5]})
+    counts = analytics.value_counts(lf, analytics.COUNT_COLUMN, 10)
+
+    assert counts.columns == [analytics.COUNT_COLUMN, "count"]
+    assert dict(counts.iter_rows()) == {3: 2, 4: 1, 5: 1}
 
 
 def test_value_counts_refuses_a_near_unique_column(small_dataset):

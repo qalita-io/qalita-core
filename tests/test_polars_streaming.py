@@ -214,6 +214,164 @@ class TestPolarsIO:
         assert sniff_json_format(path) == "ndjson"
 
 
+class TestPinnedTypeVersusLaterBatches:
+    """What happens when a batch does not fit the type pinned from the first.
+
+    These paths — rows from a cursor, documents from Mongo/Elasticsearch, an
+    xlsx sheet — carry no declared type, so the type comes from the first
+    ``fetch_rows`` rows. Everything here is about the rows that come after.
+    """
+
+    def test_a_later_decimal_is_not_floored_into_an_int_column(
+        self, temp_parquet_dir
+    ):
+        """A price column whose first chunk is whole numbers.
+
+        ``pa.array([19.99], type=pa.int64())`` truncates instead of raising, so
+        the pinned int64 used to eat the decimals of every later batch with no
+        error, no warning and no way to notice afterwards.
+        """
+        from qalita_core.polars_io import write_row_batches
+
+        rows = [(0, 10), (1, 10), (2, 10), (3, 19.99), (4, 5.25)]
+        paths = write_row_batches(
+            iter(rows),
+            ["qty", "price"],
+            temp_parquet_dir,
+            "prices",
+            chunk_rows=1000,
+            fetch_rows=3,
+        )
+
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["price"].to_list() == [10.0, 10.0, 10.0, 19.99, 5.25]
+        assert frame["qty"].to_list() == [0, 1, 2, 3, 4]
+
+    def test_documents_keep_their_decimals(self, temp_parquet_dir):
+        """Same on the document path (MongoDB, Elasticsearch, JSON arrays).
+
+        BSON mixes int32, int64 and double in one field routinely, so this is
+        the ordinary case there rather than the exotic one.
+        """
+        from qalita_core.polars_io import write_dict_rows
+
+        documents = [{"v": 0}, {"v": 1}, {"v": 2}, {"v": 3.5}]
+        paths = write_dict_rows(
+            iter(documents),
+            temp_parquet_dir,
+            "docs",
+            chunk_rows=1000,
+            fetch_rows=3,
+        )
+
+        assert pl.scan_parquet(paths).collect()["v"].to_list() == [
+            0.0,
+            1.0,
+            2.0,
+            3.5,
+        ]
+
+    def test_a_later_text_value_widens_the_whole_object(
+        self, temp_parquet_dir
+    ):
+        """The "N/A" row: the load completes, as text, parts and all.
+
+        Widening only the parts still to be written would leave the object with
+        two Parquet schemas, so the parts already on disk are rewritten too —
+        ``pl.scan_parquet`` over all of them has to work.
+        """
+        from qalita_core.polars_io import write_row_batches
+
+        rows = [(i, i * 10) for i in range(5)] + [(5, "N/A")]
+        paths = write_row_batches(
+            iter(rows),
+            ["id", "score"],
+            temp_parquet_dir,
+            "scores",
+            # Two rows per part, so the flip happens with parts already closed.
+            chunk_rows=2,
+            fetch_rows=5,
+        )
+
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["score"].dtype == pl.String
+        assert frame["score"].to_list() == ["0", "10", "20", "30", "40", "N/A"]
+
+    def test_mixed_types_inside_one_batch_still_become_text(
+        self, temp_parquet_dir
+    ):
+        """The documented fallback, unchanged: mixed values are text."""
+        from qalita_core.polars_io import write_row_batches
+
+        paths = write_row_batches(
+            iter([(1,), (2,), ("N/A",)]),
+            ["v"],
+            temp_parquet_dir,
+            "mixed",
+            chunk_rows=1000,
+        )
+        assert pl.scan_parquet(paths).collect()["v"].to_list() == [
+            "1",
+            "2",
+            "N/A",
+        ]
+
+    def test_a_missing_column_still_fails_and_leaves_no_parts(
+        self, temp_parquet_dir
+    ):
+        """Not every divergence is widenable, and a failed load cleans up.
+
+        ``Pack.cleanup()`` only knows the paths ``get_data`` returned, and a
+        raising load returns none — so an aborted writer that leaves its parts
+        behind leaks them on the staging volume forever.
+        """
+        from qalita_core.polars_io import (
+            SchemaDriftError,
+            write_arrow_batches,
+        )
+
+        batches = [
+            pl.DataFrame({"a": [1, 2], "b": ["x", "y"]}),
+            pl.DataFrame({"a": [3, 4]}),
+        ]
+        with pytest.raises(SchemaDriftError):
+            write_arrow_batches(
+                iter(batches),
+                temp_parquet_dir,
+                "incomplete",
+                chunk_rows=2,
+            )
+
+        assert not list(Path(temp_parquet_dir).glob("incomplete_part_*"))
+
+    def test_excel_decimals_survive_an_integral_first_chunk(
+        self, temp_parquet_dir
+    ):
+        """End to end through the real Excel path, which cannot be typed."""
+        from openpyxl import Workbook
+
+        from qalita_core.data_source_opener import FileSource
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["qty", "price"])
+        for row in [(0, 10), (1, 10), (2, 10), (3, 19.99), (4, 5.25)]:
+            sheet.append(list(row))
+        path = os.path.join(temp_parquet_dir, "prices.xlsx")
+        workbook.save(path)
+
+        source = FileSource(path)
+        paths = source.get_data(
+            pack_config={
+                "parquet_output_dir": os.path.join(temp_parquet_dir, "out"),
+                "fetch_rows": 3,
+            }
+        )
+
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["price"].to_list() == [10.0, 10.0, 10.0, 19.99, 5.25]
+
+
 class TestCompletenessAggregatorPolars:
     """Test CompletenessAggregator with Polars."""
 

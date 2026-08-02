@@ -233,6 +233,67 @@ def _conform(table: "pa.Table", schema: "pa.Schema") -> "pa.Table":
         ) from exc
 
 
+def _castable(column: Any, target: "pa.DataType") -> bool:
+    """Whether ``column`` fits ``target`` under Arrow's *checked* cast rules."""
+    try:
+        column.cast(target)
+    except Exception:  # noqa: BLE001 - any refusal means "does not fit"
+        return False
+    return True
+
+
+def _wider_types(
+    pinned: "pa.DataType", incoming: "pa.DataType"
+) -> List["pa.DataType"]:
+    """Types that could hold both the pinned column and the new batch.
+
+    The ladder is monotone and short — integer -> float64 -> text — so a
+    pathological source can trigger at most two rewrites of a column, and never
+    a rewrite back towards a narrower type. ``large_string`` is terminal: once a
+    column is text there is nothing wider to promote it to.
+    """
+    candidates: List["pa.DataType"] = []
+    if pa.types.is_integer(pinned) and (
+        pa.types.is_floating(incoming) or pa.types.is_decimal(incoming)
+    ):
+        candidates.append(pa.float64())
+    candidates.append(pa.large_string())
+    return [c for c in candidates if not c.equals(pinned)]
+
+
+def _promotions(
+    table: "pa.Table", schema: "pa.Schema"
+) -> Dict[str, List["pa.DataType"]]:
+    """Columns the batch does not fit, and the wider types that would hold it.
+
+    Empty when every divergent column can simply be cast down to the pinned
+    type, which is the ordinary case (an int32 batch into an int64 column).
+    """
+    promotions: Dict[str, List["pa.DataType"]] = {}
+    for field in schema:
+        if field.name not in table.schema.names:
+            continue
+        column = table.column(field.name)
+        if column.type.equals(field.type) or _castable(column, field.type):
+            continue
+        wider = [
+            candidate
+            for candidate in _wider_types(field.type, column.type)
+            if _castable(column, candidate)
+        ]
+        if wider:
+            promotions[field.name] = wider
+    return promotions
+
+
+def _with_types(
+    schema: "pa.Schema", types: Dict[str, "pa.DataType"]
+) -> "pa.Schema":
+    return pa.schema(
+        [pa.field(f.name, types.get(f.name, f.type)) for f in schema]
+    )
+
+
 def _batch_rows(chunk_rows: int, fetch_rows: Optional[int]) -> int:
     """Rows held in Python at once, never more than one part."""
     return max(1, min(int(chunk_rows), int(fetch_rows or DEFAULT_FETCH_ROWS)))
@@ -307,6 +368,10 @@ class ParquetPartWriter:
         table = _as_table(data)
         if self.schema is None:
             self.schema = _pin_schema(table.schema, self.type_hints)
+        if not table.schema.equals(self.schema):
+            promotions = _promotions(table, self.schema)
+            if promotions:
+                self._promote(promotions)
         table = _conform(table, self.schema)
 
         offset = 0
@@ -338,14 +403,119 @@ class ParquetPartWriter:
             self._close_part()
         return list(self.paths)
 
-    def abort(self) -> None:
-        """Close the current part after a failure, leaving what was written."""
+    def abort(self, discard: bool = False) -> None:
+        """Close the current part after a failure.
+
+        ``discard`` also unlinks what was written. Every caller that aborts
+        re-raises, so ``get_data`` never returns those paths and
+        ``Pack.cleanup()`` — which only knows the paths ``get_data`` returned —
+        cannot delete them: without this, each failed load leaks a part on the
+        staging volume until someone notices the volume is full.
+        """
+        current = self._current_path
         try:
             self._close_part()
         except Exception:  # noqa: BLE001 - the original error is the story
             logger.exception(
                 "failed to close parquet part for %s", self.base_name
             )
+        if not discard:
+            return
+        for path in list(dict.fromkeys([*self.paths, current])):
+            if not path:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:  # noqa: PERF203 - best effort, we are failing
+                logger.debug("could not remove partial part %s", path)
+        self.paths.clear()
+
+    def _promote(self, promotions: Dict[str, List["pa.DataType"]]) -> None:
+        """Widen the pinned schema, rewriting the parts already on disk.
+
+        Widening only the parts still to be written would leave the object with
+        two Parquet schemas, and ``pl.scan_parquet(parts)`` then raises with
+        nothing to say which part diverged — invariant #1 above. So the promotion
+        is all-or-nothing: every existing part is rewritten to the wider type
+        first, and if that cannot be done the schema stays as it was and
+        ``_conform`` raises ``SchemaDriftError`` as before.
+        """
+        levels = max(len(v) for v in promotions.values())
+        for level in range(levels):
+            widened = _with_types(
+                self.schema,
+                {
+                    name: types[min(level, len(types) - 1)]
+                    for name, types in promotions.items()
+                },
+            )
+            if widened.equals(self.schema):
+                continue
+            self._close_part()
+            if not self._rewrite_parts(widened):
+                continue
+            for field in widened:
+                old = self.schema.field(field.name).type
+                if not old.equals(field.type):
+                    logger.warning(
+                        "%s: column %r holds values that do not fit %s; the "
+                        "object is being rewritten as %s. Metrics computed on "
+                        "that column change accordingly.",
+                        self.base_name,
+                        field.name,
+                        old,
+                        field.type,
+                    )
+            self.schema = widened
+            return
+
+    def _rewrite_parts(self, schema: "pa.Schema") -> bool:
+        """Recast every part already written to ``schema``. All or nothing.
+
+        Each part is streamed through a temporary file so a failure halfway
+        leaves the object exactly as it was; the temporaries also mean the
+        rewrite transiently needs one extra part's worth of space, which is why
+        the disk guard runs first.
+        """
+        if not self.paths:
+            return True
+        check_disk_space(self.output_dir, min_free_bytes=self.min_free_bytes)
+        rewritten: List[tuple] = []
+        batch_rows = _batch_rows(self.chunk_rows, None)
+        try:
+            for path in self.paths:
+                temporary = f"{path}.widening"
+                rewritten.append((path, temporary))
+                reader = pq.ParquetFile(path)
+                writer = pq.ParquetWriter(
+                    temporary, schema, compression=self.compression
+                )
+                try:
+                    for batch in reader.iter_batches(batch_size=batch_rows):
+                        writer.write_table(
+                            _conform(pa.Table.from_batches([batch]), schema),
+                            row_group_size=self.chunk_rows,
+                        )
+                finally:
+                    writer.close()
+                    reader.close()
+        except Exception:  # noqa: BLE001 - the caller falls back or raises
+            logger.debug(
+                "could not rewrite the parts of %s as %s",
+                self.base_name,
+                schema,
+                exc_info=True,
+            )
+            for _, temporary in rewritten:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            return False
+
+        for path, temporary in rewritten:
+            os.replace(temporary, path)
+        return True
 
     def _open_part(self) -> None:
         check_disk_space(self.output_dir, min_free_bytes=self.min_free_bytes)
@@ -396,7 +566,7 @@ def write_arrow_batches(
                 continue
             writer.write(batch)
     except Exception:
-        writer.abort()
+        writer.abort(discard=True)
         raise
     return writer.close()
 
@@ -445,7 +615,7 @@ def write_row_batches(
         if buffered:
             writer.write(_columns_to_table(names, buffer, writer.schema))
     except Exception:
-        writer.abort()
+        writer.abort(discard=True)
         raise
     return writer.close()
 
@@ -489,7 +659,7 @@ def write_dict_rows(
             _note_unknown_keys(buffer, names, dropped, base_name)
             writer.write(_documents_to_table(names, buffer, writer.schema))
     except Exception:
-        writer.abort()
+        writer.abort(discard=True)
         raise
     return writer.close()
 
@@ -577,20 +747,39 @@ def _safe_array(
     A driver that returns an int for some rows and a string for others would
     otherwise abort the whole load; representing that column as text keeps every
     part of the object identically typed, which is what makes them scannable.
+
+    The array is built untyped and *then* cast, never handed to
+    ``pa.array(values, type=target)``: pyarrow's Python-sequence converter is
+    unsafe, so ``pa.array([19.99], type=pa.int64())`` silently returns ``19``
+    while ``pa.array([19.99]).cast(pa.int64())`` refuses. A spreadsheet or Mongo
+    collection whose first batch happens to hold whole numbers would otherwise
+    have every later decimal floored, with no warning anywhere.
+
+    A batch that does not fit the pinned type is returned as it is, so the
+    writer can widen the object's schema (or ``_conform`` can name the column);
+    deciding that here is impossible, since the parts already on disk have to be
+    rewritten with it.
     """
     errors = (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError)
-    if target is not None:
-        try:
-            return pa.array(values, type=target)
-        except errors:
-            pass
     try:
-        return pa.array(values)
+        array = pa.array(values)
     except errors:
-        return pa.array(
+        array = pa.array(
             [None if v is None else str(v) for v in values],
             type=pa.large_string(),
         )
+    if target is None or array.type == target:
+        return array
+    try:
+        return array.cast(target)
+    except errors:
+        if pa.types.is_large_string(target) or pa.types.is_string(target):
+            # A column already pinned as text takes anything, including the
+            # shapes Arrow refuses to cast (a nested value among scalars).
+            return pa.array(
+                [None if v is None else str(v) for v in values], type=target
+            )
+        return array
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +844,7 @@ def stream_sql_to_parquet(
             for batch in batches:
                 writer.write(batch)
         except Exception:
-            writer.abort()
+            writer.abort(discard=True)
             raise
         if writer.schema is None and type_hints:
             # An empty result set yields no batch at all, so the schema can only

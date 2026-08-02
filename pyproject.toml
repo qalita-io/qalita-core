@@ -21,7 +21,14 @@ classifiers = [
     "Natural Language :: English"
 ]
 dependencies = [
-    "polars>=1.0.0",  # Primary data processing library for big data (100GB+)
+    # Primary data processing library for big data (100GB+).
+    # Floor is 1.30.0, not 1.0.0: below 1.25 `collect(engine="streaming")` is
+    # swallowed by polars' **kwargs and silently runs the in-memory engine (the
+    # exact OOM this library exists to prevent), `pl.PartitionMaxSize` does not
+    # exist below 1.25.2 nor accept `file_path` below 1.27, and 1.27-1.29 panic
+    # inside the streaming parquet reader. 1.30.0 is the lowest version on which
+    # tests/test_polars_streaming.py and tests/test_analytics.py are green.
+    "polars>=1.30.0",
     "sqlalchemy>=2.0.27",
     "pyarrow>=19.0.0",
     "openpyxl>=3.1.2",
@@ -69,6 +76,12 @@ dev = [
     "black>=23.3.0",
     "pre-commit>=3.3.3",
     "pytest>=7.4.0",
+    # tests/test_release_contract.py reads pyproject/properties/workflow files.
+    # These three arrive transitively today; declared here so the guard cannot
+    # start erroring out because an unrelated dependency dropped them.
+    "pyyaml>=6.0",
+    "packaging>=23.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [build-system]

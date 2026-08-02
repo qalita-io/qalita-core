@@ -21,6 +21,7 @@ Two properties the rest of the system depends on:
 """
 
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -112,6 +113,65 @@ class DataSource(ABC):
             existing = {}
             self._object_paths = existing
         return existing
+
+    @property
+    def _base_names(self) -> Dict[str, str]:
+        """Base name already handed out -> the raw object it was built for."""
+        existing = getattr(self, "_base_name_owners", None)
+        if existing is None:
+            existing = {}
+            self._base_name_owners = existing
+        return existing
+
+    def _object_base_name(
+        self, source_type: str, object_identifier: str
+    ) -> str:
+        """The part-file prefix *and* ``object_paths`` key of one object.
+
+        ``slugify`` folds case, accents and every run of separators into ``_``,
+        so ``logs-2024.01`` and ``logs_2024_01`` — or ``Orders`` and ``orders``,
+        or ``données`` and ``donnees`` — produce the same base name. Both the
+        on-disk prefix and the object key derive from it, so a clash makes the
+        second object truncate the first one's ``_part_1`` and concatenates the
+        two path lists under one key: one object vanishes and the other is
+        counted twice, silently.
+
+        Disambiguation has to happen here, before the first part is opened —
+        doing it when the paths are recorded is too late, the files have already
+        overwritten each other. Only an actual clash is renamed, so the object
+        names every pack and every stored metric already uses are untouched.
+        """
+        base = _build_base_name(source_type, object_identifier)
+        identifier = str(object_identifier)
+        registry = self._base_names
+
+        candidate = base
+        owner = registry.get(candidate)
+        if owner is not None and owner != identifier:
+            # A digest keeps the suffix stable across runs and independent of
+            # the order the objects happen to be listed in. blake2s rather than
+            # sha1: nothing here is security-sensitive, but a weak-hash warning
+            # on every scan trains people to ignore the scanner.
+            digest = hashlib.blake2s(
+                identifier.encode("utf-8", "replace"), digest_size=4
+            ).hexdigest()
+            candidate = f"{base}_{digest}"
+            index = 1
+            while registry.get(candidate, identifier) != identifier:
+                index += 1
+                candidate = f"{base}_{digest}_{index}"
+            logger.warning(
+                "%r and %r have the same normalized name %r; %r is exported "
+                "as %r so the two objects do not overwrite each other.",
+                owner,
+                identifier,
+                base,
+                identifier,
+                candidate,
+            )
+
+        registry[candidate] = identifier
+        return candidate
 
     def _record_object(self, name: str, paths: List[str]) -> List[str]:
         if paths:
@@ -309,7 +369,7 @@ class _SqlAlchemySource(DataSource):
                     engine,
                     table_or_query,
                     output_dir,
-                    _build_base_name(dialect_name, "query"),
+                    self._object_base_name(dialect_name, "query"),
                     chunk_rows,
                     pack_config=pack_config,
                 )
@@ -351,7 +411,7 @@ class _SqlAlchemySource(DataSource):
             engine,
             f"SELECT * FROM {qualified}",
             output_dir,
-            _build_base_name(dialect_name or self.dialect_name, display),
+            self._object_base_name(dialect_name or self.dialect_name, display),
             chunk_rows,
             table=table_name,
             schema=schema,
@@ -527,7 +587,7 @@ class FileSource(DataSource):
                 pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
             )
 
-        base_name = _build_base_name(
+        base_name = self._object_base_name(
             "file", os.path.splitext(os.path.basename(file_path))[0]
         )
         lower = file_path.lower()
@@ -727,7 +787,7 @@ class DatabaseSource(_SqlAlchemySource):
                     self.engine,
                     table_or_query,
                     output_dir,
-                    _build_base_name(dialect_name or "db", "query"),
+                    self._object_base_name(dialect_name or "db", "query"),
                     chunk_rows,
                     pack_config=pack_config,
                 )
@@ -779,7 +839,7 @@ class DatabaseSource(_SqlAlchemySource):
             engine,
             f"SELECT * FROM {qualified}",
             output_dir,
-            _build_base_name(dialect_name or "db", display),
+            self._object_base_name(dialect_name or "db", display),
             chunk_rows,
             table=effective_table,
             schema=effective_schema,
@@ -934,7 +994,7 @@ def _materialize_remote_to_parquet(
             pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
         )
 
-    base_name = _build_base_name(
+    base_name = source._object_base_name(
         "remote", os.path.splitext(os.path.basename(path))[0]
     )
 
@@ -1261,7 +1321,7 @@ class MongoDBSource(DataSource):
         try:
             for collection_name in collections:
                 collection = db[collection_name]
-                base_name = _build_base_name("mongodb", collection_name)
+                base_name = self._object_base_name("mongodb", collection_name)
                 cursor = collection.find(batch_size=chunk_rows)
                 paths = pio.write_dict_rows(
                     _mongo_documents(cursor),
@@ -1470,7 +1530,7 @@ class DatabricksSource(DataSource):
                 tables = list(table_or_query)
             elif isinstance(table_or_query, str):
                 if _is_sql_query(table_or_query):
-                    base_name = _build_base_name("databricks", "query")
+                    base_name = self._object_base_name("databricks", "query")
                     cursor.execute(table_or_query)
                     return self._record_object(
                         base_name,
@@ -1489,7 +1549,7 @@ class DatabricksSource(DataSource):
                 )
 
             for table_name in tables:
-                base_name = _build_base_name("databricks", table_name)
+                base_name = self._object_base_name("databricks", table_name)
                 cursor.execute(f"SELECT * FROM {table_name}")
                 all_paths.extend(
                     self._record_object(
@@ -1733,7 +1793,7 @@ class DuckDBSource(DataSource):
                 table_names = list(table_or_query)
             elif isinstance(table_or_query, str):
                 if _is_sql_query(table_or_query):
-                    base_name = _build_base_name("duckdb", "query")
+                    base_name = self._object_base_name("duckdb", "query")
                     return self._record_object(
                         base_name,
                         self._export_query_to_parquet(
@@ -1753,7 +1813,7 @@ class DuckDBSource(DataSource):
 
             all_paths: List[str] = []
             for table_name in table_names:
-                base_name = _build_base_name("duckdb", table_name)
+                base_name = self._object_base_name("duckdb", table_name)
                 qualified = (
                     f"{schema}.{table_name}"
                     if schema != "main"
@@ -1893,7 +1953,7 @@ class TrinoSource(DataSource):
                 table_names = list(table_or_query)
             elif isinstance(table_or_query, str):
                 if _is_sql_query(table_or_query):
-                    base_name = _build_base_name("trino", "query")
+                    base_name = self._object_base_name("trino", "query")
                     cursor.execute(table_or_query)
                     return self._record_object(
                         base_name,
@@ -1912,7 +1972,7 @@ class TrinoSource(DataSource):
                 )
 
             for table_name in table_names:
-                base_name = _build_base_name("trino", table_name)
+                base_name = self._object_base_name("trino", table_name)
                 cursor.execute(f"SELECT * FROM {table_name}")
                 all_paths.extend(
                     self._record_object(
@@ -2110,7 +2170,7 @@ class CassandraSource(DataSource):
                 table_names = list(table_or_query)
             elif isinstance(table_or_query, str):
                 if _is_sql_query(table_or_query):
-                    base_name = _build_base_name("cassandra", "query")
+                    base_name = self._object_base_name("cassandra", "query")
                     rows = session.execute(table_or_query)
                     return self._record_object(
                         base_name,
@@ -2131,7 +2191,7 @@ class CassandraSource(DataSource):
                 )
 
             for table_name in table_names:
-                base_name = _build_base_name("cassandra", table_name)
+                base_name = self._object_base_name("cassandra", table_name)
                 # The driver pages the result set, so iterating it never holds
                 # more than one page.
                 rows = session.execute(f"SELECT * FROM {table_name}")
@@ -2238,7 +2298,7 @@ class ElasticsearchSource(DataSource):
         all_paths: List[str] = []
         try:
             for index in indices:
-                base_name = _build_base_name("elasticsearch", index)
+                base_name = self._object_base_name("elasticsearch", index)
                 paths = pio.write_dict_rows(
                     _scroll_documents(es, index, chunk_rows),
                     output_dir,

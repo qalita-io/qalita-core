@@ -249,7 +249,7 @@ def _top_values(
     """
     if n_distinct <= max_groups:
         counts = analytics.value_counts(lf, column, k, max_groups=max_groups)
-        return _records(counts, column), None
+        return _records(counts), None
 
     if sample_rows <= 0:
         # Estimating is off: say nothing rather than report a number whose cost
@@ -259,7 +259,7 @@ def _top_values(
     if total_rows <= sample_rows:
         # Small enough to count exactly regardless of cardinality.
         counts = analytics.value_counts(lf, column, k, max_groups=None)
-        return _records(counts, column), None
+        return _records(counts), None
 
     drawn = analytics.sample(lf, sample_rows, total_rows=total_rows).select(
         column
@@ -270,12 +270,18 @@ def _top_values(
     factor = total_rows / drawn.height if drawn.height else 1.0
     return [
         {"value": rec["value"], "count": int(round(rec["count"] * factor))}
-        for rec in _records(counts, column)
+        for rec in _records(counts)
     ], "sampled"
 
 
-def _records(counts: "pl.DataFrame", column: str) -> list[dict[str, Any]]:
+def _records(counts: "pl.DataFrame") -> list[dict[str, Any]]:
+    """Turn a ``value_counts`` frame into records.
+
+    Read POSITIONALLY: ``value_counts`` always returns ``[value, frequency]``
+    in that order, but the frequency column is only called ``"count"`` when
+    the profiled column is not itself called ``"count"``. Selecting by name
+    here is what used to make a `sku,count` table abort the whole profile.
+    """
     return [
-        {"value": row[0], "count": int(row[1])}
-        for row in counts.select(column, "count").iter_rows()
+        {"value": row[0], "count": int(row[1])} for row in counts.iter_rows()
     ]
