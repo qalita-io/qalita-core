@@ -36,18 +36,19 @@ def _records_of(frame):
     )
 
 
+def _columns_of(frame, records):
+    """Colonnes du frame : depuis les lignes, sinon depuis le schéma s'il est vide."""
+    if records:
+        return list(records[0].keys())
+    if hasattr(frame, "columns"):  # DataFrame pandas/polars vide
+        return list(frame.columns)
+    return None  # liste de dicts vide : aucune colonne déclarée
+
+
 def _to_records(frame, columns):
     """Extrait `columns` en listes positionnelles, dans l'ordre demandé."""
     records = _records_of(frame)
-
-    if records:
-        available = set(records[0].keys())
-    elif hasattr(
-        frame, "columns"
-    ):  # DataFrame pandas/polars vide : colonnes connues même sans lignes
-        available = set(frame.columns)
-    else:  # liste de dicts vide : aucune colonne déclarée à vérifier
-        available = None
+    available = _columns_of(frame, records)
 
     if available is not None:
         for col in columns:
@@ -57,26 +58,82 @@ def _to_records(frame, columns):
     return [[record.get(col) for col in columns] for record in records]
 
 
-def top_n(frame, by, n, other=True, label="Autres"):
-    """Garde les n plus grandes lignes selon `by`, replie la queue en une ligne `label`.
+def _take(frame, records, positions, folded, columns):
+    """Reconstruit le frame d'origine restreint à `positions`, plus la ligne `folded`.
 
-    À n'utiliser que sur une mesure additive (un compte). Replier des ratios en
-    les sommant produit un chiffre faux : dans ce cas, laisser la troncature
+    Les lignes conservées sont prélevées sur le frame d'origine, jamais
+    reconstruites à partir de dicts : le type de chaque colonne est celui de
+    l'entrée. Seule la ligne repliée peut élargir un type, et uniquement sur
+    les colonnes qu'elle renseigne.
+    """
+    if isinstance(frame, list):
+        rows = [records[i] for i in positions]
+        return rows + [folded] if folded is not None else rows
+
+    if hasattr(frame, "to_dicts"):  # polars
+        import polars as pl
+
+        head = frame.select(pl.all().gather(positions))
+        if folded is None:
+            return head
+        # vertical_relaxed : une colonne nulle prend le type de la tête, et la
+        # colonne repliée prend le supertype (str) sans toucher aux autres.
+        return pl.concat([head, type(frame)([folded])], how="vertical_relaxed")
+
+    # pandas
+    import pandas as pd
+
+    head = frame.iloc[positions].reset_index(drop=True)
+    if folded is None:
+        return head
+    fold_frame = type(frame)([folded], columns=columns)
+    for column in columns:
+        # Une colonne repliée à None est toute-NA : sans ce recalage de type,
+        # pandas re-déduit le type de la colonne entière à la concaténation.
+        if folded[column] is None:
+            try:
+                fold_frame[column] = fold_frame[column].astype(
+                    head[column].dtype
+                )
+            except (TypeError, ValueError):
+                pass
+    return pd.concat([head, fold_frame], ignore_index=True)
+
+
+def top_n(frame, by, n, other=False, label="Autres"):
+    """Garde les n plus grandes lignes selon `by`, en jetant la queue.
+
+    `other=True` replie la queue en une ligne `label` au lieu de la jeter. À
+    n'utiliser que sur une mesure additive (un compte) : replier des ratios en
+    les sommant produit un chiffre faux — dans ce cas, laisser la troncature
     faire son travail et afficher la note de dépassement.
+
+    La ligne repliée ne fabrique aucune valeur : `label` va dans la première
+    colonne hors `by` — la dimension repliée —, `by` porte la somme de la
+    queue, et toute autre colonne est nulle.
     """
     records = _records_of(frame)
-    rebuild = list if isinstance(frame, list) else type(frame)
+    columns = _columns_of(frame, records)
 
-    records = sorted(records, key=lambda r: r.get(by) or 0, reverse=True)
-    head, tail = records[:n], records[n:]
+    if columns is not None and by not in columns:
+        raise ValueError(f"Colonne '{by}' absente du frame")
 
-    if other and tail:
-        key_columns = [c for c in records[0].keys() if c != by]
-        folded = {c: label for c in key_columns}
-        folded[by] = sum((r.get(by) or 0) for r in tail)
-        head = head + [folded]
+    positions = sorted(
+        range(len(records)),
+        key=lambda i: records[i].get(by) or 0,
+        reverse=True,
+    )
+    head_positions, tail_positions = positions[:n], positions[n:]
 
-    return head if rebuild is list else rebuild(head)
+    folded = None
+    if other and tail_positions:
+        folded = {column: None for column in columns}
+        dimension = next((c for c in columns if c != by), None)
+        if dimension is not None:
+            folded[dimension] = label
+        folded[by] = sum((records[i].get(by) or 0) for i in tail_positions)
+
+    return _take(frame, records, head_positions, folded, columns)
 
 
 class FiguresAsset(PlatformAsset):

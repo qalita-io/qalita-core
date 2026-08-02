@@ -4,6 +4,7 @@ Tests for qalita_core.figures
 """
 
 import json
+import math
 import pandas as pd
 import polars as pl
 import pytest
@@ -220,14 +221,14 @@ def test_add_accepts_empty_list_of_dicts_without_declared_columns():
 
 def test_top_n_folds_tail_into_other():
     df = pd.DataFrame({"column": list("abcde"), "v": [10, 8, 6, 4, 2]})
-    out = top_n(df, by="v", n=3)
+    out = top_n(df, by="v", n=3, other=True)
     assert list(out["column"]) == ["a", "b", "c", "Autres"]
     assert list(out["v"]) == [10, 8, 6, 6]
 
 
 def test_top_n_folds_tail_into_other_polars():
     df = pl.DataFrame({"column": list("abcde"), "v": [10, 8, 6, 4, 2]})
-    out = top_n(df, by="v", n=3)
+    out = top_n(df, by="v", n=3, other=True)
     assert isinstance(out, pl.DataFrame)
     assert out["column"].to_list() == ["a", "b", "c", "Autres"]
     assert out["v"].to_list() == [10, 8, 6, 6]
@@ -241,10 +242,86 @@ def test_top_n_folds_tail_into_other_list_of_dicts():
         {"column": "d", "v": 4},
         {"column": "e", "v": 2},
     ]
-    out = top_n(frame, by="v", n=3)
+    out = top_n(frame, by="v", n=3, other=True)
     assert isinstance(out, list)
     assert [r["column"] for r in out] == ["a", "b", "c", "Autres"]
     assert [r["v"] for r in out] == [10, 8, 6, 6]
+
+
+def _two_measure_records():
+    return [
+        {"column": "a", "n": 10, "ratio": 0.5},
+        {"column": "b", "n": 8, "ratio": 0.2},
+        {"column": "c", "n": 6, "ratio": 0.1},
+        {"column": "d", "n": 4, "ratio": 0.1},
+        {"column": "e", "n": 2, "ratio": 0.1},
+    ]
+
+
+def test_top_n_does_not_fabricate_a_label_in_a_second_measure_pandas():
+    out = top_n(pd.DataFrame(_two_measure_records()), by="n", n=3, other=True)
+    records = out.to_dict(orient="records")
+    assert [r["column"] for r in records] == ["a", "b", "c", "Autres"]
+    assert [r["n"] for r in records] == [10, 8, 6, 6]
+    assert [r["ratio"] for r in records[:3]] == [0.5, 0.2, 0.1]
+    folded_ratio = records[3]["ratio"]
+    assert folded_ratio is None or math.isnan(folded_ratio)
+
+
+def test_top_n_does_not_coerce_untouched_columns_to_str_polars():
+    out = top_n(pl.DataFrame(_two_measure_records()), by="n", n=3, other=True)
+    assert out["column"].to_list() == ["a", "b", "c", "Autres"]
+    assert out["n"].to_list() == [10, 8, 6, 6]
+    # the whole ratio column stayed float: 0.5 must not become "0.5"
+    assert out["ratio"].dtype == pl.Float64
+    assert out["ratio"].to_list() == [0.5, 0.2, 0.1, None]
+    assert out["n"].dtype == pl.Int64
+
+
+def test_top_n_does_not_fabricate_a_label_in_a_second_measure_list():
+    out = top_n(_two_measure_records(), by="n", n=3, other=True)
+    assert out[3] == {"column": "Autres", "n": 6, "ratio": None}
+    assert out[:3] == _two_measure_records()[:3]
+
+
+def test_top_n_drops_the_tail_by_default():
+    df = pd.DataFrame(_two_measure_records())
+    out = top_n(df, by="n", n=3)
+    assert list(out["column"]) == ["a", "b", "c"]
+    assert list(out["ratio"]) == [0.5, 0.2, 0.1]
+
+
+def test_top_n_drops_the_tail_by_default_polars():
+    out = top_n(pl.DataFrame(_two_measure_records()), by="n", n=3)
+    assert out["column"].to_list() == ["a", "b", "c"]
+    assert out["ratio"].dtype == pl.Float64
+
+
+def test_top_n_drops_the_tail_by_default_list_of_dicts():
+    out = top_n(_two_measure_records(), by="n", n=3)
+    assert out == _two_measure_records()[:3]
+
+
+def test_top_n_rejects_unknown_by_pandas():
+    with pytest.raises(ValueError, match="absente"):
+        top_n(pd.DataFrame(_two_measure_records()), by="nn", n=3, other=True)
+
+
+def test_top_n_rejects_unknown_by_polars():
+    with pytest.raises(ValueError, match="absente"):
+        top_n(pl.DataFrame(_two_measure_records()), by="nn", n=3, other=True)
+
+
+def test_top_n_rejects_unknown_by_list_of_dicts():
+    with pytest.raises(ValueError, match="absente"):
+        top_n(_two_measure_records(), by="nn", n=3)
+
+
+def test_top_n_preserves_measure_dtypes_when_no_tail_polars():
+    frame = pl.DataFrame(_two_measure_records())
+    out = top_n(frame, by="n", n=10, other=True)
+    assert out.schema == frame.schema
+    assert out["ratio"].to_list() == [0.5, 0.2, 0.1, 0.1, 0.1]
 
 
 def test_save_writes_contract_to_disk(tmp_path, monkeypatch):
