@@ -100,6 +100,23 @@ def _take(frame, records, positions, folded, columns):
     return pd.concat([head, fold_frame], ignore_index=True)
 
 
+def _reject_duplicate_dim_tuples(key, rows, dim_count):
+    """Un agrégat a une ligne par tuple de dimensions ; un doublon signe des lignes brutes."""
+    seen = set()
+    for row in rows:
+        # repr : identité fiable pour des scalaires homogènes, et jamais
+        # d'exception sur une valeur non hachable.
+        signature = tuple(repr(value) for value in row[:dim_count])
+        if signature in seen:
+            raise ValueError(
+                f"figure '{key}' : le tuple de dimensions "
+                f"{tuple(row[:dim_count])} apparaît plusieurs fois — `frame` "
+                "doit être un agrégat (une ligne par tuple de dimensions), "
+                "pas les lignes brutes de la source"
+            )
+        seen.add(signature)
+
+
 def top_n(frame, by, n, other=False, label="Autres"):
     """Garde les n plus grandes lignes selon `by`, en jetant la queue.
 
@@ -180,10 +197,30 @@ class FiguresAsset(PlatformAsset):
         title=None,
         max_rows=MAX_ROWS,
     ):
-        """Ajoute une figure. `dims` accepte "nom" (nominal par défaut) ou ("nom", "temporal")."""
+        """Ajoute une figure. `dims` accepte "nom" (nominal par défaut) ou ("nom", "temporal").
+
+        `frame` doit être un **agrégat** : au moins une dimension, au moins une
+        mesure, et exactement une ligne par tuple de dimensions. Une figure
+        explique un chiffre, elle ne transporte pas les lignes de la source —
+        y déverser des lignes brutes ferait sortir des données individuelles
+        de chez le client. Les trois règles sont vérifiées ici.
+        """
         if intent not in INTENTS:
             raise ValueError(
                 f"intent '{intent}' inconnu — attendus : {', '.join(INTENTS)}"
+            )
+
+        if not list(dims):
+            raise ValueError(
+                f"figure '{key}' : `dims` est vide — une figure décrit un "
+                "agrégat, qui a au moins une dimension"
+            )
+
+        if not list(measures):
+            raise ValueError(
+                f"figure '{key}' : `measures` est vide — une figure décrit un "
+                "agrégat, qui a au moins une mesure ; sans mesure, `add` "
+                "n'est plus qu'une projection de colonnes brutes"
             )
 
         normalized_dims = []
@@ -199,6 +236,8 @@ class FiguresAsset(PlatformAsset):
 
         columns = [d["name"] for d in normalized_dims] + list(measures)
         rows = _to_records(frame, columns)
+
+        _reject_duplicate_dim_tuples(key, rows, len(normalized_dims))
 
         truncated = len(rows) > max_rows
         if truncated:

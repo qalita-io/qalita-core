@@ -219,6 +219,92 @@ def test_add_accepts_empty_list_of_dicts_without_declared_columns():
     assert figure["rows"] == []
 
 
+def test_add_rejects_empty_dims():
+    fig = FiguresAsset()
+    with pytest.raises(ValueError, match="dims"):
+        fig.add(
+            "x",
+            intent="breakdown",
+            frame=pd.DataFrame({"v": [1]}),
+            dims=[],
+            measures=["v"],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
+def test_add_rejects_empty_measures():
+    # Sans mesure, add devient un projecteur de colonnes : 2 000 000 de lignes
+    # d'identifiants patients sortiraient tronquées à 5000, sans une plainte.
+    fig = FiguresAsset()
+    with pytest.raises(ValueError, match="measures"):
+        fig.add(
+            "x",
+            intent="breakdown",
+            frame=pd.DataFrame({"patient_id": ["p1", "p2"]}),
+            dims=["patient_id"],
+            measures=[],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
+def test_add_rejects_duplicate_dim_tuples():
+    # Un agrégat a exactement une ligne par tuple de dimensions : un doublon
+    # signe des lignes brutes.
+    fig = FiguresAsset()
+    raw = pd.DataFrame(
+        {"service": ["cardio", "uro", "cardio"], "age": [41, 12, 77]}
+    )
+    with pytest.raises(ValueError, match="agrégat"):
+        fig.add(
+            "x",
+            intent="breakdown",
+            frame=raw,
+            dims=["service"],
+            measures=["age"],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
+def test_add_rejects_duplicate_dim_tuples_across_several_dims():
+    fig = FiguresAsset()
+    raw = [
+        {"service": "cardio", "day": "2026-01-01", "n": 1},
+        {"service": "cardio", "day": "2026-01-02", "n": 1},
+        {"service": "cardio", "day": "2026-01-01", "n": 1},
+    ]
+    with pytest.raises(ValueError, match="agrégat"):
+        fig.add(
+            "x",
+            intent="trend",
+            frame=raw,
+            dims=["service", ("day", "temporal")],
+            measures=["n"],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
+def test_add_accepts_distinct_dim_tuples_across_several_dims():
+    fig = FiguresAsset()
+    aggregate = [
+        {"service": "cardio", "day": "2026-01-01", "n": 4},
+        {"service": "cardio", "day": "2026-01-02", "n": 7},
+        {"service": "uro", "day": "2026-01-01", "n": 2},
+    ]
+    fig.add(
+        "x",
+        intent="trend",
+        frame=aggregate,
+        dims=["service", ("day", "temporal")],
+        measures=["n"],
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    assert len(fig.data["figures"][0]["rows"]) == 3
+
+
+def test_add_documents_the_aggregate_constraint_at_the_call_site():
+    assert "agrégat" in FiguresAsset.add.__doc__
+
+
 def test_top_n_folds_tail_into_other():
     df = pd.DataFrame({"column": list("abcde"), "v": [10, 8, 6, 4, 2]})
     out = top_n(df, by="v", n=3, other=True)
