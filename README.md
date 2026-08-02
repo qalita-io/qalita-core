@@ -126,6 +126,98 @@ from qalita_core import (
 - `DuplicateAggregator`: duplicate counts and dataset-level score using key columns
 - `TimelinessAggregator`: dates/years coverage and recency scoring
 
+## Figures — `figures.json`
+
+`FiguresAsset` (exposed as `pack.figures`) is the sibling of `pack.metrics`: metrics
+carry the numbers, figures carry the aggregates that explain them. A pack declares
+an **intention**, never a chart type — the platform picks the rendering.
+
+```python
+from qalita_core.pack import Pack
+
+with Pack() as pack:
+    pack.figures.declare_measure(
+        "p_missing", unit="ratio", direction="lower_is_better", target=0.05
+    )
+    pack.figures.add(
+        "missing_by_column",
+        intent="breakdown",          # what contributes to the number
+        of="p_cells_missing",        # the metric this figure explains
+        frame=df,
+        dims=["column"],
+        measures=["p_missing"],
+        scope={"perimeter": "dataset", "value": name},
+    )
+    pack.figures.save()
+```
+
+### API
+
+```python
+declare_measure(key, *, unit=None, direction=None, target=None,
+                warn=None, label=None, description=None)
+```
+Declares the semantics of a measure — referenceable both by a figure's `measures`/`of`
+and by a `metrics.json` key.
+
+```python
+add(key, *, intent, frame, dims, measures, scope, of=None, title=None,
+    max_rows=5000)
+```
+Adds one figure. `intent` is one of `breakdown`, `composition`, `distribution`,
+`trend`, `comparison`, `matrix`, `flow`. `frame` must be an **aggregate**: pandas
+or polars `DataFrame`, or a list of dicts — at least one dimension, at least one
+measure, exactly one row per dimension tuple. `dims` items are a bare name
+(`"column"`, nominal) or a `(name, type)` tuple (`type` one of `nominal`,
+`ordinal`, `temporal`). Rows beyond `max_rows` are dropped and the figure is
+flagged `truncated: true` rather than raising.
+
+`add()` raises on an empty `dims`, an empty `measures`, or a duplicate dimension
+tuple in `frame` (a strong signal the frame was never aggregated). It does
+**not** catch every non-aggregate: a frame keyed by a unique identifier —
+`dims=["patient_id"], measures=["age"]` — has no duplicate tuple by construction
+and clears every guard, shipping one row per patient (up to `max_rows`, truncated
+above that). Nothing but the caller enforces "aggregate only, never raw rows" in
+that case — worth remembering on regulated data.
+
+`save()` additionally verifies that every measure named by a figure's `measures`
+or `of` was declared via `declare_measure`; if not, it raises rather than writing
+a figure that can never be linked to its metric. This means an undeclared measure
+fails the whole pack run, not just that figure.
+
+```python
+add_raw(key, *, option, scope, title=None)
+```
+Escape hatch: a raw ECharts `option` dict, bypassing intent/self-service
+rendering and excluded from reporting/drill-down. Use only when no `intent`
+fits.
+
+```python
+top_n(frame, by, n, other=False, label="Autres", dim=None)
+```
+Keeps the `n` largest rows by `by`, dropping the tail. `other=True` folds the
+tail into one row labeled `label` instead — valid **only** for an additive
+measure (a count): summing ratios into that row produces a wrong number, which
+is why `other` defaults to `False`. `dim` names the column that receives
+`label` on the folded row; it is inferred only when exactly one column other
+than `by` exists, and `top_n` raises rather than guess when there is more than
+one candidate (or none).
+
+Note: folding an integer dimension column produces different element types
+across backends — `["1", "2", "Autres"]` under polars vs. `[1, 2, "Autres"]`
+under pandas, because the label forces a common supertype. Both are valid JSON;
+this is intentional and covered by tests, not a bug to work around.
+
+### Chunking and `figures.add`
+
+Data above `chunk_rows` (default 100 000) is processed in chunks (see above). A
+pack that calls `figures.add` once per chunk without aggregating across chunks
+first will emit one row per rule *execution*, not per dimension value — producing
+duplicate dimension tuples that `add()` rejects. Either accumulate into a dict
+keyed by the dimension across the whole loop and call `add()` once at the end, or
+concatenate chunks into a single frame before computing aggregates. Both are
+legitimate; pick one per pack.
+
 ## Development
 
 - Tests: `uv run pytest`
