@@ -167,7 +167,14 @@ add(key, *, intent, frame, dims, measures, scope, of=None, title=None,
 Adds one figure. `intent` is one of `breakdown`, `composition`, `distribution`,
 `trend`, `comparison`, `matrix`, `flow`. `frame` must be an **aggregate**: pandas
 or polars `DataFrame`, or a list of dicts — at least one dimension, at least one
-measure, exactly one row per dimension tuple. `dims` items are a bare name
+measure, exactly one row per dimension tuple. A polars `LazyFrame` (what
+`pack.scan_data()` returns, the recommended path for 100 GB+ sources) is
+rejected with a `TypeError` telling you to `.collect()` first — `figures.py`
+never materializes your plan for you. Call `.collect()` (or
+`.collect(engine="streaming")`) on your **aggregate**, not on the raw source,
+before passing it; collecting inside `add()` would materialize the whole plan
+in the worker and defeat the `max_rows` cap below, which exists to prevent
+exactly that. `dims` items are a bare name
 (`"column"`, nominal) or a `(name, type)` tuple (`type` one of `nominal`,
 `ordinal`, `temporal`). Rows beyond `max_rows` are dropped and the figure is
 flagged `truncated: true` rather than raising.
