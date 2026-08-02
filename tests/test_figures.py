@@ -9,7 +9,7 @@ import pandas as pd
 import polars as pl
 import pytest
 
-from qalita_core.figures import FiguresAsset, top_n
+from qalita_core.figures import MAX_ROWS, FiguresAsset, top_n
 
 
 def test_add_builds_positional_rows_in_declared_order():
@@ -429,6 +429,173 @@ def test_save_writes_contract_to_disk(tmp_path, monkeypatch):
     assert payload["version"] == 1
     assert payload["measures"]["v"]["unit"] == "count"
     assert payload["figures"][0]["key"] == "f"
+
+
+def test_add_tells_a_lazyframe_author_to_collect():
+    # scan_data() est l'idiom big-data documenté de la librairie : passer le
+    # résultat d'un group_by lazy est du code de pack naturel.
+    fig = FiguresAsset()
+    lazy = pl.DataFrame({"c": ["a"], "v": [1]}).lazy()
+    with pytest.raises(TypeError, match=r"collect\(\)"):
+        fig.add(
+            "x",
+            intent="breakdown",
+            frame=lazy,
+            dims=["c"],
+            measures=["v"],
+            scope={"perimeter": "dataset", "value": "t"},
+        )
+
+
+class _MaterialisationSpy:
+    """Frame pandas qui refuse d'être matérialisé en entier."""
+
+    def __init__(self, frame):
+        self._frame = frame
+        self.head_sizes = []
+
+    @property
+    def columns(self):
+        return list(self._frame.columns)
+
+    def head(self, size):
+        self.head_sizes.append(size)
+        return self._frame.head(size)
+
+    def to_dict(self, orient):
+        raise AssertionError(
+            "frame entier matérialisé avant l'application du plafond"
+        )
+
+
+def test_add_slices_to_the_cap_before_materialising_rows():
+    spy = _MaterialisationSpy(
+        pd.DataFrame({"c": [f"c{i}" for i in range(50)], "v": range(50)})
+    )
+    fig = FiguresAsset()
+    fig.add(
+        "big",
+        intent="breakdown",
+        frame=spy,
+        dims=["c"],
+        measures=["v"],
+        scope={"perimeter": "dataset", "value": "t"},
+        max_rows=10,
+    )
+    assert spy.head_sizes == [11]
+    figure = fig.data["figures"][0]
+    assert len(figure["rows"]) == 10
+    assert figure["truncated"] is True
+
+
+def test_add_uses_a_default_cap_of_five_thousand_rows():
+    assert MAX_ROWS == 5000
+    fig = FiguresAsset()
+    frame = [{"c": f"c{i}", "v": i} for i in range(MAX_ROWS + 1)]
+    fig.add(
+        "big",
+        intent="breakdown",
+        frame=frame,
+        dims=["c"],
+        measures=["v"],
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    figure = fig.data["figures"][0]
+    assert len(figure["rows"]) == 5000
+    assert figure["truncated"] is True
+
+
+def test_add_does_not_flag_a_frame_exactly_at_the_default_cap():
+    fig = FiguresAsset()
+    frame = [{"c": f"c{i}", "v": i} for i in range(MAX_ROWS)]
+    fig.add(
+        "big",
+        intent="breakdown",
+        frame=frame,
+        dims=["c"],
+        measures=["v"],
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    figure = fig.data["figures"][0]
+    assert len(figure["rows"]) == 5000
+    assert figure["truncated"] is False
+
+
+def _figure_with(fig, **kwargs):
+    defaults = dict(
+        intent="breakdown",
+        frame=pd.DataFrame({"c": ["a"], "p_missing": [0.5]}),
+        dims=["c"],
+        measures=["p_missing"],
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    defaults.update(kwargs)
+    fig.add("f", **defaults)
+
+
+def test_save_rejects_an_of_that_is_not_a_declared_measure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    fig = FiguresAsset()
+    fig.declare_measure("p_missing", unit="ratio")
+    _figure_with(fig, of="p_mising")
+    with pytest.raises(ValueError, match="p_mising"):
+        fig.save()
+    assert not (tmp_path / "figures.json").exists()
+
+
+def test_save_rejects_a_measure_name_that_is_not_declared(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    fig = FiguresAsset()
+    fig.declare_measure("p_missing", unit="ratio")
+    _figure_with(
+        fig,
+        frame=pd.DataFrame({"c": ["a"], "p_mising": [0.5]}),
+        measures=["p_mising"],
+    )
+    with pytest.raises(ValueError, match="p_mising"):
+        fig.save()
+    assert not (tmp_path / "figures.json").exists()
+
+
+def test_save_names_the_figure_key_in_the_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    fig = FiguresAsset()
+    fig.declare_measure("p_missing", unit="ratio")
+    _figure_with(fig, of="ghost")
+    with pytest.raises(ValueError, match="'f'"):
+        fig.save()
+
+
+def test_save_accepts_measures_declared_after_the_figure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    fig = FiguresAsset()
+    _figure_with(fig, of="p_missing")
+    fig.declare_measure("p_missing", unit="ratio")
+    fig.save()
+    payload = json.loads(
+        (tmp_path / "figures.json").read_text(encoding="utf-8")
+    )
+    assert payload["figures"][0]["of"] == "p_missing"
+
+
+def test_save_does_not_require_measures_for_a_raw_figure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    fig = FiguresAsset()
+    fig.add_raw(
+        "custom",
+        option={"series": []},
+        scope={"perimeter": "dataset", "value": "t"},
+    )
+    fig.save()
+    assert (tmp_path / "figures.json").exists()
 
 
 def test_add_raw_carries_option_with_no_dims_measures_or_rows():

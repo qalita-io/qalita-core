@@ -31,9 +31,24 @@ def _records_of(frame):
         return frame.to_dict(orient="records")
     if isinstance(frame, list):
         return list(frame)
+    if hasattr(frame, "collect"):  # LazyFrame polars, issu de scan_data()
+        raise TypeError(
+            "frame est un plan différé (LazyFrame) : appelez .collect() "
+            '(ou .collect(engine="streaming")) sur votre agrégat avant de le '
+            "passer — figures.py ne matérialise pas votre plan à votre place"
+        )
     raise TypeError(
         "frame doit être un DataFrame pandas/polars ou une liste de dicts"
     )
+
+
+def _limit(frame, size):
+    """Restreint le frame à `size` lignes AVANT toute matérialisation."""
+    if isinstance(frame, list):
+        return frame[:size]
+    if hasattr(frame, "head"):
+        return frame.head(size)
+    return frame
 
 
 def _columns_of(frame, records):
@@ -235,7 +250,10 @@ class FiguresAsset(PlatformAsset):
             normalized_dims.append({"name": name, "type": dim_type})
 
         columns = [d["name"] for d in normalized_dims] + list(measures)
-        rows = _to_records(frame, columns)
+        # Une ligne de plus que le plafond suffit à savoir qu'il est dépassé :
+        # un frame de 50M de lignes passé par erreur ne doit pas faire tomber
+        # le worker avant même d'être marqué tronqué.
+        rows = _to_records(_limit(frame, max_rows + 1), columns)
 
         _reject_duplicate_dim_tuples(key, rows, len(normalized_dims))
 
@@ -256,6 +274,23 @@ class FiguresAsset(PlatformAsset):
                 "truncated": truncated,
             }
         )
+
+    def save(self):
+        """Vérifie que chaque figure référence des mesures déclarées, puis écrit."""
+        declared = set(self.data["measures"])
+        for figure in self.data["figures"]:
+            names = list(figure.get("measures") or [])
+            if figure.get("of") is not None:
+                names.append(figure["of"])
+            for name in names:
+                if name not in declared:
+                    raise ValueError(
+                        f"figure '{figure['key']}' : mesure '{name}' non "
+                        "déclarée — appelez declare_measure('"
+                        f"{name}') ; sinon la figure ne sera jamais reliée à "
+                        "son chiffre"
+                    )
+        super().save()
 
     def add_raw(self, key, *, option, scope, title=None):
         """Échappatoire : option ECharts brute. Exclue du self-service et du reporting."""
