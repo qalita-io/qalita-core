@@ -132,7 +132,40 @@ def _reject_duplicate_dim_tuples(key, rows, dim_count):
         seen.add(signature)
 
 
-def top_n(frame, by, n, other=False, label="Autres"):
+def _fold_target(columns, by, dim, label):
+    """Colonne qui reçoit `label` sur la ligne repliée.
+
+    Nommée par `dim`, ou déduite quand une seule colonne peut la porter. Jamais
+    devinée par position : rien ne contraint l'ordre des colonnes d'un frame, et
+    une dimension placée après une mesure ferait atterrir le label dans cette
+    mesure — exactement la corruption que la ligne repliée doit éviter.
+    """
+    if dim is not None:
+        if dim == by:
+            raise ValueError(
+                f"top_n : `dim` ne peut pas être '{by}', la mesure repliée — "
+                "`dim` nomme la dimension qui porte le label"
+            )
+        return dim
+
+    candidates = [c for c in columns if c != by]
+    if not candidates:
+        raise ValueError(
+            f"top_n : aucune colonne ne peut porter le label '{label}' — le "
+            f"frame n'a que la colonne '{by}', et la ligne repliée serait "
+            "indiscernable d'une vraie ligne"
+        )
+    if len(candidates) > 1:
+        raise ValueError(
+            f"top_n : plusieurs colonnes hors '{by}' "
+            f"({', '.join(str(c) for c in candidates)}) — précisez dim= pour "
+            "nommer celle qui porte le label ; la déduire de sa position "
+            "écrirait le label dans une mesure"
+        )
+    return candidates[0]
+
+
+def top_n(frame, by, n, other=False, label="Autres", dim=None):
     """Garde les n plus grandes lignes selon `by`, en jetant la queue.
 
     `other=True` replie la queue en une ligne `label` au lieu de la jeter. À
@@ -140,15 +173,27 @@ def top_n(frame, by, n, other=False, label="Autres"):
     les sommant produit un chiffre faux — dans ce cas, laisser la troncature
     faire son travail et afficher la note de dépassement.
 
-    La ligne repliée ne fabrique aucune valeur : `label` va dans la première
-    colonne hors `by` — la dimension repliée —, `by` porte la somme de la
-    queue, et toute autre colonne est nulle.
+    `dim` nomme la colonne qui porte `label` sur la ligne repliée. Elle n'est
+    déduite que si une seule colonne hors `by` existe ; au-delà, `dim` est
+    exigé plutôt que deviné.
+
+    La ligne repliée ne fabrique aucune valeur : `label` va dans `dim`, `by`
+    porte la somme de la queue, et toute autre colonne est nulle.
     """
     records = _records_of(frame)
     columns = _columns_of(frame, records)
 
-    if columns is not None and by not in columns:
-        raise ValueError(f"Colonne '{by}' absente du frame")
+    if columns is not None:
+        if by not in columns:
+            raise ValueError(f"Colonne '{by}' absente du frame")
+        if dim is not None and dim not in columns:
+            raise ValueError(f"Colonne '{dim}' absente du frame")
+
+    dimension = None
+    if other and columns is not None:
+        # Résolu même sans queue à replier : le contrat d'appel ne doit pas
+        # dépendre du contenu du frame du jour.
+        dimension = _fold_target(columns, by, dim, label)
 
     positions = sorted(
         range(len(records)),
@@ -160,9 +205,7 @@ def top_n(frame, by, n, other=False, label="Autres"):
     folded = None
     if other and tail_positions:
         folded = {column: None for column in columns}
-        dimension = next((c for c in columns if c != by), None)
-        if dimension is not None:
-            folded[dimension] = label
+        folded[dimension] = label
         folded[by] = sum((records[i].get(by) or 0) for i in tail_positions)
 
     return _take(frame, records, head_positions, folded, columns)

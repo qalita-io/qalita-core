@@ -375,6 +375,10 @@ def test_top_n_folds_tail_into_other():
     out = top_n(df, by="v", n=3, other=True)
     assert list(out["column"]) == ["a", "b", "c", "Autres"]
     assert list(out["v"]) == [10, 8, 6, 6]
+    # 6 == 6.0 : sans contrôle de dtype, un élargissement silencieux de la
+    # mesure en float64 passerait l'assertion ci-dessus.
+    assert out["v"].dtype == df["v"].dtype
+    assert out["column"].dtype == df["column"].dtype
 
 
 def test_top_n_folds_tail_into_other_polars():
@@ -409,8 +413,91 @@ def _two_measure_records():
     ]
 
 
+def _measure_first_records():
+    """Frame dont la dimension n'est pas la première colonne : (ratio, code, n)."""
+    return [
+        {"ratio": 0.5, "code": 1, "n": 10},
+        {"ratio": 0.2, "code": 2, "n": 8},
+        {"ratio": 0.1, "code": 3, "n": 6},
+        {"ratio": 0.1, "code": 4, "n": 4},
+    ]
+
+
+def test_top_n_labels_the_named_dim_in_a_measure_first_frame_polars():
+    frame = pl.DataFrame(_measure_first_records())
+    out = top_n(frame, by="n", n=2, other=True, dim="code")
+    # `ratio` n'est pas la dimension : il ne reçoit pas le label et ne bascule
+    # pas en str, quelle que soit sa position dans le frame.
+    assert out["ratio"].dtype == pl.Float64
+    assert out["ratio"].to_list() == [0.5, 0.2, None]
+    assert out["code"].to_list() == ["1", "2", "Autres"]
+    assert out["n"].to_list() == [10, 8, 10]
+
+
+def test_top_n_labels_the_named_dim_in_a_measure_first_frame_pandas():
+    frame = pd.DataFrame(_measure_first_records())
+    out = top_n(frame, by="n", n=2, other=True, dim="code")
+    records = out.to_dict(orient="records")
+    assert [r["code"] for r in records] == [1, 2, "Autres"]
+    assert [r["ratio"] for r in records[:2]] == [0.5, 0.2]
+    assert records[2]["ratio"] is None or math.isnan(records[2]["ratio"])
+    assert out["n"].dtype == frame["n"].dtype
+
+
+def test_top_n_requires_dim_when_several_columns_could_carry_the_label():
+    # Rien dans la librairie ne contraint l'ordre des colonnes : deviner
+    # positionnellement, c'est écrire un label dans une mesure.
+    with pytest.raises(ValueError, match="dim="):
+        top_n(pl.DataFrame(_measure_first_records()), by="n", n=2, other=True)
+
+
+def test_top_n_requires_dim_even_when_there_is_no_tail_to_fold():
+    with pytest.raises(ValueError, match="dim="):
+        top_n(pl.DataFrame(_measure_first_records()), by="n", n=99, other=True)
+
+
+def test_top_n_refuses_to_fold_a_frame_with_no_other_column():
+    # Sinon la ligne repliée est indiscernable d'une vraie ligne.
+    with pytest.raises(ValueError, match="label"):
+        top_n(pl.DataFrame({"n": [5, 4, 3]}), by="n", n=2, other=True)
+
+
+def test_top_n_rejects_an_unknown_dim():
+    with pytest.raises(ValueError, match="absente"):
+        top_n(
+            pd.DataFrame(_two_measure_records()),
+            by="n",
+            n=3,
+            other=True,
+            dim="colunm",
+        )
+
+
+def test_top_n_rejects_a_dim_equal_to_by():
+    with pytest.raises(ValueError, match="dim"):
+        top_n(
+            pd.DataFrame(_two_measure_records()),
+            by="n",
+            n=3,
+            other=True,
+            dim="n",
+        )
+
+
+def test_top_n_infers_the_dim_when_it_is_the_only_other_column():
+    frame = pl.DataFrame({"column": list("abcde"), "v": [10, 8, 6, 4, 2]})
+    out = top_n(frame, by="v", n=3, other=True)
+    assert out["column"].to_list() == ["a", "b", "c", "Autres"]
+
+
 def test_top_n_does_not_fabricate_a_label_in_a_second_measure_pandas():
-    out = top_n(pd.DataFrame(_two_measure_records()), by="n", n=3, other=True)
+    out = top_n(
+        pd.DataFrame(_two_measure_records()),
+        by="n",
+        n=3,
+        other=True,
+        dim="column",
+    )
     records = out.to_dict(orient="records")
     assert [r["column"] for r in records] == ["a", "b", "c", "Autres"]
     assert [r["n"] for r in records] == [10, 8, 6, 6]
@@ -420,7 +507,13 @@ def test_top_n_does_not_fabricate_a_label_in_a_second_measure_pandas():
 
 
 def test_top_n_does_not_coerce_untouched_columns_to_str_polars():
-    out = top_n(pl.DataFrame(_two_measure_records()), by="n", n=3, other=True)
+    out = top_n(
+        pl.DataFrame(_two_measure_records()),
+        by="n",
+        n=3,
+        other=True,
+        dim="column",
+    )
     assert out["column"].to_list() == ["a", "b", "c", "Autres"]
     assert out["n"].to_list() == [10, 8, 6, 6]
     # the whole ratio column stayed float: 0.5 must not become "0.5"
@@ -430,7 +523,7 @@ def test_top_n_does_not_coerce_untouched_columns_to_str_polars():
 
 
 def test_top_n_does_not_fabricate_a_label_in_a_second_measure_list():
-    out = top_n(_two_measure_records(), by="n", n=3, other=True)
+    out = top_n(_two_measure_records(), by="n", n=3, other=True, dim="column")
     assert out[3] == {"column": "Autres", "n": 6, "ratio": None}
     assert out[:3] == _two_measure_records()[:3]
 
@@ -470,7 +563,7 @@ def test_top_n_rejects_unknown_by_list_of_dicts():
 
 def test_top_n_preserves_measure_dtypes_when_no_tail_polars():
     frame = pl.DataFrame(_two_measure_records())
-    out = top_n(frame, by="n", n=10, other=True)
+    out = top_n(frame, by="n", n=10, other=True, dim="column")
     assert out.schema == frame.schema
     assert out["ratio"].to_list() == [0.5, 0.2, 0.1, 0.1, 0.1]
 
