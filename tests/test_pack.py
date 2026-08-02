@@ -282,6 +282,24 @@ class TestSanitizeForJson:
         result = _sanitize_for_json(t_val)
         assert result == "10:30:00"
 
+    def test_pandas_nat_becomes_null_not_the_string_nat(self):
+        import pandas as pd
+
+        # pd.NaT is an instance of datetime.datetime, so the datetime branch
+        # must not win: a missing date is null, never the category "NaT".
+        assert _sanitize_for_json(pd.NaT) is None
+
+    def test_pandas_na_becomes_null(self):
+        import pandas as pd
+
+        assert _sanitize_for_json(pd.NA) is None
+
+    def test_pandas_timestamp_is_isoformatted(self):
+        import pandas as pd
+
+        result = _sanitize_for_json(pd.Timestamp("2026-01-15T10:30:00"))
+        assert result == "2026-01-15T10:30:00"
+
     def test_decimal(self):
         dec_val = Decimal("3.14159")
         result = _sanitize_for_json(dec_val)

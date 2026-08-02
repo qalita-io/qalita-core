@@ -340,6 +340,14 @@ def _sanitize_for_json(obj):
             return obj
         return None
 
+    # pandas NA / NaT without importing pandas.
+    # Must be checked BEFORE the datetime branch: pd.NaT is an instance of
+    # datetime.datetime, so the datetime branch would otherwise serialize a
+    # missing date as the string "NaT" instead of null.
+    tname = type(obj).__name__
+    if tname in ("NAType", "NaTType"):
+        return None
+
     # Datetime-like objects
     if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
         try:
@@ -353,11 +361,6 @@ def _sanitize_for_json(obj):
             return float(obj)
         except Exception:
             return str(obj)
-
-    # pandas NA / NaT without importing pandas
-    tname = type(obj).__name__
-    if tname in ("NAType", "NaTType"):
-        return None
 
     # numpy scalars and arrays without importing numpy
     # Many numpy scalars have .item(); arrays often have .tolist()
