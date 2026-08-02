@@ -188,3 +188,71 @@ class TestSanitizationIntegration:
         output_path = tmp_path / "test_cat.parquet"
         result.to_parquet(output_path, engine="pyarrow")
         assert output_path.exists()
+
+
+class TestSanitizationIsNotInstalledOnImport:
+    """Importing qalita_core must not patch pandas, nor import it."""
+
+    def _run(self, code):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def test_importing_qalita_core_does_not_import_pandas(self):
+        assert (
+            self._run(
+                "import sys, qalita_core; print('pandas' in sys.modules)"
+            )
+            == "False"
+        )
+
+    def test_importing_qalita_core_does_not_patch_to_parquet(self):
+        # The patch copies the frame on every write, doubling peak RAM; a pack
+        # that never asked for it must never pay for it.
+        assert (
+            self._run(
+                "import qalita_core, pandas as pd;"
+                " print(getattr(pd.DataFrame,"
+                " '_qalita_safe_to_parquet_installed', False))"
+            )
+            == "False"
+        )
+
+    def test_the_helpers_are_still_reachable_from_the_package(self):
+        assert (
+            self._run(
+                "import qalita_core;"
+                " print(callable(qalita_core.sanitize_dataframe_for_parquet)"
+                " and callable("
+                "qalita_core.install_pandas_parquet_sanitization))"
+            )
+            == "True"
+        )
+
+    def test_an_unknown_attribute_still_raises(self):
+        import qalita_core
+
+        with pytest.raises(AttributeError):
+            qalita_core.does_not_exist
+
+
+class TestSanitizeCopySemantics:
+    """`copy=False` exists to avoid doubling peak RAM on a big frame."""
+
+    def test_copy_true_leaves_the_input_alone(self):
+        df = pd.DataFrame({"col": [b"a", b"b"]})
+        sanitize_dataframe_for_parquet(df, copy=True)
+        assert df["col"].iloc[0] == b"a"
+
+    def test_copy_false_sanitizes_in_place(self):
+        df = pd.DataFrame({"col": [b"a", b"b"]})
+        out = sanitize_dataframe_for_parquet(df, copy=False)
+        assert out is df
+        assert df["col"].iloc[0] == "a"

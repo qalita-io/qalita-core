@@ -129,29 +129,89 @@ class TestPolarsIO:
         read_df = pl.read_parquet(result_path)
         assert len(read_df) == 1000
 
-    def test_estimate_memory_usage(self, sample_parquet_file):
-        """Test memory usage estimation."""
-        from qalita_core.polars_io import estimate_memory_usage, scan_parquet
+    def test_sink_parts_splits_in_one_pass(self, temp_parquet_dir):
+        """Parts roll at chunk_rows and are named for the object they hold."""
+        from qalita_core.polars_io import sink_parts
 
-        lf = scan_parquet(sample_parquet_file)
-        estimate = estimate_memory_usage(lf)
+        lf = pl.LazyFrame(
+            {"x": range(2500), "y": [f"v_{i}" for i in range(2500)]}
+        )
+        paths = sink_parts(lf, temp_parquet_dir, "obj", chunk_rows=1000)
 
-        assert "row_count" in estimate
-        assert estimate["row_count"] == 100_000
-        assert "estimated_size_mb" in estimate
-        assert estimate["estimated_size_mb"] > 0
+        assert [os.path.basename(p) for p in paths] == [
+            "obj_part_1.parquet",
+            "obj_part_2.parquet",
+            "obj_part_3.parquet",
+        ]
+        # The parts are one dataset: reading them together must not raise.
+        assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 2500
 
-    def test_should_use_streaming(self, sample_parquet_file):
-        """Test streaming recommendation based on data size."""
-        from qalita_core.polars_io import should_use_streaming, scan_parquet
+    def test_sink_parts_writes_an_empty_object(self, temp_parquet_dir):
+        """An empty source still yields a scannable object."""
+        from qalita_core.polars_io import sink_parts
 
-        lf = scan_parquet(sample_parquet_file)
+        paths = sink_parts(
+            pl.LazyFrame({"x": [], "y": []}), temp_parquet_dir, "void"
+        )
+        assert len(paths) == 1
+        assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 0
 
-        # 100K rows should not trigger streaming by default
-        assert not should_use_streaming(lf, threshold_rows=200_000)
+    def test_parts_share_one_pinned_schema(self, temp_parquet_dir):
+        """The regression this module exists for.
 
-        # But should trigger with lower threshold
-        assert should_use_streaming(lf, threshold_rows=50_000)
+        A writer per part infers dtypes per part: an all-null first batch types
+        the column Null and the next one String, and scanning the parts
+        together then raises SchemaError.
+        """
+        import pyarrow as pa
+        from qalita_core.polars_io import ParquetPartWriter
+
+        writer = ParquetPartWriter(
+            temp_parquet_dir,
+            "drift",
+            chunk_rows=2,
+            type_hints={"v": pa.large_string()},
+        )
+        writer.write(pl.DataFrame({"id": [1, 2], "v": [None, None]}))
+        writer.write(pl.DataFrame({"id": [3, 4], "v": ["a", "b"]}))
+        paths = writer.close()
+
+        assert len(paths) == 2
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["v"].to_list() == [None, None, "a", "b"]
+
+    def test_disk_guard_refuses_an_oversized_stage(self, temp_parquet_dir):
+        """Refuse before filling the volume rather than after."""
+        from qalita_core.polars_io import (
+            InsufficientDiskSpaceError,
+            check_disk_space,
+        )
+
+        check_disk_space(temp_parquet_dir, 1024)
+        with pytest.raises(InsufficientDiskSpaceError):
+            check_disk_space(temp_parquet_dir, 1 << 60)
+
+    def test_json_array_is_streamed_element_by_element(self, temp_parquet_dir):
+        """A top-level JSON array is read without loading the document."""
+        import json as _json
+        from qalita_core.polars_io import iter_json_array, sniff_json_format
+
+        path = os.path.join(temp_parquet_dir, "records.json")
+        records = [{"id": i, "name": f"n{i}"} for i in range(50)]
+        with open(path, "w", encoding="utf-8") as handle:
+            _json.dump(records, handle)
+
+        assert sniff_json_format(path) == "array"
+        # A tiny buffer forces the refill path.
+        assert list(iter_json_array(path, buffer_size=8)) == records
+
+    def test_sniff_detects_ndjson(self, temp_parquet_dir):
+        from qalita_core.polars_io import sniff_json_format
+
+        path = os.path.join(temp_parquet_dir, "lines.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"a": 1}\n{"a": 2}\n')
+        assert sniff_json_format(path) == "ndjson"
 
 
 class TestCompletenessAggregatorPolars:

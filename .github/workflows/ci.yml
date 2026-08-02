@@ -26,6 +26,31 @@ jobs:
         with:
           extra_args: --only-verified
 
+  streaming-check:
+    name: Static check - no eager reads
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # No dependencies on purpose: the checker is stdlib-only AST analysis, so
+      # this job answers in seconds and cannot be broken by an install failure.
+      - name: Fail on eager reads in the streaming contract
+        run: |
+          python tests/test_no_eager_reads.py \
+            qalita_core/analytics.py \
+            qalita_core/profiling.py \
+            qalita_core/pack.py
+      # Advisory until data_source_opener.py and pandas_sanitization.py finish
+      # migrating; make this the blocking step (drop continue-on-error and the
+      # step above) once it reports nothing.
+      - name: Report eager reads in the rest of the package
+        continue-on-error: true
+        run: python tests/test_no_eager_reads.py qalita_core --show-waivers
+
   test:
     name: Pytest - Unit Tests
     runs-on: ubuntu-latest

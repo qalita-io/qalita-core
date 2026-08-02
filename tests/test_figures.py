@@ -874,3 +874,47 @@ def test_pack_exposes_a_figures_asset(config_paths):
     assert isinstance(pack.figures, FiguresAsset)
     assert pack.figures.type == "figures"
     assert pack.figures.data == {"version": 1, "measures": {}, "figures": []}
+
+
+def test_top_n_polars_never_materializes_the_frame_in_python(monkeypatch):
+    """Le tri reste dans le moteur : aucune ligne ne devient un dict Python.
+
+    `top_n` est nourri de résultats de `group_by` — le cas à forte cardinalité.
+    Matérialiser puis trier en Python, c'était la seule fonction de figures.py
+    sans plafond de lignes.
+    """
+    import qalita_core.figures as figures
+
+    def explode(_frame):
+        raise AssertionError("le frame polars a été matérialisé en dicts")
+
+    monkeypatch.setattr(figures, "_records_of", explode)
+    frame = pl.DataFrame({"column": list("abcde"), "v": [10, 8, 6, 4, 2]})
+    out = figures.top_n(frame, by="v", n=3, other=True)
+    assert out["column"].to_list() == ["a", "b", "c", "Autres"]
+    assert out["v"].to_list() == [10, 8, 6, 6]
+
+
+def test_top_n_polars_keeps_only_n_rows_of_a_wide_group_by():
+    frame = pl.DataFrame(
+        {"key": [str(i) for i in range(10_000)], "n": list(range(10_000))}
+    )
+    out = top_n(frame, by="n", n=5)
+    assert out.height == 5
+    assert out["n"].to_list() == [9999, 9998, 9997, 9996, 9995]
+
+
+def test_top_n_polars_folded_row_sums_the_whole_tail():
+    frame = pl.DataFrame(
+        {"key": [str(i) for i in range(1000)], "n": [1] * 1000}
+    )
+    out = top_n(frame, by="n", n=10, other=True, dim="key")
+    assert out.height == 11
+    assert out["key"].to_list()[-1] == "Autres"
+    assert out["n"].to_list()[-1] == 990
+
+
+def test_top_n_polars_rejects_a_lazyframe_with_the_collect_hint():
+    frame = pl.DataFrame({"column": list("abc"), "v": [3, 2, 1]}).lazy()
+    with pytest.raises(TypeError, match="collect"):
+        top_n(frame, by="v", n=2)

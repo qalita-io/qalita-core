@@ -3,13 +3,18 @@
 Tests for qalita_core.aggregation module
 """
 
+import subprocess
+import sys
+
 import pytest
 import pandas as pd
 import numpy as np
+import polars as pl
 import datetime as dt
 from qalita_core.aggregation import (
     detect_chunked_from_items,
     normalize_and_dedupe_recommendations,
+    streaming_outliers,
     CompletenessAggregator,
     OutlierAggregator,
     DuplicateAggregator,
@@ -213,65 +218,184 @@ class TestCompletenessAggregator:
         assert isinstance(metrics, list)
 
 
+def _outlier_frame():
+    """0..99 plus one value far outside any fence."""
+    return pl.DataFrame(
+        {
+            "v": [float(i) for i in range(100)] + [10_000.0],
+            "flat": [7.0] * 101,
+        }
+    )
+
+
+class TestStreamingOutliers:
+    """Tests for the two-pass streaming outlier helper."""
+
+    def test_iqr_counts_the_outlier(self):
+        result = streaming_outliers(_outlier_frame().lazy(), ["v"])
+        assert result["v"]["outlier_count"] == 1
+        assert result["v"]["non_null"] == 101
+        assert result["v"]["normality_score"] == pytest.approx(1 - 1 / 101)
+        assert result["v"]["upper"] < 10_000
+
+    def test_iqr_is_approximate_by_default(self):
+        result = streaming_outliers(_outlier_frame().lazy(), ["v"])
+        assert result["v"]["bounds_method"] == "histogram"
+
+    def test_exact_flips_the_method_label(self):
+        result = streaming_outliers(_outlier_frame().lazy(), ["v"], exact=True)
+        assert result["v"]["bounds_method"] == "exact"
+        assert result["v"]["outlier_count"] == 1
+
+    def test_zscore_bounds_are_exact(self):
+        result = streaming_outliers(
+            _outlier_frame().lazy(), ["v"], method="zscore"
+        )
+        assert result["v"]["bounds_method"] == "exact"
+        assert result["v"]["method"] == "zscore"
+        assert result["v"]["outlier_count"] == 1
+
+    def test_constant_column_has_no_fence(self):
+        result = streaming_outliers(_outlier_frame().lazy(), ["flat"])
+        assert result["flat"]["outlier_count"] == 0
+        assert result["flat"]["normality_score"] == 1.0
+        assert result["flat"]["lower"] is None
+
+    def test_all_null_column_is_not_an_outlier_factory(self):
+        frame = pl.DataFrame(
+            {"v": [None, None, None]}, schema={"v": pl.Float64}
+        )
+        result = streaming_outliers(frame.lazy(), ["v"])
+        assert result["v"]["outlier_count"] == 0
+        assert result["v"]["non_null"] == 0
+        assert result["v"]["normality_score"] == 1.0
+
+    def test_chunks_share_one_global_fence(self):
+        """The fence must come from the whole dataset, not from a chunk.
+
+        Split in two, the first chunk alone would flag nothing: its own IQR
+        covers its own range. Only a global fence sees the tail.
+        """
+        frame = _outlier_frame()
+        whole = streaming_outliers(frame.lazy(), ["v"])
+        halves = pl.concat([frame.head(50), frame.tail(51)]).lazy()
+        assert streaming_outliers(halves, ["v"]) == whole
+
+    def test_empty_columns_costs_nothing(self):
+        assert streaming_outliers(_outlier_frame().lazy(), []) == {}
+
+    def test_unknown_method_is_refused(self):
+        with pytest.raises(ValueError, match="unknown outlier method"):
+            streaming_outliers(_outlier_frame().lazy(), ["v"], method="mad")
+
+
 class TestOutlierAggregator:
     """Tests for OutlierAggregator class."""
 
     def test_init(self):
         agg = OutlierAggregator()
-        assert agg.col_outliers == {}
-        assert agg.col_norm_weighted_sum == {}
-        assert agg.col_rows == {}
+        assert agg.columns == {}
         assert agg.dataset_outliers == 0
         assert agg.total_rows == 0
 
-    def test_add_column_stats(self):
+    def test_add_column_result(self):
         agg = OutlierAggregator()
-        agg.add_column_stats(
-            "col1", mean_normality=0.9, outlier_count=5, rows=100
+        agg.add_column_result(
+            "col1", outlier_count=5, normality_score=0.95, rows=100
         )
-        assert agg.col_outliers["col1"] == 5
-        assert agg.col_rows["col1"] == 100
+        assert agg.columns["col1"]["outlier_count"] == 5
+        assert agg.columns["col1"]["rows"] == 100
 
-    def test_add_multiple_column_stats(self):
+    def test_a_column_is_recorded_once_not_accumulated(self):
+        """Global results replace each other; they are never summed."""
         agg = OutlierAggregator()
-        agg.add_column_stats("col1", 0.9, 5, 100)
-        agg.add_column_stats("col1", 0.8, 3, 50)
-        assert agg.col_outliers["col1"] == 8
-        assert agg.col_rows["col1"] == 150
+        agg.add_column_result("col1", outlier_count=5, normality_score=0.95)
+        agg.add_column_result("col1", outlier_count=8, normality_score=0.92)
+        assert agg.columns["col1"]["outlier_count"] == 8
 
-    def test_add_dataset_stats(self):
+    def test_add_streaming_outliers(self):
         agg = OutlierAggregator()
-        agg.add_dataset_stats(
-            mean_normality=0.85, rows=100, multivariate_outliers_count=10
-        )
+        results = streaming_outliers(_outlier_frame().lazy(), ["v", "flat"])
+        agg.add_streaming_outliers(results, rows=101)
+        assert agg.total_rows == 101
+        assert agg.columns["v"]["outlier_count"] == 1
+
+    def test_add_dataset_result(self):
+        agg = OutlierAggregator()
+        agg.add_dataset_result(rows=100, multivariate_outliers_count=10)
         assert agg.dataset_outliers == 10
         assert agg.total_rows == 100
 
     def test_finalize_metrics_and_recommendations(self):
         agg = OutlierAggregator()
-        agg.add_column_stats("col1", 0.9, 5, 100)
-        agg.add_dataset_stats(0.85, 100, 10)
+        agg.add_column_result(
+            "col1", outlier_count=5, normality_score=0.95, rows=100
+        )
+        agg.add_dataset_result(rows=100, multivariate_outliers_count=10)
 
         metrics, recommendations = agg.finalize_metrics_and_recommendations(
             "test_dataset", normality_threshold=0.8
         )
 
-        assert len(metrics) > 0
         metric_keys = [m["key"] for m in metrics]
         assert "outliers" in metric_keys
         assert "score" in metric_keys
+        assert "total_outliers_count" in metric_keys
+
+    def test_approximate_metrics_carry_a_method_sibling(self):
+        agg = OutlierAggregator()
+        agg.add_streaming_outliers(
+            streaming_outliers(_outlier_frame().lazy(), ["v"]), rows=101
+        )
+        metrics, _ = agg.finalize_metrics_and_recommendations(
+            "test_dataset", normality_threshold=0.8
+        )
+        methods = {
+            m["key"]: m["value"]
+            for m in metrics
+            if m["key"].endswith("_method")
+        }
+        assert methods["normality_score_method"] == "histogram"
+        assert methods["outliers_method"] == "histogram"
+
+    def test_exact_metrics_say_so(self):
+        agg = OutlierAggregator()
+        agg.add_streaming_outliers(
+            streaming_outliers(_outlier_frame().lazy(), ["v"], exact=True),
+            rows=101,
+        )
+        metrics, _ = agg.finalize_metrics_and_recommendations(
+            "test_dataset", normality_threshold=0.8
+        )
+        methods = {
+            m["key"]: m["value"]
+            for m in metrics
+            if m["key"].endswith("_method")
+        }
+        assert set(methods.values()) == {"exact"}
 
     def test_low_normality_generates_recommendation(self):
         agg = OutlierAggregator()
-        agg.add_column_stats("col1", 0.5, 50, 100)  # Low normality
-        agg.add_dataset_stats(0.5, 100, 50)
+        agg.add_column_result(
+            "col1", outlier_count=50, normality_score=0.5, rows=100
+        )
+        agg.add_dataset_result(rows=100, multivariate_outliers_count=50)
 
         metrics, recommendations = agg.finalize_metrics_and_recommendations(
             "test_dataset", normality_threshold=0.8
         )
 
-        # Should generate recommendations for low normality
         assert len(recommendations) > 0
+
+    def test_dataset_score_is_the_mean_of_column_scores(self):
+        agg = OutlierAggregator()
+        agg.add_column_result("a", outlier_count=0, normality_score=1.0)
+        agg.add_column_result("b", outlier_count=10, normality_score=0.5)
+        metrics, _ = agg.finalize_metrics_and_recommendations(
+            "test_dataset", normality_threshold=0.0
+        )
+        score = [m for m in metrics if m["key"] == "normality_score_dataset"]
+        assert score[0]["value"] == 0.75
 
 
 class TestDuplicateAggregator:
@@ -496,3 +620,241 @@ class TestDetermineRecommendationLevel:
         assert _determine_recommendation_level(0.31) == "warning"
         assert _determine_recommendation_level(0.5) == "warning"
         assert _determine_recommendation_level(0.51) == "high"
+
+
+class TestCompletenessAggregatorPolars:
+    """The streaming path: LazyFrames in, one pass each."""
+
+    def test_add_lf_counts_nulls_per_column(self):
+        agg = CompletenessAggregator()
+        frame = pl.DataFrame({"a": [1, None, 3], "b": [None, None, "x"]})
+        agg.add_lf(frame.lazy())
+        assert agg.total_rows == 3
+        assert agg.per_column["a"] == {"non_null": 2, "rows": 3}
+        assert agg.per_column["b"] == {"non_null": 1, "rows": 3}
+        assert agg.total_cells == 6
+        assert agg.total_non_null_cells == 3
+
+    def test_chunks_accumulate(self):
+        agg = CompletenessAggregator()
+        agg.add_lf(pl.DataFrame({"a": [1, None]}).lazy())
+        agg.add_lf(pl.DataFrame({"a": [3, 4]}).lazy())
+        assert agg.total_rows == 4
+        assert agg.per_column["a"]["non_null"] == 3
+
+    def test_add_pl_matches_add_lf(self):
+        frame = pl.DataFrame({"a": [1, None, 3]})
+        lazy_agg = CompletenessAggregator()
+        lazy_agg.add_lf(frame.lazy())
+        eager_agg = CompletenessAggregator()
+        eager_agg.add_pl(frame)
+        assert eager_agg.per_column == lazy_agg.per_column
+        assert eager_agg.total_rows == lazy_agg.total_rows
+
+    def test_add_dispatches_on_type(self):
+        agg = CompletenessAggregator()
+        agg.add(pl.DataFrame({"a": [1, 2]}).lazy())
+        agg.add(pl.DataFrame({"a": [3]}))
+        agg.add(pd.DataFrame({"a": [4]}))
+        assert agg.total_rows == 4
+
+    def test_add_refuses_an_unsupported_type(self):
+        with pytest.raises(TypeError):
+            CompletenessAggregator().add([{"a": 1}])
+
+    def test_a_frame_with_no_rows_is_not_an_error(self):
+        agg = CompletenessAggregator()
+        agg.add_lf(pl.DataFrame(schema={"a": pl.Int64}).lazy())
+        assert agg.total_rows == 0
+        assert agg.per_column["a"] == {"non_null": 0, "rows": 0}
+        assert agg.unique_columns == {"a"}
+
+    def test_a_frame_with_no_columns_is_not_an_error(self):
+        agg = CompletenessAggregator()
+        agg.add_lf(pl.DataFrame().lazy())
+        assert agg.total_rows == 0
+        assert agg.per_column == {}
+
+    def test_metrics_match_the_pandas_path(self):
+        frame = pd.DataFrame({"a": [1, None, 3], "b": [1, 2, 3]})
+        pandas_agg = CompletenessAggregator()
+        pandas_agg.add_df(frame)
+        polars_agg = CompletenessAggregator()
+        polars_agg.add_lf(pl.from_pandas(frame).lazy())
+        assert polars_agg.finalize_metrics_and_schemas(
+            "d"
+        ) == pandas_agg.finalize_metrics_and_schemas("d")
+
+
+class TestDuplicateAggregatorPolars:
+    """The streaming path: Polars owns the group state, not a Python dict."""
+
+    def test_duplicates_are_counted_across_chunks(self):
+        # id 2 appears once per chunk: only a group-by that sees both chunks
+        # can call it a duplicate.
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": [1, 2]}).lazy())
+        agg.add_lf(pl.DataFrame({"id": [2, 3]}).lazy())
+        assert agg.total_rows == 4
+        assert agg.duplicate_count() == 1
+
+    def test_no_python_dict_is_built_on_the_lazy_path(self):
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": list(range(1000))}).lazy())
+        agg.duplicate_count()
+        assert agg.combo_to_count == {}
+
+    def test_finalize_metrics(self):
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": [1, 1, 2, 3]}).lazy())
+        metrics, _ = agg.finalize_metrics("test_dataset")
+        by_key = {m["key"]: m["value"] for m in metrics}
+        assert by_key["duplicates"] == 1
+        assert by_key["score"] == "0.75"
+
+    def test_multi_column_keys(self):
+        agg = DuplicateAggregator(["a", "b"])
+        agg.add_pl(pl.DataFrame({"a": [1, 1, 2], "b": ["x", "x", "x"]}))
+        assert agg.duplicate_count() == 1
+        assert agg.get_duplicate_keys() == [(1, "x")]
+
+    def test_get_duplicate_keys_is_bounded(self):
+        agg = DuplicateAggregator(["id"])
+        # 500 distinct keys, every one duplicated: the unbounded version
+        # returned 500 tuples, i.e. the dataset.
+        agg.add_lf(pl.DataFrame({"id": list(range(500)) * 2}).lazy())
+        assert len(agg.get_duplicate_keys(limit=10)) == 10
+
+    def test_get_duplicate_keys_returns_the_worst_first(self):
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": [1, 1, 2, 2, 2, 3]}).lazy())
+        assert agg.get_duplicate_keys(limit=1) == [(2,)]
+
+    def test_get_duplicate_key_counts_columns(self):
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": [1, 1, 2]}).lazy())
+        counts = agg.get_duplicate_key_counts()
+        assert counts.columns == ["id", "count"]
+        assert counts.to_dicts() == [{"id": 1, "count": 2}]
+
+    def test_get_duplicate_keys_refuses_an_empty_bound(self):
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": [1, 1]}).lazy())
+        with pytest.raises(ValueError, match="limit must be positive"):
+            agg.get_duplicate_keys(limit=0)
+
+    def test_registering_a_frame_invalidates_the_counts(self):
+        agg = DuplicateAggregator(["id"])
+        agg.add_lf(pl.DataFrame({"id": [1, 2]}).lazy())
+        assert agg.duplicate_count() == 0
+        agg.add_lf(pl.DataFrame({"id": [1]}).lazy())
+        assert agg.duplicate_count() == 1
+        assert agg.total_rows == 3
+
+    def test_nothing_added_is_not_an_error(self):
+        agg = DuplicateAggregator(["id"])
+        assert agg.total_rows == 0
+        assert agg.duplicate_count() == 0
+        assert agg.get_duplicate_keys() == []
+
+
+class TestTimelinessAggregatorAddLf:
+    """One batched min/max pass instead of one distinct-value pass per column."""
+
+    def test_dates_and_years_in_a_single_pass(self):
+        frame = pl.DataFrame(
+            {
+                "d": [dt.date(2020, 1, 1), dt.date(2024, 6, 1), None],
+                "y": [2015, 2018, None],
+                "label": ["a", "b", "c"],
+            }
+        )
+        agg = TimelinessAggregator()
+        agg.add_lf(frame.lazy(), ["d", "y", "label"])
+        assert agg.date_cols["d"] == {
+            "kind": "date",
+            "min": dt.date(2020, 1, 1),
+            "max": dt.date(2024, 6, 1),
+        }
+        assert agg.date_cols["y"] == {"kind": "year", "min": 2015, "max": 2018}
+        # a string column is neither a date nor a year: skipped, not guessed
+        assert "label" not in agg.date_cols
+
+    def test_datetime_columns_are_observed(self):
+        frame = pl.DataFrame(
+            {"ts": [dt.datetime(2020, 1, 1), dt.datetime(2021, 1, 1)]}
+        )
+        agg = TimelinessAggregator()
+        agg.add_lf(frame.lazy(), ["ts"])
+        assert agg.date_cols["ts"]["kind"] == "date"
+        assert agg.date_cols["ts"]["max"] == dt.datetime(2021, 1, 1)
+
+    def test_chunks_widen_the_interval(self):
+        agg = TimelinessAggregator()
+        agg.add_lf(pl.DataFrame({"d": [dt.date(2021, 1, 1)]}).lazy(), ["d"])
+        agg.add_lf(
+            pl.DataFrame(
+                {"d": [dt.date(2019, 1, 1), dt.date(2023, 1, 1)]}
+            ).lazy(),
+            ["d"],
+        )
+        assert agg.date_cols["d"]["min"] == dt.date(2019, 1, 1)
+        assert agg.date_cols["d"]["max"] == dt.date(2023, 1, 1)
+
+    def test_all_null_column_is_ignored(self):
+        frame = pl.DataFrame({"d": [None, None]}, schema={"d": pl.Date})
+        agg = TimelinessAggregator()
+        agg.add_lf(frame.lazy(), ["d"])
+        assert agg.date_cols == {}
+
+    def test_defaults_to_every_column(self):
+        frame = pl.DataFrame({"d": [dt.date(2020, 1, 1)]})
+        agg = TimelinessAggregator()
+        agg.add_lf(frame.lazy())
+        assert "d" in agg.date_cols
+
+    def test_finalize_after_add_lf(self):
+        frame = pl.DataFrame({"d": [dt.date(2020, 1, 1)]})
+        agg = TimelinessAggregator()
+        agg.add_lf(frame.lazy(), ["d"])
+        metrics, recommendations = agg.finalize_metrics(
+            "ds", None, lambda days: max(0.0, 1 - days / 365)
+        )
+        keys = [m["key"] for m in metrics]
+        assert "earliest_date" in keys and "latest_date" in keys
+        assert recommendations  # 2020 is more than a year old
+
+
+class TestPandasIsOptional:
+    """pandas must not be imported by importing qalita_core."""
+
+    def test_importing_qalita_core_does_not_import_pandas(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys, qalita_core; print('pandas' in sys.modules)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "False"
+
+    def test_importing_aggregation_does_not_import_pandas(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys, qalita_core.aggregation as a;"
+                " print('pandas' in sys.modules)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "False"
+
+    def test_missing_values_are_detected_without_pandas(self):
+        agg = DuplicateAggregator(["a"])
+        assert agg._sanitize_key_tuple((np.nan, None, 1)) == (None, None, 1)

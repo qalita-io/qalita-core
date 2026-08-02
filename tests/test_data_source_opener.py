@@ -10,6 +10,9 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import polars as pl
+import pyarrow.parquet as pq
+
 from qalita_core.data_source_opener import (
     FileSource,
     DatabaseSource,
@@ -25,6 +28,7 @@ from qalita_core.data_source_opener import (
     _build_base_name,
     _build_parquet_path,
     _infer_format_from_path,
+    _materialize_remote_to_parquet,
     DEFAULT_PORTS,
 )
 
@@ -388,6 +392,67 @@ class TestS3Source:
         # This will fail at actual S3 access, but we can verify path construction
         # by checking the exception message or using mocks in integration tests
 
+    def test_credentials_reach_the_scan(self):
+        """The options used to be built and then dropped on the parquet path."""
+        source = S3Source(
+            {
+                "path": "s3://bucket/key.parquet",
+                "key": "AKIA",
+                "secret": "shh",
+                "token": "sess",
+                "client_kwargs": {"region_name": "eu-west-3"},
+            }
+        )
+        assert source._storage_options() == {
+            "aws_access_key_id": "AKIA",
+            "aws_secret_access_key": "shh",
+            "aws_session_token": "sess",
+            "aws_region": "eu-west-3",
+        }
+
+    def test_no_credentials_means_no_options(self):
+        assert (
+            S3Source({"path": "s3://bucket/key.csv"})._storage_options()
+            is None
+        )
+
+
+class TestRemoteMaterialization:
+    """Remote parquet: pass through when it can be read, stage when it cannot."""
+
+    def _parquet(self, tmp_path):
+        path = tmp_path / "remote.parquet"
+        pl.DataFrame({"a": [1, 2, 3]}).write_parquet(path)
+        return str(path)
+
+    def test_public_parquet_is_passed_through(self, tmp_path):
+        source = S3Source({"path": "s3://bucket/remote.parquet"})
+        paths = _materialize_remote_to_parquet(
+            source,
+            self._parquet(tmp_path),
+            "parquet",
+            None,
+            {"parquet_output_dir": str(tmp_path / "out")},
+        )
+        assert paths == [self._parquet(tmp_path)]
+        assert list(source.object_paths) == ["remote_remote"]
+
+    def test_private_parquet_is_staged_with_its_credentials(self, tmp_path):
+        # get_data returns bare paths, so credentials cannot travel with them:
+        # the object is staged rather than silently scanned anonymously later.
+        source = S3Source({"path": "s3://bucket/remote.parquet", "key": "AK"})
+        paths = _materialize_remote_to_parquet(
+            source,
+            self._parquet(tmp_path),
+            "parquet",
+            source._storage_options(),
+            {"parquet_output_dir": str(tmp_path / "out")},
+        )
+        assert [os.path.basename(p) for p in paths] == [
+            "remote_remote_part_1.parquet"
+        ]
+        assert pl.scan_parquet(paths).collect().height == 3
+
 
 class TestGCSSource:
     """Tests for GCSSource class."""
@@ -516,3 +581,154 @@ class TestDatabaseSourceSchemaHandling:
         # This should split "main.items" into schema="main", table="items"
         paths = source.get_data("items", pack_config=pack_config)
         assert len(paths) > 0
+
+
+def _make_db(path, tables):
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    for name, rows in tables.items():
+        cur.execute(f"CREATE TABLE {name}(id INTEGER, v TEXT)")
+        cur.executemany(f"INSERT INTO {name} VALUES (?,?)", rows)
+    conn.commit()
+    conn.close()
+
+
+class TestObjectPaths:
+    """Every source records which parts belong to which logical object."""
+
+    def test_database_records_one_entry_per_table(self, tmp_path):
+        db_path = tmp_path / "objects.db"
+        _make_db(
+            db_path,
+            {
+                "alpha": [(i, f"a{i}") for i in range(2500)],
+                "beta": [(i, f"b{i}") for i in range(10)],
+            },
+        )
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        pack_config = {
+            "parquet_output_dir": str(tmp_path / "out"),
+            "chunk_rows": 1000,
+        }
+        paths = source.get_data("*", pack_config=pack_config)
+
+        # The pairing is recorded while writing, so the three parts of "alpha"
+        # cannot be mistaken for three separate tables.
+        assert set(source.object_paths) == {"sqlite_alpha", "sqlite_beta"}
+        assert len(source.object_paths["sqlite_alpha"]) == 3
+        assert len(source.object_paths["sqlite_beta"]) == 1
+        assert sorted(paths) == sorted(
+            p for parts in source.object_paths.values() for p in parts
+        )
+
+    def test_file_records_its_object(self, tmp_path):
+        csv_path = tmp_path / "people.csv"
+        csv_path.write_text("id,name\n1,a\n2,b\n")
+
+        source = FileSource(str(csv_path))
+        source.get_data(
+            pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+        assert list(source.object_paths) == ["file_people"]
+
+
+class TestStreamingFileFormats:
+    """Files always go through the Polars streaming path now."""
+
+    def test_small_csv_is_written_with_zstd(self, tmp_path):
+        # The pandas path used to write these with snappy, so parts of one
+        # object could differ in compression from one another.
+        csv_path = tmp_path / "small.csv"
+        csv_path.write_text("id,value\n1,10\n2,20\n")
+
+        source = FileSource(str(csv_path))
+        paths = source.get_data(
+            pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+        metadata = pq.ParquetFile(paths[0]).metadata
+        compression = metadata.row_group(0).column(0).compression
+        assert compression.upper() == "ZSTD"
+
+    def test_ndjson_document_is_detected_without_a_flag(self, tmp_path):
+        # json_lines defaulted to False, so NDJSON was parsed as one document.
+        json_path = tmp_path / "events.json"
+        json_path.write_text(
+            "\n".join(json.dumps({"id": i}) for i in range(2500))
+        )
+
+        source = FileSource(str(json_path))
+        paths = source.get_data(
+            pack_config={
+                "parquet_output_dir": str(tmp_path / "out"),
+                "chunk_rows": 1000,
+            }
+        )
+        assert len(paths) == 3
+        assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 2500
+
+    def test_json_array_document_is_streamed(self, tmp_path):
+        json_path = tmp_path / "records.json"
+        json_path.write_text(
+            json.dumps([{"id": i, "name": f"n{i}"} for i in range(2500)])
+        )
+
+        source = FileSource(str(json_path))
+        paths = source.get_data(
+            pack_config={
+                "parquet_output_dir": str(tmp_path / "out"),
+                "chunk_rows": 1000,
+            }
+        )
+        assert len(paths) == 3
+        frame = pl.scan_parquet(paths).collect()
+        assert frame.height == 2500
+        assert frame["name"][0] == "n0"
+
+
+class TestSqlStreaming:
+    """SQL result sets reach Parquet as Arrow batches, one schema per object."""
+
+    def test_parts_of_a_table_share_a_schema(self, tmp_path):
+        db_path = tmp_path / "drift.db"
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t(id INTEGER, v TEXT)")
+        # The first chunk is entirely NULL on `v`: inferring per part types it
+        # Null there and String in the next one, and scanning the parts
+        # together then raises SchemaError.
+        cur.executemany(
+            "INSERT INTO t VALUES (?,?)",
+            [(i, None) for i in range(1000)]
+            + [(i, f"v{i}") for i in range(1000, 2000)],
+        )
+        conn.commit()
+        conn.close()
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        paths = source.get_data(
+            "t",
+            pack_config={
+                "parquet_output_dir": str(tmp_path / "out"),
+                "chunk_rows": 500,
+            },
+        )
+        assert len(paths) == 4
+        frame = pl.scan_parquet(paths).collect()
+        assert frame.height == 2000
+        assert frame["v"].null_count() == 1000
+
+    def test_empty_table_yields_a_scannable_object(self, tmp_path):
+        db_path = tmp_path / "empty.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE blank(id INTEGER, v TEXT)")
+        conn.commit()
+        conn.close()
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        paths = source.get_data(
+            "blank",
+            pack_config={"parquet_output_dir": str(tmp_path / "out")},
+        )
+        assert len(paths) == 1
+        assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 0

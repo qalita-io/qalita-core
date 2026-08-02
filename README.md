@@ -11,9 +11,15 @@ QALITA Core is a lightweight helper library used by QALITA packs to load data fr
 - Unified data access via a simple `DataSource` abstraction and factory
 - File, database, and object storage loaders with streaming to Parquet
 - Deterministic, size-bounded Parquet chunking with stable filenames
-- Safe Parquet writing for pandas DataFrames (automatic sanitization)
-- Shared aggregators for completeness, outliers, duplicates, and timeliness
+- `qalita_core.analytics` — streaming primitives (one pass, bounded results)
+  that packs compute with instead of loading frames
+- `qalita_core.profiling` — a whole-dataset profile in a handful of passes
+- Shared aggregators for completeness, outliers, duplicates, and timeliness,
+  all fed LazyFrames
 - Minimal pack runtime with JSON config loading and simple asset persistence
+
+pandas is **optional** (`pip install qalita_core[pandas]`): importing
+`qalita_core` does not import it, and nothing on the data path uses it.
 
 ## Supported sources
 
@@ -90,25 +96,59 @@ Configure output and size via `pack_config`:
 - `chunk_rows` (default: `100000`)
 - Optional `job.source.skiprows` applied to CSV/Excel
 
-## Safe Parquet writing for pandas
+## Computing over data — `qalita_core.analytics`
 
-On import, QALITA Core installs a small monkeypatch so `DataFrame.to_parquet`:
-
-- Ensures column names are strings
-- Decodes bytes to UTF‑8 strings when present
-- Normalizes mixed-type object columns and categoricals
-- Defaults to `engine="pyarrow"`
-
-You can also call the sanitizer explicitly:
+A pack never reads a file and never holds a frame. It asks `Pack.scan()` for a
+LazyFrame and computes with `analytics`, which is streaming-only: every collect
+runs with `engine="streaming"` and **raises** (`StreamingCollectError`) instead
+of falling back to the in-memory engine — on a large source that fallback is an
+OOM kill dressed as resilience.
 
 ```python
-from qalita_core import sanitize_dataframe_for_parquet
-clean_df = sanitize_dataframe_for_parquet(df)
+import polars as pl
+from qalita_core import analytics
+from qalita_core.pack import Pack
+
+with Pack() as pack:
+    lf = pack.scan("source")            # LazyFrame; never a path, never a chunk
+    schema = pack.schema("source")      # Parquet footers, no data read
+
+    # ONE pass, every statistic at once. A `for column in columns` loop issuing
+    # one query per column re-reads the whole source once per column.
+    stats = analytics.agg(lf, {
+        "rows": pl.len(),
+        **{f"{c}__nulls": pl.col(c).null_count()
+           for c in analytics.string_columns(schema)},
+    })
+
+    n_failed, examples = analytics.failures(   # count exact, rows bounded
+        lf, pl.col("age") < 0, limit=10
+    )
 ```
+
+| Function | What it gives back |
+|---|---|
+| `row_count(lf)` | exact count; Parquet answers from the footers |
+| `agg(lf, {name: expr})` | many aggregates in one streaming pass |
+| `sample(lf, n, seed=…, method=…)` | at most `n` rows drawn from the WHOLE dataset |
+| `approx_n_unique(lf, cols, exact=False)` | distinct counts (HyperLogLog by default) |
+| `quantiles(lf, cols, qs, exact=False)` | quantiles (histogram by default, O(bins) memory) |
+| `top_k(lf, by, k)` / `value_counts(lf, col, k)` | bounded ranked rows |
+| `failures(lf, predicate, limit=…)` | exact failing count + bounded example rows |
+| `sink(lf, path, max_rows_per_file=…)` | Parquet written without materializing |
+| `numeric_columns` / `string_columns` / `temporal_columns` | column selection from a schema |
+
+Approximate is the default for distinct counts and quantiles. Any metric derived
+from an approximate statistic also emits a sibling metric `<key>_method` whose
+value is `hyperloglog`, `histogram` or `exact`, so the UI can label the number.
+`qalita_core.profiling.profile(lf, schema=…, exact=…)` applies the same contract
+to a whole-dataset profile.
 
 ## Aggregation helpers (for packs)
 
-Helpers centralize common result/metric aggregation logic:
+Helpers centralize common result/metric aggregation logic. They take LazyFrames
+and compute through `analytics`, so memory depends on the number of columns and
+the requested top-K, never on the number of rows.
 
 ```python
 from qalita_core import (
@@ -119,12 +159,54 @@ from qalita_core import (
     DuplicateAggregator,
     TimelinessAggregator,
 )
+from qalita_core.aggregation import streaming_outliers
 ```
 
-- `CompletenessAggregator`: column/dataset completeness and schema extraction
-- `OutlierAggregator`: per-column and dataset outlier/normality metrics
-- `DuplicateAggregator`: duplicate counts and dataset-level score using key columns
-- `TimelinessAggregator`: dates/years coverage and recency scoring
+- `CompletenessAggregator.add_lf(lf)`: column/dataset completeness and schema
+  extraction, one streaming pass per frame whatever its width.
+- `DuplicateAggregator.add_lf(lf)`: registers a frame; the group-by runs once
+  over every registered frame at `finalize_metrics()` / `duplicate_count()`
+  time, so a key duplicated across two chunks is seen. `get_duplicate_keys(limit)`
+  returns the **most duplicated** keys, capped (1000 by default).
+- `TimelinessAggregator.add_lf(lf, date_columns)`: min/max of every date column
+  in one batched pass. Temporal columns become date observations, numeric ones
+  are read as years.
+- `streaming_outliers(lf, columns, method="iqr"|"zscore", threshold=…, exact=…)`:
+  two-pass global outlier detection — pass 1 computes the fences over the whole
+  column, pass 2 counts the rows outside them in a single aggregation. Feed the
+  result to `OutlierAggregator.add_streaming_outliers(results, rows=…)`.
+
+```python
+results = streaming_outliers(pack.scan("source"),
+                             analytics.numeric_columns(schema))
+agg = OutlierAggregator()
+agg.add_streaming_outliers(results, rows=analytics.row_count(lf))
+metrics, recommendations = agg.finalize_metrics_and_recommendations(name, 0.8)
+```
+
+`OutlierAggregator` no longer accepts per-chunk normality: a row-weighted mean of
+per-chunk normality is not the normality of the dataset, and per-chunk fences
+answer a different question than global ones. The legacy `add_column_stats()` /
+`add_dataset_stats()` are gone; use `add_column_result()` /
+`add_dataset_result()` / `add_streaming_outliers()`.
+
+## pandas (optional extra)
+
+pandas is not a dependency of `qalita_core`; install `qalita_core[pandas]` if a
+pack needs it. The `add_df()` entry points of the aggregators still work on
+frames that are already in memory.
+
+Importing `qalita_core` no longer monkeypatches
+`DataFrame.to_parquet`: the hook sanitizes into a **copy** of the frame, which
+doubles peak RAM on every write. Ask for it explicitly, or call the sanitizer:
+
+```python
+from qalita_core import (
+    sanitize_dataframe_for_parquet,       # resolved lazily, imports pandas
+    install_pandas_parquet_sanitization,  # opt-in monkeypatch
+)
+clean_df = sanitize_dataframe_for_parquet(df)          # copy=False to avoid it
+```
 
 ## Figures — `figures.json`
 
@@ -202,7 +284,10 @@ fits.
 ```python
 top_n(frame, by, n, other=False, label="Autres", dim=None)
 ```
-Keeps the `n` largest rows by `by`, dropping the tail. `other=True` folds the
+Keeps the `n` largest rows by `by`, dropping the tail. On a polars `DataFrame`
+the ranking runs inside the engine and only the `n` kept rows (plus the folded
+one) cross into Python — `top_n` is usually fed a `group_by` result, i.e. the
+high-cardinality case. `other=True` folds the
 tail into one row labeled `label` instead — valid **only** for an additive
 measure (a count): summing ratios into that row produces a wrong number, which
 is why `other` defaults to `False`. `dim` names the column that receives

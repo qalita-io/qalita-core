@@ -486,14 +486,22 @@ def sink(
 
     if max_rows_per_file:
         target.mkdir(parents=True, exist_ok=True)
-        _as_lazy(lf).sink_parquet(
-            pl.PartitionMaxSize(
-                str(target / "part-{part}.parquet"),
-                max_size=int(max_rows_per_file),
-            ),
-            compression=compression,
-        )
-        return sorted(str(p) for p in target.glob("part-*.parquet"))
+        # PartitionBy superseded PartitionMaxSize in Polars 1.36.1; keep working
+        # on both so the pinned floor (>=1.0) stays honest.
+        if hasattr(pl, "PartitionBy"):
+            partitioning: Any = pl.PartitionBy(
+                str(target),
+                max_rows_per_file=int(max_rows_per_file),
+                # Let the row count alone decide the split, rather than an
+                # estimate of the in-memory size of a batch.
+                approximate_bytes_per_file=None,
+            )
+        else:  # pragma: no cover - Polars < 1.36.1
+            partitioning = pl.PartitionMaxSize(
+                str(target), max_size=int(max_rows_per_file)
+            )
+        _as_lazy(lf).sink_parquet(partitioning, compression=compression)
+        return sorted(str(p) for p in target.glob("**/*.parquet"))
 
     target.parent.mkdir(parents=True, exist_ok=True)
     kwargs: dict[str, Any] = {"compression": compression}

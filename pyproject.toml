@@ -22,7 +22,6 @@ classifiers = [
 ]
 dependencies = [
     "polars>=1.0.0",  # Primary data processing library for big data (100GB+)
-    "pandas>=2.2.0",  # Keep for backward compatibility with packs
     "sqlalchemy>=2.0.27",
     "pyarrow>=19.0.0",
     "openpyxl>=3.1.2",
@@ -55,7 +54,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# pandas is no longer on the hot path: nothing in qalita_core imports it at
+# module level, and a pack that uses Polars must not pay for it. Install
+# qalita_core[pandas] for the legacy DataFrame entry points
+# (aggregation.add_df, pandas_sanitization) or for a pack wrapping a
+# pandas-only third party.
+pandas = [
+    "pandas>=2.2.0",
+]
 dev = [
+    "pandas>=2.2.0",
     "flake8>=3.8.1,<8.0",
     "pylint>=2.17.4",
     "black>=23.3.0",
@@ -74,3 +82,12 @@ include = ["version.json"]
 [tool.black]
 line-length = 79
 target-version = ["py313"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    # Memory-ceiling tests. They run a small dataset by default; set
+    # QALITA_BIGDATA_ROWS to make them meaningful, and deselect with
+    # `-m "not slow"` when you only want the semantic suite.
+    "slow: exercises the streaming engine against a large generated dataset",
+]
