@@ -242,20 +242,69 @@ def _castable(column: Any, target: "pa.DataType") -> bool:
     return True
 
 
+_INTEGER_DIGITS = {8: 3, 16: 5, 32: 10, 64: 19}
+
+
+def _decimal_parts(dtype: "pa.DataType") -> Optional[tuple]:
+    """``(integer digits, scale)`` needed to hold every value of ``dtype``."""
+    if pa.types.is_decimal(dtype):
+        return dtype.precision - dtype.scale, dtype.scale
+    if pa.types.is_integer(dtype):
+        digits = _INTEGER_DIGITS.get(dtype.bit_width)
+        if digits is None:
+            return None
+        if not pa.types.is_signed_integer(dtype):
+            digits += 1
+        return digits, 0
+    return None
+
+
+def _covering_decimal(
+    pinned: "pa.DataType", incoming: "pa.DataType"
+) -> Optional["pa.DataType"]:
+    """The narrowest decimal holding both, or None when no standard one does.
+
+    Absorbing a longer scale by widening to float64 would reintroduce exactly
+    the silent rounding that keeping Decimal out of float exists to prevent, so
+    a decimal column widens to a wider decimal or not at all.
+    """
+    left = _decimal_parts(pinned)
+    right = _decimal_parts(incoming)
+    if left is None or right is None:
+        return None
+    scale = max(left[1], right[1])
+    precision = max(left[0], right[0]) + scale
+    if precision <= 38:
+        return pa.decimal128(precision, scale)
+    if precision <= 76:
+        return pa.decimal256(precision, scale)
+    return None
+
+
 def _wider_types(
     pinned: "pa.DataType", incoming: "pa.DataType"
 ) -> List["pa.DataType"]:
     """Types that could hold both the pinned column and the new batch.
 
-    The ladder is monotone and short — integer -> float64 -> text — so a
-    pathological source can trigger at most two rewrites of a column, and never
-    a rewrite back towards a narrower type. ``large_string`` is terminal: once a
-    column is text there is nothing wider to promote it to.
+    The ladder is monotone — nothing ever promotes back towards a narrower
+    type — and ``large_string`` is terminal: once a column is text there is
+    nothing wider to promote it to. Numbers reach text through at most one
+    intermediate step (integer -> float64 -> text).
+
+    Decimals are the one place a column can widen more than twice: a source
+    whose batches carry a growing scale walks decimal128(p,s) upwards one step
+    per surprise. It is bounded by precision 38 (then 76 via decimal256), and
+    each step is a rewrite of the parts already on disk — the alternative,
+    collapsing to float64 on the first scale change, silently rounds the
+    values instead.
     """
     candidates: List["pa.DataType"] = []
-    if pa.types.is_integer(pinned) and (
-        pa.types.is_floating(incoming) or pa.types.is_decimal(incoming)
-    ):
+    covering = _covering_decimal(pinned, incoming)
+    if covering is not None:
+        candidates.append(covering)
+    if (
+        pa.types.is_integer(pinned) or pa.types.is_decimal(pinned)
+    ) and pa.types.is_floating(incoming):
         candidates.append(pa.float64())
     candidates.append(pa.large_string())
     return [c for c in candidates if not c.equals(pinned)]
@@ -702,9 +751,13 @@ def _arrow_safe(value: Any) -> Any:
     """
     if isinstance(value, (dict, list, tuple, set)):
         return json.dumps(value, default=str)
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (str, bytes, bool, int, float, type(None))):
+    if isinstance(value, (str, bytes, bool, int, float, Decimal, type(None))):
+        # Decimal is handed to Arrow as-is, which types it decimal128/256 and
+        # keeps every digit. It used to be float()ed here, which silently
+        # rounded any value past float64's ~15 significant digits: a
+        # NUMERIC(38,2) ledger amount came out of the loader different from
+        # the value in the database, and every metric computed on it was
+        # computed on the wrong number.
         return value
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
         return value
@@ -991,8 +1044,15 @@ def sniff_json_format(file_path: str) -> str:
     The loader used to take this from a ``json_lines`` config flag that defaults
     to False, so an NDJSON file was read with ``pl.read_json`` — the whole
     document at once — unless the caller happened to know to set it.
+
+    ``utf-8-sig`` because a UTF-8 BOM is not whitespace: with plain ``utf-8``
+    the first character of a BOM-prefixed array is ``\\ufeff``, not ``[``, and
+    every file written by a Windows exporter was classified as NDJSON and then
+    failed to parse.
     """
-    with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+    with open(
+        file_path, "r", encoding="utf-8-sig", errors="replace"
+    ) as handle:
         while True:
             character = handle.read(1)
             if not character:
@@ -1013,7 +1073,7 @@ def iter_json_array(
     table: a top-level array.
     """
     decoder = json.JSONDecoder()
-    with open(file_path, "r", encoding="utf-8") as handle:
+    with open(file_path, "r", encoding="utf-8-sig") as handle:
         buffer = handle.read(buffer_size)
         index = _skip_space(buffer, 0)
         if index >= len(buffer) or buffer[index] != "[":
@@ -1041,15 +1101,39 @@ def iter_json_array(
             if buffer[index] == "]":
                 return
 
+            start = index
             while True:
                 try:
-                    value, index = decoder.raw_decode(buffer, index)
-                    break
+                    value, end = decoder.raw_decode(buffer, start)
                 except ValueError:
                     more = handle.read(buffer_size)
                     if not more:
                         raise
                     buffer += more
+                    continue
+
+                # A successful decode is not proof the value was complete.
+                # raw_decode stops at the first character that cannot continue
+                # the token, so a buffer holding " 9." yields 9 and leaves
+                # ".75" to be read as a second element, and one ending in
+                # "123" yields 123 before "456" arrives. In an array every
+                # element is followed by ',' or ']', so that is the only thing
+                # that proves the buffer held all of it.
+                after = _skip_space(buffer, end)
+                if after < len(buffer) and buffer[after] in ",]":
+                    break
+                more = handle.read(buffer_size)
+                if not more:
+                    if after >= len(buffer):
+                        # End of file right after the value: the document is
+                        # missing its ']', but the element itself is whole.
+                        break
+                    raise ValueError(
+                        f"{file_path}: {buffer[after]!r} follows a value "
+                        f"where ',' or ']' was expected."
+                    )
+                buffer += more
+            index = end
             yield value
 
 

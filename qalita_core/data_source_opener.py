@@ -441,11 +441,37 @@ def _stage_remote_file(path: str, storage_options: Optional[dict]) -> str:
 
     local_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "qalita-staging"
     local_dir.mkdir(parents=True, exist_ok=True)
-    local_path = local_dir / os.path.basename(path.rstrip("/"))
 
-    with fsspec.open(path, "rb", **(storage_options or {})) as remote:
-        with open(local_path, "wb") as local:
-            shutil.copyfileobj(remote, local, length=8 * 1024 * 1024)
+    # The basename alone collides: s3://a/data.csv and s3://b/data.csv stage to
+    # the same file, and the second source silently analyses the first one's
+    # bytes. The digest of the full path disambiguates without making the name
+    # unreadable. blake2s, not sha1: a weak-hash warning on every staged file
+    # trains people to ignore the scanner.
+    base = os.path.basename(path.rstrip("/")) or "object"
+    digest = hashlib.blake2s(path.encode("utf-8"), digest_size=4).hexdigest()
+    local_path = local_dir / f"{digest}-{base}"
+
+    opened = fsspec.open(path, "rb", **(storage_options or {}))
+    with opened as remote:
+        # Ask the remote how big it is before writing a byte. Without this a
+        # 100 GiB object fills the staging volume and the failure surfaces as
+        # ENOSPC halfway through, leaving a truncated file behind that looks
+        # like a complete one.
+        size = None
+        try:
+            size = opened.fs.size(path)
+        except Exception:  # noqa: BLE001 - not every filesystem reports size
+            logger.debug("could not determine remote size of %s", path)
+        pio.check_disk_space(str(local_dir), size)
+
+        try:
+            with open(local_path, "wb") as local:
+                shutil.copyfileobj(remote, local, length=8 * 1024 * 1024)
+        except BaseException:
+            # A partial copy is worse than none: it is a valid-looking file the
+            # next run would happily scan.
+            local_path.unlink(missing_ok=True)
+            raise
     return str(local_path)
 
 
@@ -1084,6 +1110,19 @@ class S3Source(DataSource):
     def __init__(self, config):
         self.config = config or {}
 
+    def _object_key_is_the_path(self) -> bool:
+        """Whether ``config['key']`` names the object rather than the account.
+
+        ``key`` means two different things in the configs this class accepts:
+        fsspec spells the access key ``key``, and :meth:`get_data` builds
+        ``s3://{bucket}/{key}`` when no explicit ``path`` is given. Reading it
+        as a credential in that second case sent the object's own name to S3 as
+        ``aws_access_key_id`` — an authentication failure on every private
+        bucket configured with bucket+key, reported as a credentials problem
+        the user could not find because the credentials were correct.
+        """
+        return not self.config.get("path") and bool(self.config.get("bucket"))
+
     def _storage_options(self) -> Optional[dict]:
         """Credentials in the naming Polars' object store expects.
 
@@ -1093,10 +1132,11 @@ class S3Source(DataSource):
         """
         config = self.config
         client_kwargs = config.get("client_kwargs") or {}
+        access_key_aliases = ["access_key", "aws_access_key_id"]
+        if not self._object_key_is_the_path():
+            access_key_aliases.insert(0, "key")
         options = {
-            "aws_access_key_id": _first_of(
-                config, "key", "access_key", "aws_access_key_id"
-            ),
+            "aws_access_key_id": _first_of(config, *access_key_aliases),
             "aws_secret_access_key": _first_of(
                 config, "secret", "secret_key", "aws_secret_access_key"
             ),
