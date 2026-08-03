@@ -5,6 +5,12 @@ on:
     branches: ["main", "dev"]
     tags:
       - "*"
+  # Without this, the test matrix and the streaming check only ever run once the
+  # branch is already merged, which is too late to block anything. `publish` is
+  # guarded by a tag ref below, so a pull request runs the checks and nothing
+  # else.
+  pull_request:
+    branches: ["main", "dev"]
   workflow_dispatch:
 
 # Minimal permissions following least privilege principle
