@@ -1,34 +1,55 @@
 """
 # QALITA (c) COPYRIGHT 2025 - ALL RIGHTS RESERVED -
+
+Ingestion: turn a configured source into Parquet parts on local disk.
+
+This layer is the first thing that breaks on a large source, and it used to
+break before Python saw a row: every SQL class called
+``pandas.read_sql(sql, engine, chunksize=N)``, whose ``chunksize`` chunks
+*client-side only* — psycopg2, pymysql and pymssql buffer the entire result set
+in the driver before the first chunk is yielded. Everything here now goes
+through :mod:`qalita_core.polars_io`, which asks for a server-side cursor where
+the driver has one and streams Arrow batches straight to Parquet.
+
+Two properties the rest of the system depends on:
+
+* ``get_data()`` returns ``List[str]`` — the parquet parts, in order.
+* ``object_paths`` maps each logical object (table, collection, index, file) to
+  its parts. ``Pack`` prefers it over parsing part-file names, which is what
+  makes ``zip(table_names, parquet_paths)`` — the idiom that silently dropped
+  chunks 2..N — unnecessary at the root.
 """
 
-import os
 import glob
+import hashlib
+import json
 import logging
-import pandas as pd
-from typing import Optional, List, Iterable, Union
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import URL
+import os
+import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import URL
+
+from qalita_core import polars_io as pio
+
+# Re-exported so a caller can catch the pre-flight disk refusal without
+# reaching into polars_io.
+from qalita_core.polars_io import (  # noqa: F401
+    DEFAULT_CHUNK_ROWS,
+    InsufficientDiskSpaceError,
+)
 from qalita_core.utils import slugify
 
-# Polars for big data streaming (optional but recommended for 100GB+)
-try:
-    import polars as pl
-
-    POLARS_AVAILABLE = True
-except ImportError:
-    POLARS_AVAILABLE = False
-    pl = None  # type: ignore
+import polars as pl
 
 logger = logging.getLogger(__name__)
 
-# Configuration for big data mode
-USE_POLARS_BY_DEFAULT = True  # Set to False to use pandas by default
-STREAMING_THRESHOLD_BYTES = (
-    1_000_000_000  # 1GB - use streaming above this size
-)
+# Kept for callers that still test for it. Polars is a hard requirement of
+# qalita_core now: there is no pandas path left to fall back to.
+POLARS_AVAILABLE = True
 
 DEFAULT_PORTS = {
     "5432": "postgresql",
@@ -57,12 +78,105 @@ DEFAULT_PORTS = {
     "444": "athena",  # Athena uses HTTPS
 }
 
+# Object stores Polars reads natively. Anything else has to be staged through
+# fsspec to a local file first.
+_NATIVE_SCHEMES = (
+    "s3://",
+    "s3a://",
+    "gs://",
+    "gcs://",
+    "az://",
+    "abfs://",
+    "abfss://",
+    "http://",
+    "https://",
+)
+
+_SQL_STARTERS = ("select", "with", "show", "describe", "pragma", "explain")
+
 
 class DataSource(ABC):
     @abstractmethod
     def get_data(self, table_or_query=None, pack_config=None):
         """Return a list of parquet file paths for the requested data."""
         pass
+
+    @property
+    def object_paths(self) -> Dict[str, List[str]]:
+        """Logical object name -> the parquet parts holding it.
+
+        Recorded while writing, so the pairing between an object and its chunks
+        is never reconstructed by position afterwards.
+        """
+        existing = getattr(self, "_object_paths", None)
+        if existing is None:
+            existing = {}
+            self._object_paths = existing
+        return existing
+
+    @property
+    def _base_names(self) -> Dict[str, str]:
+        """Base name already handed out -> the raw object it was built for."""
+        existing = getattr(self, "_base_name_owners", None)
+        if existing is None:
+            existing = {}
+            self._base_name_owners = existing
+        return existing
+
+    def _object_base_name(
+        self, source_type: str, object_identifier: str
+    ) -> str:
+        """The part-file prefix *and* ``object_paths`` key of one object.
+
+        ``slugify`` folds case, accents and every run of separators into ``_``,
+        so ``logs-2024.01`` and ``logs_2024_01`` — or ``Orders`` and ``orders``,
+        or ``données`` and ``donnees`` — produce the same base name. Both the
+        on-disk prefix and the object key derive from it, so a clash makes the
+        second object truncate the first one's ``_part_1`` and concatenates the
+        two path lists under one key: one object vanishes and the other is
+        counted twice, silently.
+
+        Disambiguation has to happen here, before the first part is opened —
+        doing it when the paths are recorded is too late, the files have already
+        overwritten each other. Only an actual clash is renamed, so the object
+        names every pack and every stored metric already uses are untouched.
+        """
+        base = _build_base_name(source_type, object_identifier)
+        identifier = str(object_identifier)
+        registry = self._base_names
+
+        candidate = base
+        owner = registry.get(candidate)
+        if owner is not None and owner != identifier:
+            # A digest keeps the suffix stable across runs and independent of
+            # the order the objects happen to be listed in. blake2s rather than
+            # sha1: nothing here is security-sensitive, but a weak-hash warning
+            # on every scan trains people to ignore the scanner.
+            digest = hashlib.blake2s(
+                identifier.encode("utf-8", "replace"), digest_size=4
+            ).hexdigest()
+            candidate = f"{base}_{digest}"
+            index = 1
+            while registry.get(candidate, identifier) != identifier:
+                index += 1
+                candidate = f"{base}_{digest}_{index}"
+            logger.warning(
+                "%r and %r have the same normalized name %r; %r is exported "
+                "as %r so the two objects do not overwrite each other.",
+                owner,
+                identifier,
+                base,
+                identifier,
+                candidate,
+            )
+
+        registry[candidate] = identifier
+        return candidate
+
+    def _record_object(self, name: str, paths: List[str]) -> List[str]:
+        if paths:
+            self.object_paths.setdefault(name, []).extend(paths)
+        return paths
 
 
 # -----------------------------
@@ -85,7 +199,24 @@ def _build_base_name(source_type: str, object_identifier: str) -> str:
 def _build_parquet_path(
     output_dir: str, base_name: str, part_index: int
 ) -> str:
-    return os.path.join(output_dir, f"{base_name}_part_{part_index}.parquet")
+    return pio.part_path(output_dir, base_name, part_index)
+
+
+def _chunk_rows(pack_config: Optional[dict]) -> int:
+    return int((pack_config or {}).get("chunk_rows") or DEFAULT_CHUNK_ROWS)
+
+
+def _fetch_rows(pack_config: Optional[dict]) -> Optional[int]:
+    """Rows a driver is asked for at a time, independent of the part size."""
+    value = (pack_config or {}).get("fetch_rows")
+    return int(value) if value else None
+
+
+def _min_free_bytes(pack_config: Optional[dict]) -> int:
+    return int(
+        (pack_config or {}).get("min_free_disk_bytes")
+        or pio.DEFAULT_MIN_FREE_BYTES
+    )
 
 
 def cleanup_parquet_files(paths: List[str], logger=None) -> int:
@@ -113,234 +244,318 @@ def cleanup_parquet_files(paths: List[str], logger=None) -> int:
     return removed_count
 
 
-def _write_df_to_parquet(df: pd.DataFrame, output_path: str) -> str:
-    # Always write with pyarrow for Arrow/Polars/DuckDB compatibility
-    df.to_parquet(output_path, engine="pyarrow", index=False)
-    return output_path
+def _is_sql_query(candidate: str) -> bool:
+    """Heuristic: SQL statement rather than a bare object name."""
+    sql = candidate.strip().lower()
+    if ";" in sql or "\n" in sql:
+        return True
+    return any(sql.startswith(token) for token in _SQL_STARTERS)
 
 
-def _write_pandas_chunks(
-    df_iter: Iterable[pd.DataFrame],
-    output_dir: str,
-    base_name: str,
-    start_part: int = 1,
-) -> List[str]:
-    paths: List[str] = []
-    part = start_part
-    for chunk_df in df_iter:
-        path = _build_parquet_path(output_dir, base_name, part)
-        _write_df_to_parquet(chunk_df, path)
-        paths.append(path)
-        part += 1
-    return paths
+def _column_type_hints(
+    engine, table: Optional[str], schema: Optional[str]
+) -> Dict[str, Any]:
+    """Arrow types for a table, from the catalog.
 
-
-# -----------------------------
-# Polars-based streaming utilities (for big data 100GB+)
-# -----------------------------
-
-
-def _should_use_polars(
-    file_path: str, pack_config: Optional[dict] = None
-) -> bool:
-    """Determine if Polars should be used based on file size and configuration."""
-    if not POLARS_AVAILABLE:
-        return False
-
-    # Check explicit configuration
-    if pack_config:
-        use_polars = pack_config.get("use_polars")
-        if use_polars is not None:
-            return bool(use_polars)
-
-    # Check file size for automatic decision
-    if USE_POLARS_BY_DEFAULT:
-        try:
-            file_size = os.path.getsize(file_path)
-            return file_size > STREAMING_THRESHOLD_BYTES
-        except OSError:
-            pass
-
-    return USE_POLARS_BY_DEFAULT
-
-
-def _write_polars_to_parquet(
-    lf: "pl.LazyFrame",
-    output_dir: str,
-    base_name: str,
-    chunk_rows: int = 100000,
-) -> List[str]:
+    Only used to type columns that are entirely NULL in the first batch. Reading
+    them from the catalog is what keeps ``*_part_1`` and ``*_part_7`` of the same
+    object identically typed when the nulls happen to be at the front.
     """
-    Write a Polars LazyFrame to parquet file(s) using streaming.
-
-    For large datasets, this uses Polars' streaming engine to avoid
-    loading everything into memory.
-    """
-    if not POLARS_AVAILABLE:
-        raise ImportError("Polars is required for streaming write")
-
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    output_path = _build_parquet_path(output_dir, base_name, 1)
-
+    if not table:
+        return {}
     try:
-        # Use sink_parquet for streaming write (memory efficient)
-        lf.sink_parquet(
-            output_path,
-            compression="zstd",
-            row_group_size=chunk_rows,
+        return pio.arrow_type_hints(
+            inspect(engine).get_columns(table, schema=schema)
         )
-        return [output_path]
-    except Exception as e:
-        logger.warning(f"Streaming write failed, falling back to collect: {e}")
-        # Fallback: collect and write (uses more memory)
-        try:
-            df = lf.collect(engine="streaming")
-        except Exception:
-            df = lf.collect()
-        df.write_parquet(
-            output_path, compression="zstd", row_group_size=chunk_rows
-        )
-        return [output_path]
+    except Exception:  # noqa: BLE001 - catalogs are best effort
+        return {}
 
 
-def _load_csv_polars(
-    file_path: str,
-    output_dir: str,
-    base_name: str,
-    skip_rows: int = 0,
-    chunk_rows: int = 100000,
-) -> List[str]:
-    """
-    Load CSV file using Polars streaming for memory-efficient processing.
-
-    This uses Polars' lazy evaluation to process files larger than memory.
-    """
-    if not POLARS_AVAILABLE:
-        raise ImportError("Polars is required for streaming CSV load")
-
-    logger.info(f"Loading CSV with Polars streaming: {file_path}")
-
-    # Create lazy scan (does not load data into memory)
-    lf = pl.scan_csv(
-        file_path,
-        skip_rows=skip_rows,
-        ignore_errors=True,
-        infer_schema_length=10000,
-        encoding="utf8",
-    )
-
-    return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
-
-
-def _load_excel_polars(
-    file_path: str,
-    output_dir: str,
-    base_name: str,
-    skip_rows: int = 0,
-    chunk_rows: int = 100000,
-) -> List[str]:
-    """
-    Load Excel file using Polars.
-
-    Note: Excel files cannot be truly streamed, but Polars is more
-    memory-efficient than pandas for the same data.
-    """
-    if not POLARS_AVAILABLE:
-        raise ImportError("Polars is required for Excel load")
-
-    logger.info(f"Loading Excel with Polars: {file_path}")
-
-    try:
-        # Polars read_excel
-        df = pl.read_excel(
-            file_path,
-            read_options={"skip_rows": skip_rows} if skip_rows else None,
-        )
-        lf = df.lazy()
-        return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
-    except Exception as e:
-        logger.warning(
-            f"Polars Excel read failed: {e}, falling back to pandas"
-        )
-        raise
-
-
-def _load_json_polars(
-    file_path: str,
-    output_dir: str,
-    base_name: str,
-    ndjson: bool = False,
-    chunk_rows: int = 100000,
-) -> List[str]:
-    """
-    Load JSON/NDJSON file using Polars.
-
-    NDJSON (newline-delimited JSON) can be streamed efficiently.
-    Regular JSON must be loaded fully.
-    """
-    if not POLARS_AVAILABLE:
-        raise ImportError("Polars is required for JSON load")
-
-    logger.info(f"Loading JSON with Polars (ndjson={ndjson}): {file_path}")
-
-    if ndjson:
-        # NDJSON can be scanned lazily
-        lf = pl.scan_ndjson(file_path)
-    else:
-        # Regular JSON must be read fully
-        df = pl.read_json(file_path)
-        lf = df.lazy()
-
-    return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
-
-
-def _load_parquet_polars(
-    file_path: str,
-    output_dir: str,
-    base_name: str,
-) -> List[str]:
-    """
-    For parquet input, just return the path (no conversion needed).
-
-    Polars and pandas can both read parquet efficiently.
-    """
-    # Parquet is already optimized, just return the path
-    return [file_path]
-
-
-def _load_database_polars(
-    connection_string: str,
+def _sql_to_parquet(
+    source: DataSource,
+    engine,
     sql: str,
     output_dir: str,
     base_name: str,
-    chunk_rows: int = 100000,
+    chunk_rows: int,
+    *,
+    table: Optional[str] = None,
+    schema: Optional[str] = None,
+    pack_config: Optional[dict] = None,
 ) -> List[str]:
+    """Stream one SQL result set to parquet parts and record the object."""
+    paths = pio.stream_sql_to_parquet(
+        engine,
+        sql,
+        output_dir,
+        base_name,
+        chunk_rows=chunk_rows,
+        fetch_rows=_fetch_rows(pack_config),
+        type_hints=_column_type_hints(engine, table, schema),
+        min_free_bytes=_min_free_bytes(pack_config),
+    )
+    return source._record_object(base_name, paths)
+
+
+def _sink_to_parquet(
+    source: DataSource,
+    lf: "pl.LazyFrame",
+    output_dir: str,
+    base_name: str,
+    chunk_rows: int,
+    *,
+    pack_config: Optional[dict] = None,
+) -> List[str]:
+    """Sink a LazyFrame to parquet parts and record the object."""
+    paths = pio.sink_parts(
+        lf,
+        output_dir,
+        base_name,
+        chunk_rows=chunk_rows,
+        min_free_bytes=_min_free_bytes(pack_config),
+    )
+    return source._record_object(base_name, paths)
+
+
+class _SqlAlchemySource(DataSource):
+    """Shared table/query dispatch for every SQLAlchemy-backed source.
+
+    Each warehouse used to carry its own copy of this ~60-line block; they had
+    already drifted (different quoting, different naming, one missing the query
+    branch entirely) while sharing the same ``pd.read_sql(chunksize=...)`` bug.
     """
-    Load data from database using Polars for better memory efficiency.
 
-    Polars read_database is generally more memory-efficient than pandas.
+    dialect_name = "db"
+
+    def _qualify(
+        self, table_name: str, schema: Optional[str]
+    ) -> tuple[str, str]:
+        """Return ``(sql_identifier, display_name)`` for a table."""
+        if schema:
+            return f"{schema}.{table_name}", f"{schema}.{table_name}"
+        return table_name, table_name
+
+    def _list_tables(self, engine, schema: Optional[str]) -> List[str]:
+        try:
+            return list(inspect(engine).get_table_names(schema=schema) or [])
+        except Exception:  # noqa: BLE001 - dialects without a catalog
+            return []
+
+    def _is_sql_query(self, s: str) -> bool:
+        return _is_sql_query(s)
+
+    def _load_data(
+        self,
+        engine,
+        table_or_query,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name=None,
+        pack_config=None,
+    ) -> List[str]:
+        dialect_name = dialect_name or self.dialect_name
+
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
+            tables = self._list_tables(engine, schema)
+        elif isinstance(table_or_query, (list, tuple, set)):
+            tables = list(table_or_query)
+        elif isinstance(table_or_query, str):
+            if self._is_sql_query(table_or_query):
+                return _sql_to_parquet(
+                    self,
+                    engine,
+                    table_or_query,
+                    output_dir,
+                    self._object_base_name(dialect_name, "query"),
+                    chunk_rows,
+                    pack_config=pack_config,
+                )
+            tables = [table_or_query]
+        else:
+            raise TypeError(
+                "table_or_query must be None, '*', a string, or a list of "
+                "table names."
+            )
+
+        all_paths: List[str] = []
+        for table_name in tables:
+            all_paths.extend(
+                self._read_table_to_parquet(
+                    engine,
+                    table_name,
+                    schema,
+                    output_dir,
+                    chunk_rows,
+                    dialect_name,
+                    pack_config=pack_config,
+                )
+            )
+        return all_paths
+
+    def _read_table_to_parquet(
+        self,
+        engine,
+        table_name,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name=None,
+        pack_config=None,
+    ) -> List[str]:
+        qualified, display = self._qualify(table_name, schema)
+        return _sql_to_parquet(
+            self,
+            engine,
+            f"SELECT * FROM {qualified}",
+            output_dir,
+            self._object_base_name(dialect_name or self.dialect_name, display),
+            chunk_rows,
+            table=table_name,
+            schema=schema,
+            pack_config=pack_config,
+        )
+
+
+# -----------------------------
+# Remote object stores
+# -----------------------------
+
+
+def _stage_remote_file(path: str, storage_options: Optional[dict]) -> str:
+    """Copy a remote file to local disk in bounded blocks.
+
+    Used for the formats Polars cannot scan in place (Excel, whole-document
+    JSON) and for schemes its object store does not speak (HDFS). The copy is
+    streamed, so the file never exists in memory.
     """
-    if not POLARS_AVAILABLE:
-        raise ImportError("Polars is required for database streaming")
-
-    logger.info(f"Loading from database with Polars: {base_name}")
-
     try:
-        # Use Polars read_database (requires connectorx or adbc for best performance)
-        df = pl.read_database(sql, connection_string)
-        lf = df.lazy()
-        return _write_polars_to_parquet(lf, output_dir, base_name, chunk_rows)
-    except Exception as e:
-        logger.warning(f"Polars read_database failed: {e}")
-        raise
+        import fsspec
+    except ImportError as exc:  # pragma: no cover - depends on the extra
+        raise ImportError(
+            f"reading {path} requires fsspec (and the filesystem package for "
+            f"its scheme). Install with: pip install fsspec"
+        ) from exc
+
+    local_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "qalita-staging"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_path = local_dir / os.path.basename(path.rstrip("/"))
+
+    with fsspec.open(path, "rb", **(storage_options or {})) as remote:
+        with open(local_path, "wb") as local:
+            shutil.copyfileobj(remote, local, length=8 * 1024 * 1024)
+    return str(local_path)
 
 
-def _get_connection_string_from_engine(engine) -> Optional[str]:
-    """Extract connection string from SQLAlchemy engine for Polars."""
-    try:
-        return str(engine.url)
-    except Exception:
-        return None
+def _is_native_remote(path: str) -> bool:
+    return path.lower().startswith(_NATIVE_SCHEMES)
+
+
+def _infer_format_from_path(
+    path: str, explicit_format: Optional[str] = None
+) -> str:
+    if explicit_format:
+        return explicit_format.lower()
+    lower = path.lower()
+    if lower.endswith(".csv"):
+        return "csv"
+    if lower.endswith(".json"):
+        return "json"
+    if lower.endswith(".parquet") or lower.endswith(".pq"):
+        return "parquet"
+    if lower.endswith(".xlsx") or lower.endswith(".xls"):
+        return "excel"
+    return "csv"
+
+
+# -----------------------------
+# Files
+# -----------------------------
+
+
+def _excel_to_parquet(
+    file_path: str,
+    output_dir: str,
+    base_name: str,
+    *,
+    skip_rows: int,
+    chunk_rows: int,
+    fetch_rows: Optional[int] = None,
+    min_free_bytes: int = pio.DEFAULT_MIN_FREE_BYTES,
+) -> List[str]:
+    """Stream an xlsx sheet to parquet through openpyxl's read-only iterator.
+
+    Neither Polars nor pandas streams Excel — both build the entire sheet first
+    — so this is the only Excel path. The schema is fixed from the first batch
+    and every later batch is cast to it.
+    """
+    headers, rows = pio.iter_excel_rows(file_path, skip_rows=skip_rows)
+    if not headers:
+        return []
+    return pio.write_row_batches(
+        rows,
+        headers,
+        output_dir,
+        base_name,
+        chunk_rows=chunk_rows,
+        fetch_rows=fetch_rows,
+        min_free_bytes=min_free_bytes,
+    )
+
+
+def _json_to_parquet(
+    source: DataSource,
+    file_path: str,
+    output_dir: str,
+    base_name: str,
+    *,
+    chunk_rows: int,
+    pack_config: Optional[dict],
+) -> List[str]:
+    """Load a .json file, whatever shape it is in.
+
+    The format is sniffed rather than taken from a ``json_lines`` flag that
+    defaults to False: that default sent every NDJSON file through
+    ``read_json``, which parses the whole document.
+    """
+    explicit = (pack_config or {}).get("json_lines")
+    if explicit is None:
+        shape = pio.sniff_json_format(file_path)
+    else:
+        shape = "ndjson" if explicit else "array"
+
+    if shape == "ndjson":
+        return _sink_to_parquet(
+            source,
+            pio.scan_ndjson(file_path),
+            output_dir,
+            base_name,
+            chunk_rows,
+            pack_config=pack_config,
+        )
+
+    # A top-level array is streamed element by element; only the batch being
+    # written is alive at any point.
+    paths = pio.write_dict_rows(
+        _as_documents(pio.iter_json_array(file_path)),
+        output_dir,
+        base_name,
+        fetch_rows=_fetch_rows(pack_config),
+        chunk_rows=chunk_rows,
+        min_free_bytes=_min_free_bytes(pack_config),
+    )
+    return source._record_object(base_name, paths)
+
+
+def _as_documents(values: Iterable[Any]) -> Iterator[Dict[str, Any]]:
+    """Normalize JSON array elements to one record per row."""
+    for value in values:
+        if isinstance(value, dict):
+            yield value
+        else:
+            yield {"value": value}
 
 
 class FileSource(DataSource):
@@ -364,158 +579,84 @@ class FileSource(DataSource):
             f"The path {self.file_path} is neither a file nor a directory, or it can't be reached."
         )
 
-    @staticmethod
-    def _load_file(file_path, pack_config, output_dir: str) -> List[str]:
+    def _load_file(self, file_path, pack_config, output_dir: str) -> List[str]:
         skiprows = 0
-        chunk_rows = (pack_config or {}).get("chunk_rows", 100000)
+        chunk_rows = _chunk_rows(pack_config)
         if pack_config:
             skiprows = (
                 pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
             )
 
-        base_name = _build_base_name(
+        base_name = self._object_base_name(
             "file", os.path.splitext(os.path.basename(file_path))[0]
         )
+        lower = file_path.lower()
 
-        # Check if we should use Polars for big data streaming
-        use_polars = _should_use_polars(file_path, pack_config)
+        # Parquet is already the staging format: no copy, no conversion.
+        if lower.endswith((".parquet", ".pq")):
+            return self._record_object(base_name, [file_path])
 
-        # Parquet files: pass through (already optimized format)
-        if file_path.lower().endswith((".parquet", ".pq")):
-            return [file_path]
+        # Text formats stage to roughly a fifth to a half of their own size
+        # once zstd is applied; 0.6 keeps the guard on the safe side of that
+        # without refusing loads that would in fact have fit.
+        try:
+            estimate = int(os.path.getsize(file_path) * 0.6)
+        except OSError:
+            estimate = None
+        pio.check_disk_space(
+            output_dir,
+            estimate,
+            min_free_bytes=_min_free_bytes(pack_config),
+        )
 
-        # CSV: use Polars streaming for big files, pandas for smaller ones
-        if file_path.endswith(".csv"):
-            if use_polars:
-                try:
-                    return _load_csv_polars(
-                        file_path,
-                        output_dir,
-                        base_name,
-                        skip_rows=int(skiprows),
-                        chunk_rows=int(chunk_rows),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Polars CSV load failed, falling back to pandas: {e}"
-                    )
+        if lower.endswith(".csv"):
+            return _sink_to_parquet(
+                self,
+                pio.scan_csv(file_path, skip_rows=int(skiprows)),
+                output_dir,
+                base_name,
+                chunk_rows,
+                pack_config=pack_config,
+            )
 
-            # Pandas fallback (original implementation)
-            df_iter = pd.read_csv(
+        if lower.endswith((".xlsx", ".xlsm")):
+            paths = _excel_to_parquet(
                 file_path,
-                low_memory=False,
-                memory_map=True,
-                skiprows=int(skiprows),
-                on_bad_lines="warn",
-                encoding="utf-8",
-                chunksize=int(chunk_rows),
+                output_dir,
+                base_name,
+                skip_rows=int(skiprows),
+                chunk_rows=chunk_rows,
+                fetch_rows=_fetch_rows(pack_config),
+                min_free_bytes=_min_free_bytes(pack_config),
             )
-            return _write_pandas_chunks(df_iter, output_dir, base_name)
+            return self._record_object(base_name, paths)
 
-        # XLSX: use Polars if available for better memory efficiency
-        if file_path.endswith(".xlsx"):
-            if use_polars:
-                try:
-                    return _load_excel_polars(
-                        file_path,
-                        output_dir,
-                        base_name,
-                        skip_rows=int(skiprows),
-                        chunk_rows=int(chunk_rows),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Polars Excel load failed, falling back to pandas: {e}"
-                    )
-
-            # Pandas fallback with openpyxl streaming
-            try:
-                from openpyxl import load_workbook
-            except Exception:
-                # Fallback: load entire file (may be memory heavy)
-                df = pd.read_excel(
-                    file_path, engine="openpyxl", skiprows=int(skiprows)
-                )
-                path = _build_parquet_path(output_dir, base_name, 1)
-                return [_write_df_to_parquet(df, path)]
-
-            wb = load_workbook(
-                filename=file_path, read_only=True, data_only=True
+        if lower.endswith((".ndjson", ".jsonl")):
+            return _sink_to_parquet(
+                self,
+                pio.scan_ndjson(file_path),
+                output_dir,
+                base_name,
+                chunk_rows,
+                pack_config=pack_config,
             )
-            ws = wb.active
-            if ws is None:
-                # Fallback: load entire file
-                df = pd.read_excel(
-                    file_path, engine="openpyxl", skiprows=int(skiprows)
-                )
-                path = _build_parquet_path(output_dir, base_name, 1)
-                return [_write_df_to_parquet(df, path)]
 
-            rows_iter = ws.iter_rows(values_only=True)
-            # Apply skiprows on header discovery
-            for _ in range(int(skiprows)):
-                try:
-                    next(rows_iter)
-                except StopIteration:
-                    break
-            try:
-                headers = list(next(rows_iter))
-            except StopIteration:
-                headers = []
-
-            batch: List[list] = []
-            part = 1
-            paths: List[str] = []
-            for row in rows_iter:
-                batch.append(list(row))
-                if len(batch) >= int(chunk_rows):
-                    df = pd.DataFrame(batch, columns=headers)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    paths.append(path)
-                    batch = []
-                    part += 1
-            if batch:
-                df = pd.DataFrame(batch, columns=headers)
-                path = _build_parquet_path(output_dir, base_name, part)
-                _write_df_to_parquet(df, path)
-                paths.append(path)
-            return paths
-
-        # JSON files
-        if file_path.lower().endswith(".json"):
-            ndjson = (pack_config or {}).get("json_lines", False)
-            if use_polars:
-                try:
-                    return _load_json_polars(
-                        file_path,
-                        output_dir,
-                        base_name,
-                        ndjson=ndjson,
-                        chunk_rows=int(chunk_rows),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Polars JSON load failed, falling back to pandas: {e}"
-                    )
-
-            # Pandas fallback
-            if ndjson:
-                df_iter = pd.read_json(
-                    file_path, lines=True, chunksize=int(chunk_rows)
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            else:
-                df = pd.read_json(file_path)
-                path = _build_parquet_path(output_dir, base_name, 1)
-                return [_write_df_to_parquet(df, path)]
+        if lower.endswith(".json"):
+            return _json_to_parquet(
+                self,
+                file_path,
+                output_dir,
+                base_name,
+                chunk_rows=chunk_rows,
+                pack_config=pack_config,
+            )
 
         raise ValueError(
             f"Unsupported file extension or missing 'skiprows' for file: {file_path}"
         )
 
 
-class DatabaseSource(DataSource):
+class DatabaseSource(_SqlAlchemySource):
     def __init__(self, connection_string=None, config=None):
         # Keep the config available for schema preference and other options
         self.config = config or {}
@@ -591,8 +732,7 @@ class DatabaseSource(DataSource):
             schema = pack_config.get("job", {}).get("source", {}).get("schema")
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
-        dialect_name = None
+        chunk_rows = _chunk_rows(pack_config)
         try:
             dialect_name = self.engine.dialect.name
         except Exception:
@@ -611,29 +751,30 @@ class DatabaseSource(DataSource):
             for table_name in table_names:
                 all_paths.extend(
                     self._read_table_to_parquet(
+                        self.engine,
                         table_name,
                         schema,
                         output_dir,
                         chunk_rows,
                         dialect_name,
-                        pack_config,
+                        pack_config=pack_config,
                     )
                 )
             return all_paths
 
         # If a list/tuple/set of table names is provided
         if isinstance(table_or_query, (list, tuple, set)):
-            table_names = list(table_or_query)
             all_paths: List[str] = []
-            for table_name in table_names:
+            for table_name in table_or_query:
                 all_paths.extend(
                     self._read_table_to_parquet(
+                        self.engine,
                         table_name,
                         schema,
                         output_dir,
                         chunk_rows,
                         dialect_name,
-                        pack_config,
+                        pack_config=pack_config,
                     )
                 )
             return all_paths
@@ -641,120 +782,69 @@ class DatabaseSource(DataSource):
         # If a single string is provided, determine if it's a table name or SQL query
         if isinstance(table_or_query, str):
             if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name or "db", "query")
-
-                # Try Polars if available
-                use_polars = POLARS_AVAILABLE and (pack_config or {}).get(
-                    "use_polars", USE_POLARS_BY_DEFAULT
+                return _sql_to_parquet(
+                    self,
+                    self.engine,
+                    table_or_query,
+                    output_dir,
+                    self._object_base_name(dialect_name or "db", "query"),
+                    chunk_rows,
+                    pack_config=pack_config,
                 )
-                if use_polars:
-                    try:
-                        conn_str = _get_connection_string_from_engine(
-                            self.engine
-                        )
-                        if conn_str:
-                            return _load_database_polars(
-                                conn_str,
-                                table_or_query,
-                                output_dir,
-                                base_name,
-                                chunk_rows,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"Polars query execution failed, falling back to pandas: {e}"
-                        )
-
-                # Pandas fallback
-                df_iter = pd.read_sql(
-                    table_or_query, self.engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
             return self._read_table_to_parquet(
+                self.engine,
                 table_or_query,
                 schema,
                 output_dir,
                 chunk_rows,
                 dialect_name,
-                pack_config,
+                pack_config=pack_config,
             )
 
         raise TypeError(
             "table_or_query must be None, '*', a string (table name or SQL), or a list/tuple/set of table names."
         )
 
-    def _read_table(
-        self, table_name: str, schema: Optional[str] = None
-    ) -> pd.DataFrame:
-        """Read a full table as a DataFrame using dialect-aware SQL. (Compatibility only)"""
-        # Support fully-qualified names like "SCHEMA.TABLE" when no schema is explicitly provided
+    def _qualify(self, table_name, schema):
+        # A fully-qualified "SCHEMA.TABLE" is accepted when no schema was given.
         effective_schema = schema
         effective_table = table_name
         if not schema and "." in table_name:
-            try:
-                effective_schema, effective_table = table_name.split(".", 1)
-            except ValueError:
-                effective_schema = None
-                effective_table = table_name
-
-        try:
-            return pd.read_sql_table(
-                effective_table, self.engine, schema=effective_schema
-            )
-        except Exception:
-            # Fallback to a simple SELECT * if read_sql_table is unsupported for the dialect
-            qualified = (
-                f"{effective_schema}.{effective_table}"
-                if effective_schema
-                else effective_table
-            )
-            return pd.read_sql(f"SELECT * FROM {qualified}", self.engine)
-
-    def _read_table_to_parquet(
-        self,
-        table_name: str,
-        schema: Optional[str],
-        output_dir: str,
-        chunk_rows: int,
-        dialect_name: Optional[str],
-        pack_config: Optional[dict] = None,
-    ) -> List[str]:
-        effective_schema = schema
-        effective_table = table_name
-        if not schema and "." in table_name:
-            try:
-                effective_schema, effective_table = table_name.split(".", 1)
-            except ValueError:
-                effective_schema = None
-                effective_table = table_name
-
+            effective_schema, effective_table = table_name.split(".", 1)
         qualified = (
             f"{effective_schema}.{effective_table}"
             if effective_schema
             else effective_table
         )
-        base_name = _build_base_name(dialect_name or "db", qualified)
-        sql = f"SELECT * FROM {qualified}"
+        return qualified, qualified
 
-        # Try Polars if available and configured
-        use_polars = POLARS_AVAILABLE and (pack_config or {}).get(
-            "use_polars", USE_POLARS_BY_DEFAULT
+    def _read_table_to_parquet(
+        self,
+        engine,
+        table_name,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name=None,
+        pack_config=None,
+    ) -> List[str]:
+        effective_schema = schema
+        effective_table = table_name
+        if not schema and "." in table_name:
+            effective_schema, effective_table = table_name.split(".", 1)
+
+        qualified, display = self._qualify(table_name, schema)
+        return _sql_to_parquet(
+            self,
+            engine,
+            f"SELECT * FROM {qualified}",
+            output_dir,
+            self._object_base_name(dialect_name or "db", display),
+            chunk_rows,
+            table=effective_table,
+            schema=effective_schema,
+            pack_config=pack_config,
         )
-        if use_polars:
-            try:
-                conn_str = _get_connection_string_from_engine(self.engine)
-                if conn_str:
-                    return _load_database_polars(
-                        conn_str, sql, output_dir, base_name, chunk_rows
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Polars database read failed, falling back to pandas: {e}"
-                )
-
-        # Pandas fallback with chunksize streaming
-        df_iter = pd.read_sql(sql, self.engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
 
     def _get_all_table_names(self, schema: Optional[str] = None) -> List[str]:
         """Return all table names (and views) in the database for the given schema, sorted alphabetically.
@@ -879,107 +969,147 @@ class DatabaseSource(DataSource):
         # Return whatever was found initially (likely empty)
         return initial
 
-    def _is_sql_query(self, s: str) -> bool:
-        """Heuristic to detect if a string is a SQL query rather than a bare table name."""
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "pragma", "explain")
-        return any(sql.startswith(token) for token in starters)
-
-
-def _infer_format_from_path(
-    path: str, explicit_format: Optional[str] = None
-) -> str:
-    if explicit_format:
-        return explicit_format.lower()
-    lower = path.lower()
-    if lower.endswith(".csv"):
-        return "csv"
-    if lower.endswith(".json"):
-        return "json"
-    if lower.endswith(".parquet") or lower.endswith(".pq"):
-        return "parquet"
-    if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return "excel"
-    return "csv"
-
 
 def _materialize_remote_to_parquet(
+    source: DataSource,
     path: str,
     fmt: str,
     storage_options: Optional[dict],
     pack_config: Optional[dict],
 ) -> List[str]:
-    # If already parquet, pass-through by returning the remote path
-    if fmt == "parquet":
-        return [path]
+    """Stage a remote object to local parquet parts.
 
+    Remote Parquet is passed through untouched — the one zero-copy path in the
+    layer — but only when no credentials are needed: ``get_data`` returns bare
+    paths, so credentials handed to this function could not travel with them and
+    the pack would scan the bucket anonymously. With credentials, the object is
+    staged locally instead of silently failing later.
+    """
     output_dir = _ensure_output_dir(pack_config)
-    chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+    chunk_rows = _chunk_rows(pack_config)
+    min_free = _min_free_bytes(pack_config)
     skiprows = 0
     if pack_config:
         skiprows = (
             pack_config.get("job", {}).get("source", {}).get("skiprows", 0)
         )
 
-    base_name = _build_base_name(
+    base_name = source._object_base_name(
         "remote", os.path.splitext(os.path.basename(path))[0]
     )
 
+    if fmt == "parquet" and not storage_options:
+        return source._record_object(base_name, [path])
+
+    # Polars scans s3/gs/abfs/http in place; anything else (HDFS above all) has
+    # to come through fsspec, which streams it to a local file first.
+    native = _is_native_remote(path) or os.path.exists(path)
+
+    if fmt == "parquet":
+        return _sink_to_parquet(
+            source,
+            pio.scan_parquet(path, storage_options=storage_options),
+            output_dir,
+            base_name,
+            chunk_rows,
+            pack_config=pack_config,
+        )
+
     if fmt == "csv":
-        df_iter = pd.read_csv(
-            path,
-            storage_options=storage_options,
-            low_memory=False,
-            memory_map=True,
-            skiprows=int(skiprows),
-            on_bad_lines="warn",
-            encoding="utf-8",
-            chunksize=chunk_rows,
-        )
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-    if fmt == "json":
-        # Attempt newline-delimited JSON if hinted
-        lines = bool((pack_config or {}).get("json_lines", False))
-        if lines:
-            df_iter = pd.read_json(
+        if native:
+            lf = pio.scan_csv(
                 path,
+                skip_rows=int(skiprows),
                 storage_options=storage_options,
-                lines=True,
-                chunksize=chunk_rows,
             )
-            return _write_pandas_chunks(df_iter, output_dir, base_name)
-        # Fallback: load once, write once (may be memory heavy)
-        df = pd.read_json(path, storage_options=storage_options)
-        return [
-            _write_df_to_parquet(
-                df, _build_parquet_path(output_dir, base_name, 1)
+        else:
+            lf = pio.scan_csv(
+                _stage_remote_file(path, storage_options),
+                skip_rows=int(skiprows),
             )
-        ]
-    if fmt == "excel":
-        # Excel streaming from remote is complex; fallback to single load
-        df = pd.read_excel(
-            path,
-            storage_options=storage_options,
-            engine="openpyxl",
-            skiprows=int(skiprows),
+        return _sink_to_parquet(
+            source,
+            lf,
+            output_dir,
+            base_name,
+            chunk_rows,
+            pack_config=pack_config,
         )
-        return [
-            _write_df_to_parquet(
-                df, _build_parquet_path(output_dir, base_name, 1)
-            )
-        ]
-    # Fallback to CSV behavior
-    df_iter = pd.read_csv(
-        path, storage_options=storage_options, chunksize=chunk_rows
-    )
-    return _write_pandas_chunks(df_iter, output_dir, base_name)
+
+    if fmt == "json":
+        # The shape can only be sniffed on a seekable file, and openpyxl-style
+        # local access is needed for the array case anyway.
+        local_path = (
+            path
+            if os.path.exists(path)
+            else _stage_remote_file(path, storage_options)
+        )
+        return _json_to_parquet(
+            source,
+            local_path,
+            output_dir,
+            base_name,
+            chunk_rows=chunk_rows,
+            pack_config=pack_config,
+        )
+
+    if fmt == "excel":
+        local_path = (
+            path
+            if os.path.exists(path)
+            else _stage_remote_file(path, storage_options)
+        )
+        paths = _excel_to_parquet(
+            local_path,
+            output_dir,
+            base_name,
+            skip_rows=int(skiprows),
+            chunk_rows=chunk_rows,
+            fetch_rows=_fetch_rows(pack_config),
+            min_free_bytes=min_free,
+        )
+        return source._record_object(base_name, paths)
+
+    raise ValueError(f"Unsupported remote format {fmt!r} for {path}")
+
+
+def _first_of(config: dict, *keys: str) -> Any:
+    for key in keys:
+        if config.get(key) not in (None, ""):
+            return config[key]
+    return None
 
 
 class S3Source(DataSource):
     def __init__(self, config):
         self.config = config or {}
+
+    def _storage_options(self) -> Optional[dict]:
+        """Credentials in the naming Polars' object store expects.
+
+        The previous implementation built fsspec-style options and then dropped
+        them entirely on the Parquet path, so private buckets failed on the one
+        path that was supposed to be free.
+        """
+        config = self.config
+        client_kwargs = config.get("client_kwargs") or {}
+        options = {
+            "aws_access_key_id": _first_of(
+                config, "key", "access_key", "aws_access_key_id"
+            ),
+            "aws_secret_access_key": _first_of(
+                config, "secret", "secret_key", "aws_secret_access_key"
+            ),
+            "aws_session_token": _first_of(
+                config, "token", "aws_session_token"
+            ),
+            "aws_region": _first_of(config, "region", "region_name")
+            or client_kwargs.get("region_name"),
+            "aws_endpoint_url": config.get("endpoint_url")
+            or client_kwargs.get("endpoint_url"),
+        }
+        options = {k: v for k, v in options.items() if v}
+        return options or None
 
     def get_data(self, table_or_query=None, pack_config=None):
         # Expect either a full s3 path in config['path'] or bucket/key
@@ -994,25 +1124,27 @@ class S3Source(DataSource):
                 "S3Source requires either 'path' or 'bucket'+'key' in config."
             )
 
-        storage_options = {}
-        for opt_key in [
-            "key",  # aws_access_key_id
-            "secret",  # aws_secret_access_key
-            "token",  # aws_session_token
-            "client_kwargs",  # e.g., {"region_name": "us-east-1"}
-        ]:
-            if opt_key in self.config:
-                storage_options[opt_key] = self.config[opt_key]
-
         fmt = _infer_format_from_path(path, self.config.get("format"))
         return _materialize_remote_to_parquet(
-            path, fmt, storage_options or None, pack_config
+            self, path, fmt, self._storage_options(), pack_config
         )
 
 
 class GCSSource(DataSource):
     def __init__(self, config):
         self.config = config or {}
+
+    def _storage_options(self) -> Optional[dict]:
+        config = self.config
+        options: Dict[str, Any] = {}
+        token = config.get("token")
+        if isinstance(token, dict):
+            options["google_service_account_key"] = json.dumps(token)
+        elif isinstance(token, str):
+            options["google_service_account"] = token
+        if config.get("service_account_path"):
+            options["google_service_account"] = config["service_account_path"]
+        return options or None
 
     def get_data(self, table_or_query=None, pack_config=None):
         # Expect gs:// style path or bucket/object
@@ -1027,23 +1159,28 @@ class GCSSource(DataSource):
                 "GCSSource requires either 'path' or 'bucket'+'blob' in config."
             )
 
-        storage_options = {}
-        for opt_key in [
-            "token",  # path to service account json or dict credentials
-            "project",
-        ]:
-            if opt_key in self.config:
-                storage_options[opt_key] = self.config[opt_key]
-
         fmt = _infer_format_from_path(path, self.config.get("format"))
         return _materialize_remote_to_parquet(
-            path, fmt, storage_options or None, pack_config
+            self, path, fmt, self._storage_options(), pack_config
         )
 
 
 class AzureBlobSource(DataSource):
     def __init__(self, config):
         self.config = config or {}
+
+    def _storage_options(self) -> Optional[dict]:
+        config = self.config
+        options = {
+            "azure_storage_account_name": config.get("account_name"),
+            "azure_storage_account_key": config.get("account_key"),
+            "azure_storage_sas_key": config.get("sas_token"),
+            "azure_tenant_id": config.get("tenant_id"),
+            "azure_client_id": config.get("client_id"),
+            "azure_client_secret": config.get("client_secret"),
+        }
+        options = {k: v for k, v in options.items() if v}
+        return options or None
 
     def get_data(self, table_or_query=None, pack_config=None):
         # Accept full abfs(s):// path or account/container/blob components
@@ -1059,28 +1196,25 @@ class AzureBlobSource(DataSource):
                 "AzureBlobSource requires either 'path' or 'account_name'+'container'+'blob'."
             )
 
-        storage_options = {}
-        # adlfs uses Azure credentials via storage_options
-        for opt_key in [
-            "account_name",
-            "account_key",
-            "sas_token",
-            "tenant_id",
-            "client_id",
-            "client_secret",
-        ]:
-            if opt_key in self.config:
-                storage_options[opt_key] = self.config[opt_key]
-
         fmt = _infer_format_from_path(path, self.config.get("format"))
         return _materialize_remote_to_parquet(
-            path, fmt, storage_options or None, pack_config
+            self, path, fmt, self._storage_options(), pack_config
         )
 
 
 class HDFSSource(DataSource):
     def __init__(self, config):
         self.config = config or {}
+
+    def _storage_options(self) -> Optional[dict]:
+        # HDFS is not spoken by Polars' object store, so these stay in fsspec
+        # naming: the file is staged locally through fsspec first.
+        options = {
+            key: self.config[key]
+            for key in ("host", "port", "user", "kerb_kwargs")
+            if key in self.config
+        }
+        return options or None
 
     def get_data(self, table_or_query=None, pack_config=None):
         # Expect hdfs://host:port/path
@@ -1096,19 +1230,16 @@ class HDFSSource(DataSource):
                 "HDFSSource requires 'path' or 'host'+'hdfs_path' in config."
             )
 
-        storage_options = {}
-        for opt_key in [
-            "host",
-            "port",
-            "user",
-            "kerb_kwargs",  # kerberos parameters if applicable
-        ]:
-            if opt_key in self.config:
-                storage_options[opt_key] = self.config[opt_key]
-
         fmt = _infer_format_from_path(path, self.config.get("format"))
+        if fmt == "parquet":
+            # No pass-through: a pack scanning hdfs:// directly has no way to
+            # authenticate, so the object is staged locally instead.
+            local_path = _stage_remote_file(path, self._storage_options())
+            return _materialize_remote_to_parquet(
+                self, local_path, fmt, None, pack_config
+            )
         return _materialize_remote_to_parquet(
-            path, fmt, storage_options or None, pack_config
+            self, path, fmt, self._storage_options(), pack_config
         )
 
 
@@ -1142,7 +1273,7 @@ class MongoDBSource(DataSource):
             )
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         # Build connection
         connection_string = self.config.get("connection_string")
@@ -1187,42 +1318,37 @@ class MongoDBSource(DataSource):
             )
 
         all_paths: List[str] = []
-        for collection_name in collections:
-            collection = db[collection_name]
-            base_name = _build_base_name("mongodb", collection_name)
-
-            # Stream documents in batches
-            cursor = collection.find()
-            batch: List[dict] = []
-            part = 1
-
-            for doc in cursor:
-                # Convert ObjectId to string for serialization
-                if "_id" in doc:
-                    doc["_id"] = str(doc["_id"])
-                batch.append(doc)
-
-                if len(batch) >= chunk_rows:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                    batch = []
-                    part += 1
-
-            # Write remaining documents
-            if batch:
-                df = pd.DataFrame(batch)
-                path = _build_parquet_path(output_dir, base_name, part)
-                _write_df_to_parquet(df, path)
-                all_paths.append(path)
-
-        client.close()
+        try:
+            for collection_name in collections:
+                collection = db[collection_name]
+                base_name = self._object_base_name("mongodb", collection_name)
+                cursor = collection.find(batch_size=chunk_rows)
+                paths = pio.write_dict_rows(
+                    _mongo_documents(cursor),
+                    output_dir,
+                    base_name,
+                    fetch_rows=_fetch_rows(pack_config),
+                    chunk_rows=chunk_rows,
+                    min_free_bytes=_min_free_bytes(pack_config),
+                )
+                all_paths.extend(self._record_object(base_name, paths))
+        finally:
+            client.close()
         return all_paths
 
 
-class SnowflakeSource(DataSource):
+def _mongo_documents(cursor) -> Iterator[Dict[str, Any]]:
+    """Yield documents with an ObjectId that Arrow can represent."""
+    for document in cursor:
+        if "_id" in document:
+            document["_id"] = str(document["_id"])
+        yield document
+
+
+class SnowflakeSource(_SqlAlchemySource):
     """Snowflake data warehouse source using snowflake-sqlalchemy."""
+
+    dialect_name = "snowflake"
 
     def __init__(self, config):
         self.config = config or {}
@@ -1231,13 +1357,8 @@ class SnowflakeSource(DataSource):
         """
         Load data from Snowflake and write Parquet chunks.
         """
-        try:
-            from sqlalchemy import create_engine
-        except ImportError:
-            raise ImportError("sqlalchemy is required for SnowflakeSource.")
-
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         # Build connection string
         connection_string = self.config.get("connection_string")
@@ -1281,107 +1402,34 @@ class SnowflakeSource(DataSource):
         schema = self.config.get("schema", "PUBLIC")
 
         return self._load_data(
-            engine, table_or_query, schema, output_dir, chunk_rows, "snowflake"
+            engine,
+            table_or_query,
+            schema,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
 
-    def _load_data(
-        self,
-        engine,
-        table_or_query,
-        schema,
-        output_dir,
-        chunk_rows,
-        dialect_name,
-    ):
-        """Common data loading logic for SQL-based sources."""
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            table_names = inspector.get_table_names(schema=schema)
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
 
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine,
-                table_or_query,
-                schema,
-                output_dir,
-                chunk_rows,
-                dialect_name,
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
-        )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
-    ):
-        qualified = f"{schema}.{table_name}" if schema else table_name
-        base_name = _build_base_name(dialect_name, qualified)
-        sql = f"SELECT * FROM {qualified}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "pragma", "explain")
-        return any(sql.startswith(token) for token in starters)
-
-
-class BigQuerySource(DataSource):
+class BigQuerySource(_SqlAlchemySource):
     """Google BigQuery data source using sqlalchemy-bigquery."""
+
+    dialect_name = "bigquery"
 
     def __init__(self, config):
         self.config = config or {}
+
+    def _qualify(self, table_name, schema):
+        qualified = f"{schema}.{table_name}" if schema else table_name
+        return f"`{qualified}`", qualified
 
     def get_data(self, table_or_query=None, pack_config=None):
         """
         Load data from BigQuery and write Parquet chunks.
         """
-        try:
-            from sqlalchemy import create_engine
-        except ImportError:
-            raise ImportError("sqlalchemy is required for BigQuerySource.")
-
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         # Build connection string
         connection_string = self.config.get("connection_string")
@@ -1408,64 +1456,15 @@ class BigQuerySource(DataSource):
         engine = create_engine(connection_string)
         dataset = self.config.get("dataset")
 
-        # Use similar pattern to SnowflakeSource
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            try:
-                table_names = inspector.get_table_names(schema=dataset)
-            except Exception:
-                table_names = []
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine, table_name, dataset, output_dir, chunk_rows
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine, table_name, dataset, output_dir, chunk_rows
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name("bigquery", "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine, table_or_query, dataset, output_dir, chunk_rows
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
+        return self._load_data(
+            engine,
+            table_or_query,
+            dataset,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, dataset, output_dir, chunk_rows
-    ):
-        qualified = f"{dataset}.{table_name}" if dataset else table_name
-        base_name = _build_base_name("bigquery", qualified)
-        sql = f"SELECT * FROM `{qualified}`"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
 
 
 class DatabricksSource(DataSource):
@@ -1486,7 +1485,7 @@ class DatabricksSource(DataSource):
             )
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         server_hostname = self.config.get(
             "server_hostname"
@@ -1510,87 +1509,100 @@ class DatabricksSource(DataSource):
         )
 
         cursor = connection.cursor()
-
-        # Set catalog and schema if provided
-        if catalog:
-            cursor.execute(f"USE CATALOG {catalog}")
-        if schema:
-            cursor.execute(f"USE SCHEMA {schema}")
-
-        # Determine tables to process
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            cursor.execute("SHOW TABLES")
-            tables = [
-                row[1] for row in cursor.fetchall()
-            ]  # table name is typically second column
-        elif isinstance(table_or_query, (list, tuple, set)):
-            tables = list(table_or_query)
-        elif isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                # Execute query directly
-                base_name = _build_base_name("databricks", "query")
-                cursor.execute(table_or_query)
-                columns = [desc[0] for desc in cursor.description]
-                all_paths: List[str] = []
-                batch = []
-                part = 1
-                for row in cursor:
-                    batch.append(dict(zip(columns, row)))
-                    if len(batch) >= chunk_rows:
-                        df = pd.DataFrame(batch)
-                        path = _build_parquet_path(output_dir, base_name, part)
-                        _write_df_to_parquet(df, path)
-                        all_paths.append(path)
-                        batch = []
-                        part += 1
-                if batch:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                cursor.close()
-                connection.close()
-                return all_paths
-            tables = [table_or_query]
-        else:
-            raise TypeError(
-                "table_or_query must be None, '*', a string, or a list of table names."
-            )
-
         all_paths: List[str] = []
-        for table_name in tables:
-            base_name = _build_base_name("databricks", table_name)
-            cursor.execute(f"SELECT * FROM {table_name}")
-            columns = [desc[0] for desc in cursor.description]
-            batch = []
-            part = 1
-            for row in cursor:
-                batch.append(dict(zip(columns, row)))
-                if len(batch) >= chunk_rows:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                    batch = []
-                    part += 1
-            if batch:
-                df = pd.DataFrame(batch)
-                path = _build_parquet_path(output_dir, base_name, part)
-                _write_df_to_parquet(df, path)
-                all_paths.append(path)
+        try:
+            # Set catalog and schema if provided
+            if catalog:
+                cursor.execute(f"USE CATALOG {catalog}")
+            if schema:
+                cursor.execute(f"USE SCHEMA {schema}")
 
-        cursor.close()
-        connection.close()
+            # Determine tables to process
+            if table_or_query is None or (
+                isinstance(table_or_query, str)
+                and table_or_query.strip() == "*"
+            ):
+                cursor.execute("SHOW TABLES")
+                tables = [
+                    row[1] for row in cursor.fetchall()
+                ]  # table name is typically second column
+            elif isinstance(table_or_query, (list, tuple, set)):
+                tables = list(table_or_query)
+            elif isinstance(table_or_query, str):
+                if _is_sql_query(table_or_query):
+                    base_name = self._object_base_name("databricks", "query")
+                    cursor.execute(table_or_query)
+                    return self._record_object(
+                        base_name,
+                        self._drain(
+                            cursor,
+                            output_dir,
+                            base_name,
+                            chunk_rows,
+                            pack_config,
+                        ),
+                    )
+                tables = [table_or_query]
+            else:
+                raise TypeError(
+                    "table_or_query must be None, '*', a string, or a list of table names."
+                )
+
+            for table_name in tables:
+                base_name = self._object_base_name("databricks", table_name)
+                cursor.execute(f"SELECT * FROM {table_name}")
+                all_paths.extend(
+                    self._record_object(
+                        base_name,
+                        self._drain(
+                            cursor,
+                            output_dir,
+                            base_name,
+                            chunk_rows,
+                            pack_config,
+                        ),
+                    )
+                )
+        finally:
+            cursor.close()
+            connection.close()
         return all_paths
 
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
+    def _drain(
+        self, cursor, output_dir, base_name, chunk_rows, pack_config
+    ) -> List[str]:
+        """Write a cursor's result set, using its Arrow API when it has one.
+
+        databricks-sql-connector fetches Arrow off the wire; going through
+        ``fetchmany_arrow`` skips the conversion to Python objects entirely.
+        """
+        min_free = _min_free_bytes(pack_config)
+        if hasattr(cursor, "fetchmany_arrow"):
+            return pio.write_arrow_batches(
+                _iter_arrow(cursor, chunk_rows),
+                output_dir,
+                base_name,
+                chunk_rows=chunk_rows,
+                min_free_bytes=min_free,
+            )
+        columns = [description[0] for description in cursor.description]
+        return pio.write_row_batches(
+            cursor,
+            columns,
+            output_dir,
+            base_name,
+            fetch_rows=_fetch_rows(pack_config),
+            chunk_rows=chunk_rows,
+            min_free_bytes=min_free,
+        )
+
+
+def _iter_arrow(cursor, chunk_rows: int) -> Iterator[Any]:
+    while True:
+        table = cursor.fetchmany_arrow(chunk_rows)
+        if table is None or table.num_rows == 0:
+            return
+        yield table
 
 
 class RedshiftSource(DataSource):
@@ -1603,9 +1615,6 @@ class RedshiftSource(DataSource):
         """
         Load data from Redshift and write Parquet chunks.
         """
-        output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
-
         # Build connection string - Redshift is PostgreSQL-compatible
         connection_string = self.config.get("connection_string")
         if not connection_string:
@@ -1645,30 +1654,46 @@ class RedshiftSource(DataSource):
                 )
             connection_string = url
 
-        engine = create_engine(connection_string)
-        schema = self.config.get("schema", "public")
-
-        # Use DatabaseSource pattern
+        # The URL object is passed as-is: str(URL) masks the password as
+        # "user:***@host", so stringifying it here produced an engine that
+        # could not authenticate.
         db_source = DatabaseSource(
-            connection_string=str(connection_string), config=self.config
+            connection_string=connection_string, config=self.config
         )
-        return db_source.get_data(
+        paths = db_source.get_data(
             table_or_query=table_or_query, pack_config=pack_config
         )
+        self._object_paths = db_source.object_paths
+        return paths
 
 
-class ClickHouseSource(DataSource):
+class ClickHouseSource(_SqlAlchemySource):
     """ClickHouse data source using clickhouse-sqlalchemy."""
+
+    dialect_name = "clickhouse"
 
     def __init__(self, config):
         self.config = config or {}
+
+    def _qualify(self, table_name, schema):
+        # ClickHouse databases are selected by the connection, not qualified.
+        return table_name, table_name
+
+    def _list_tables(self, engine, schema):
+        tables = super()._list_tables(engine, None)
+        if tables:
+            return tables
+        database = self.config.get("database", "default")
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SHOW TABLES FROM {database}"))
+            return [row[0] for row in result]
 
     def get_data(self, table_or_query=None, pack_config=None):
         """
         Load data from ClickHouse and write Parquet chunks.
         """
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         # Build connection string
         connection_string = self.config.get("connection_string")
@@ -1696,68 +1721,16 @@ class ClickHouseSource(DataSource):
             connection_string = url
 
         engine = create_engine(connection_string)
-        database = self.config.get("database", "default")
 
-        # Get tables
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            try:
-                table_names = inspector.get_table_names()
-            except Exception:
-                # Fallback: query system tables
-                with engine.connect() as conn:
-                    result = conn.execute(text(f"SHOW TABLES FROM {database}"))
-                    table_names = [row[0] for row in result]
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine, table_name, output_dir, chunk_rows
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine, table_name, output_dir, chunk_rows
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name("clickhouse", "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine, table_or_query, output_dir, chunk_rows
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
+        return self._load_data(
+            engine,
+            table_or_query,
+            None,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, output_dir, chunk_rows
-    ):
-        base_name = _build_base_name("clickhouse", table_name)
-        sql = f"SELECT * FROM {table_name}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
 
 
 class DuckDBSource(DataSource):
@@ -1775,7 +1748,7 @@ class DuckDBSource(DataSource):
         Load data from DuckDB and write Parquet files using streaming export.
 
         IMPORTANT: Uses DuckDB's native COPY TO for memory-efficient export.
-        Does NOT load data into pandas DataFrame for large datasets.
+        Does NOT load data into a DataFrame for large datasets.
         """
         try:
             import duckdb
@@ -1785,7 +1758,7 @@ class DuckDBSource(DataSource):
             )
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         # Connect to DuckDB
         db_path = self.config.get("path") or self.config.get(
@@ -1806,46 +1779,61 @@ class DuckDBSource(DataSource):
 
         schema = self.config.get("schema", "main")
 
-        # Get tables
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            result = conn.execute(
-                f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
-            )
-            table_names = [row[0] for row in result.fetchall()]
-        elif isinstance(table_or_query, (list, tuple, set)):
-            table_names = list(table_or_query)
-        elif isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name("duckdb", "query")
-                paths = self._export_query_to_parquet(
-                    conn, table_or_query, output_dir, base_name, chunk_rows
+        try:
+            # Get tables
+            if table_or_query is None or (
+                isinstance(table_or_query, str)
+                and table_or_query.strip() == "*"
+            ):
+                result = conn.execute(
+                    f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
                 )
-                conn.close()
-                return paths
-            table_names = [table_or_query]
-        else:
-            raise TypeError(
-                "table_or_query must be None, '*', a string, or a list of table names."
-            )
+                table_names = [row[0] for row in result.fetchall()]
+            elif isinstance(table_or_query, (list, tuple, set)):
+                table_names = list(table_or_query)
+            elif isinstance(table_or_query, str):
+                if _is_sql_query(table_or_query):
+                    base_name = self._object_base_name("duckdb", "query")
+                    return self._record_object(
+                        base_name,
+                        self._export_query_to_parquet(
+                            conn,
+                            table_or_query,
+                            output_dir,
+                            base_name,
+                            chunk_rows,
+                            pack_config,
+                        ),
+                    )
+                table_names = [table_or_query]
+            else:
+                raise TypeError(
+                    "table_or_query must be None, '*', a string, or a list of table names."
+                )
 
-        all_paths: List[str] = []
-        for table_name in table_names:
-            base_name = _build_base_name("duckdb", table_name)
-            qualified = (
-                f"{schema}.{table_name}" if schema != "main" else table_name
-            )
-            paths = self._export_query_to_parquet(
-                conn,
-                f"SELECT * FROM {qualified}",
-                output_dir,
-                base_name,
-                chunk_rows,
-            )
-            all_paths.extend(paths)
-
-        conn.close()
+            all_paths: List[str] = []
+            for table_name in table_names:
+                base_name = self._object_base_name("duckdb", table_name)
+                qualified = (
+                    f"{schema}.{table_name}"
+                    if schema != "main"
+                    else table_name
+                )
+                all_paths.extend(
+                    self._record_object(
+                        base_name,
+                        self._export_query_to_parquet(
+                            conn,
+                            f"SELECT * FROM {qualified}",
+                            output_dir,
+                            base_name,
+                            chunk_rows,
+                            pack_config,
+                        ),
+                    )
+                )
+        finally:
+            conn.close()
         return all_paths
 
     def _export_query_to_parquet(
@@ -1855,6 +1843,7 @@ class DuckDBSource(DataSource):
         output_dir: str,
         base_name: str,
         chunk_rows: int,
+        pack_config: Optional[dict] = None,
     ) -> List[str]:
         """
         Export query results directly to parquet using DuckDB's COPY TO.
@@ -1862,11 +1851,14 @@ class DuckDBSource(DataSource):
         This is memory-efficient as DuckDB streams data directly to parquet
         without loading into memory first.
         """
+        pio.check_disk_space(
+            output_dir, min_free_bytes=_min_free_bytes(pack_config)
+        )
         output_path = _build_parquet_path(output_dir, base_name, 1)
 
         try:
-            # Use DuckDB's native COPY TO for streaming export (memory efficient)
-            # This exports directly from DuckDB to parquet without loading into pandas
+            # DuckDB streams its own result set to Parquet; nothing crosses into
+            # Python at all on this path.
             copy_sql = f"""
                 COPY ({query}) TO '{output_path}'
                 (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {chunk_rows})
@@ -1879,9 +1871,8 @@ class DuckDBSource(DataSource):
             logger.warning(
                 f"DuckDB COPY TO failed ({e}), falling back to chunked export"
             )
-            # Fallback: use fetch_arrow_table for more efficient memory usage than df()
             return self._export_query_chunked(
-                conn, query, output_dir, base_name, chunk_rows
+                conn, query, output_dir, base_name, chunk_rows, pack_config
             )
 
     def _export_query_chunked(
@@ -1891,69 +1882,26 @@ class DuckDBSource(DataSource):
         output_dir: str,
         base_name: str,
         chunk_rows: int,
+        pack_config: Optional[dict] = None,
     ) -> List[str]:
+        """Fallback: pull the result as an Arrow record batch stream.
+
+        ``fetch_record_batch`` yields batches as DuckDB produces them;
+        ``fetch_arrow_table`` (what this used to call) materializes the entire
+        result first, which defeats the purpose of the fallback.
         """
-        Fallback: Export query results in chunks using Arrow for better memory efficiency.
-        """
-        all_paths: List[str] = []
-
-        try:
-            # Use Arrow tables instead of pandas for better memory efficiency
-            result = conn.execute(query)
-            arrow_table = result.fetch_arrow_table()
-
-            # Write directly from Arrow to parquet (no pandas intermediate)
-            import pyarrow.parquet as pq
-
-            total_rows = arrow_table.num_rows
-            if total_rows == 0:
-                output_path = _build_parquet_path(output_dir, base_name, 1)
-                pq.write_table(arrow_table, output_path, compression="zstd")
-                return [output_path]
-
-            # Split into chunks
-            part = 1
-            for i in range(0, total_rows, chunk_rows):
-                chunk = arrow_table.slice(i, min(chunk_rows, total_rows - i))
-                output_path = _build_parquet_path(output_dir, base_name, part)
-                pq.write_table(
-                    chunk,
-                    output_path,
-                    compression="zstd",
-                    row_group_size=chunk_rows,
-                )
-                all_paths.append(output_path)
-                part += 1
-
-            return all_paths
-
-        except Exception as e:
-            logger.warning(f"Arrow export failed ({e}), using pandas fallback")
-            # Final fallback: pandas (not recommended for big data)
-            result = conn.execute(query)
-            df = result.df()
-
-            if len(df) == 0:
-                output_path = _build_parquet_path(output_dir, base_name, 1)
-                _write_df_to_parquet(df, output_path)
-                return [output_path]
-
-            for i in range(0, len(df), chunk_rows):
-                chunk_df = df.iloc[i : i + chunk_rows]
-                output_path = _build_parquet_path(
-                    output_dir, base_name, (i // chunk_rows) + 1
-                )
-                _write_df_to_parquet(chunk_df, output_path)
-                all_paths.append(output_path)
-
-            return all_paths
+        result = conn.execute(query)
+        reader = result.fetch_record_batch(chunk_rows)
+        return pio.write_arrow_batches(
+            reader,
+            output_dir,
+            base_name,
+            chunk_rows=chunk_rows,
+            min_free_bytes=_min_free_bytes(pack_config),
+        )
 
     def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain", "pragma")
-        return any(sql.startswith(token) for token in starters)
+        return _is_sql_query(s)
 
 
 class TrinoSource(DataSource):
@@ -1974,7 +1922,7 @@ class TrinoSource(DataSource):
             )
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         host = self.config.get("host", "localhost")
         port = int(self.config.get("port", 8080))
@@ -1992,82 +1940,85 @@ class TrinoSource(DataSource):
             http_scheme=http_scheme,
         )
         cursor = conn.cursor()
-
-        # Get tables
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            cursor.execute("SHOW TABLES")
-            table_names = [row[0] for row in cursor.fetchall()]
-        elif isinstance(table_or_query, (list, tuple, set)):
-            table_names = list(table_or_query)
-        elif isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name("trino", "query")
-                cursor.execute(table_or_query)
-                columns = [desc[0] for desc in cursor.description]
-                all_paths: List[str] = []
-                batch = []
-                part = 1
-                for row in cursor:
-                    batch.append(dict(zip(columns, row)))
-                    if len(batch) >= chunk_rows:
-                        df = pd.DataFrame(batch)
-                        path = _build_parquet_path(output_dir, base_name, part)
-                        _write_df_to_parquet(df, path)
-                        all_paths.append(path)
-                        batch = []
-                        part += 1
-                if batch:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                cursor.close()
-                conn.close()
-                return all_paths
-            table_names = [table_or_query]
-        else:
-            raise TypeError(
-                "table_or_query must be None, '*', a string, or a list of table names."
-            )
-
         all_paths: List[str] = []
-        for table_name in table_names:
-            base_name = _build_base_name("trino", table_name)
-            cursor.execute(f"SELECT * FROM {table_name}")
-            columns = [desc[0] for desc in cursor.description]
-            batch = []
-            part = 1
-            for row in cursor:
-                batch.append(dict(zip(columns, row)))
-                if len(batch) >= chunk_rows:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                    batch = []
-                    part += 1
-            if batch:
-                df = pd.DataFrame(batch)
-                path = _build_parquet_path(output_dir, base_name, part)
-                _write_df_to_parquet(df, path)
-                all_paths.append(path)
+        try:
+            # Get tables
+            if table_or_query is None or (
+                isinstance(table_or_query, str)
+                and table_or_query.strip() == "*"
+            ):
+                cursor.execute("SHOW TABLES")
+                table_names = [row[0] for row in cursor.fetchall()]
+            elif isinstance(table_or_query, (list, tuple, set)):
+                table_names = list(table_or_query)
+            elif isinstance(table_or_query, str):
+                if _is_sql_query(table_or_query):
+                    base_name = self._object_base_name("trino", "query")
+                    cursor.execute(table_or_query)
+                    return self._record_object(
+                        base_name,
+                        _drain_cursor(
+                            cursor,
+                            output_dir,
+                            base_name,
+                            chunk_rows,
+                            pack_config,
+                        ),
+                    )
+                table_names = [table_or_query]
+            else:
+                raise TypeError(
+                    "table_or_query must be None, '*', a string, or a list of table names."
+                )
 
-        cursor.close()
-        conn.close()
+            for table_name in table_names:
+                base_name = self._object_base_name("trino", table_name)
+                cursor.execute(f"SELECT * FROM {table_name}")
+                all_paths.extend(
+                    self._record_object(
+                        base_name,
+                        _drain_cursor(
+                            cursor,
+                            output_dir,
+                            base_name,
+                            chunk_rows,
+                            pack_config,
+                        ),
+                    )
+                )
+        finally:
+            cursor.close()
+            conn.close()
         return all_paths
 
     def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
+        return _is_sql_query(s)
 
 
-class TeradataSource(DataSource):
+def _drain_cursor(
+    cursor,
+    output_dir: str,
+    base_name: str,
+    chunk_rows: int,
+    pack_config: Optional[dict],
+) -> List[str]:
+    """Write an executed DB-API cursor to parquet parts, column-major."""
+    columns = [description[0] for description in cursor.description]
+    return pio.write_row_batches(
+        cursor,
+        columns,
+        output_dir,
+        base_name,
+        chunk_rows=chunk_rows,
+        fetch_rows=_fetch_rows(pack_config),
+        min_free_bytes=_min_free_bytes(pack_config),
+    )
+
+
+class TeradataSource(_SqlAlchemySource):
     """Teradata data source using teradatasqlalchemy."""
+
+    dialect_name = "teradata"
 
     def __init__(self, config):
         self.config = config or {}
@@ -2075,7 +2026,7 @@ class TeradataSource(DataSource):
     def get_data(self, table_or_query=None, pack_config=None):
         """Load data from Teradata and write Parquet chunks."""
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         connection_string = self.config.get("connection_string")
         if not connection_string:
@@ -2103,99 +2054,33 @@ class TeradataSource(DataSource):
         schema = self.config.get("schema")
 
         return self._load_data(
-            engine, table_or_query, schema, output_dir, chunk_rows, "teradata"
+            engine,
+            table_or_query,
+            schema,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
 
-    def _load_data(
-        self,
-        engine,
-        table_or_query,
-        schema,
-        output_dir,
-        chunk_rows,
-        dialect_name,
-    ):
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            table_names = inspector.get_table_names(schema=schema)
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
 
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine,
-                table_or_query,
-                schema,
-                output_dir,
-                chunk_rows,
-                dialect_name,
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
-        )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
-    ):
-        qualified = f"{schema}.{table_name}" if schema else table_name
-        base_name = _build_base_name(dialect_name, qualified)
-        sql = f"SELECT * FROM {qualified}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
-
-
-class SapHanaSource(DataSource):
+class SapHanaSource(_SqlAlchemySource):
     """SAP HANA data source using hdbcli/sqlalchemy-hana."""
+
+    dialect_name = "sap_hana"
 
     def __init__(self, config):
         self.config = config or {}
 
+    def _qualify(self, table_name, schema):
+        if schema:
+            return f'"{schema}"."{table_name}"', f"{schema}.{table_name}"
+        return f'"{table_name}"', table_name
+
     def get_data(self, table_or_query=None, pack_config=None):
         """Load data from SAP HANA and write Parquet chunks."""
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         connection_string = self.config.get("connection_string")
         if not connection_string:
@@ -2203,7 +2088,6 @@ class SapHanaSource(DataSource):
             port = self.config.get("port", 30015)
             user = self.config.get("user") or self.config.get("username")
             password = self.config.get("password")
-            database = self.config.get("database")
 
             if not all([host, user, password]):
                 raise ValueError(
@@ -2224,91 +2108,14 @@ class SapHanaSource(DataSource):
         schema = self.config.get("schema")
 
         return self._load_data(
-            engine, table_or_query, schema, output_dir, chunk_rows, "sap_hana"
+            engine,
+            table_or_query,
+            schema,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
-
-    def _load_data(
-        self,
-        engine,
-        table_or_query,
-        schema,
-        output_dir,
-        chunk_rows,
-        dialect_name,
-    ):
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            table_names = inspector.get_table_names(schema=schema)
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine,
-                table_or_query,
-                schema,
-                output_dir,
-                chunk_rows,
-                dialect_name,
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
-        )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
-    ):
-        qualified = (
-            f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
-        )
-        base_name = _build_base_name(
-            dialect_name, f"{schema}.{table_name}" if schema else table_name
-        )
-        sql = f"SELECT * FROM {qualified}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
 
 
 class CassandraSource(DataSource):
@@ -2328,7 +2135,8 @@ class CassandraSource(DataSource):
             )
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
+        min_free = _min_free_bytes(pack_config)
 
         hosts = self.config.get("hosts") or [
             self.config.get("host", "localhost")
@@ -2347,78 +2155,69 @@ class CassandraSource(DataSource):
             cluster = Cluster(hosts, port=port)
 
         session = cluster.connect(keyspace)
-
-        # Get tables
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            rows = session.execute(
-                f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{keyspace}'"
-            )
-            table_names = [row.table_name for row in rows]
-        elif isinstance(table_or_query, (list, tuple, set)):
-            table_names = list(table_or_query)
-        elif isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name("cassandra", "query")
-                rows = session.execute(table_or_query)
-                columns = rows.column_names
-                all_paths: List[str] = []
-                batch = []
-                part = 1
-                for row in rows:
-                    batch.append(dict(zip(columns, row)))
-                    if len(batch) >= chunk_rows:
-                        df = pd.DataFrame(batch)
-                        path = _build_parquet_path(output_dir, base_name, part)
-                        _write_df_to_parquet(df, path)
-                        all_paths.append(path)
-                        batch = []
-                        part += 1
-                if batch:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                cluster.shutdown()
-                return all_paths
-            table_names = [table_or_query]
-        else:
-            raise TypeError(
-                "table_or_query must be None, '*', a string, or a list of table names."
-            )
-
         all_paths: List[str] = []
-        for table_name in table_names:
-            base_name = _build_base_name("cassandra", table_name)
-            rows = session.execute(f"SELECT * FROM {table_name}")
-            columns = rows.column_names
-            batch = []
-            part = 1
-            for row in rows:
-                batch.append(dict(zip(columns, row)))
-                if len(batch) >= chunk_rows:
-                    df = pd.DataFrame(batch)
-                    path = _build_parquet_path(output_dir, base_name, part)
-                    _write_df_to_parquet(df, path)
-                    all_paths.append(path)
-                    batch = []
-                    part += 1
-            if batch:
-                df = pd.DataFrame(batch)
-                path = _build_parquet_path(output_dir, base_name, part)
-                _write_df_to_parquet(df, path)
-                all_paths.append(path)
+        try:
+            # Get tables
+            if table_or_query is None or (
+                isinstance(table_or_query, str)
+                and table_or_query.strip() == "*"
+            ):
+                rows = session.execute(
+                    f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{keyspace}'"
+                )
+                table_names = [row.table_name for row in rows]
+            elif isinstance(table_or_query, (list, tuple, set)):
+                table_names = list(table_or_query)
+            elif isinstance(table_or_query, str):
+                if _is_sql_query(table_or_query):
+                    base_name = self._object_base_name("cassandra", "query")
+                    rows = session.execute(table_or_query)
+                    return self._record_object(
+                        base_name,
+                        pio.write_row_batches(
+                            rows,
+                            rows.column_names,
+                            output_dir,
+                            base_name,
+                            fetch_rows=_fetch_rows(pack_config),
+                            chunk_rows=chunk_rows,
+                            min_free_bytes=min_free,
+                        ),
+                    )
+                table_names = [table_or_query]
+            else:
+                raise TypeError(
+                    "table_or_query must be None, '*', a string, or a list of table names."
+                )
 
-        cluster.shutdown()
+            for table_name in table_names:
+                base_name = self._object_base_name("cassandra", table_name)
+                # The driver pages the result set, so iterating it never holds
+                # more than one page.
+                rows = session.execute(f"SELECT * FROM {table_name}")
+                all_paths.extend(
+                    self._record_object(
+                        base_name,
+                        pio.write_row_batches(
+                            rows,
+                            rows.column_names,
+                            output_dir,
+                            base_name,
+                            fetch_rows=_fetch_rows(pack_config),
+                            chunk_rows=chunk_rows,
+                            min_free_bytes=min_free,
+                        ),
+                    )
+                )
+        finally:
+            cluster.shutdown()
         return all_paths
 
     def _is_sql_query(self, s: str) -> bool:
         sql = s.strip().lower()
         if ";" in sql or "\n" in sql:
             return True
-        starters = ("select", "with")
-        return any(sql.startswith(token) for token in starters)
+        return sql.startswith(("select", "with"))
 
 
 class ElasticsearchSource(DataSource):
@@ -2437,7 +2236,7 @@ class ElasticsearchSource(DataSource):
             )
 
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         hosts = self.config.get("hosts") or [
             self.config.get("host", "localhost")
@@ -2497,50 +2296,53 @@ class ElasticsearchSource(DataSource):
             )
 
         all_paths: List[str] = []
-        for index in indices:
-            base_name = _build_base_name("elasticsearch", index)
-            # Use scroll API for large datasets
-            resp = es.search(
-                index=index,
-                scroll="2m",
-                size=min(chunk_rows, 10000),
-                body={"query": {"match_all": {}}},
-            )
-            scroll_id = resp["_scroll_id"]
-            hits = resp["hits"]["hits"]
-
-            batch = []
-            part = 1
-            while hits:
-                for hit in hits:
-                    doc = hit["_source"]
-                    doc["_id"] = hit["_id"]
-                    batch.append(doc)
-                    if len(batch) >= chunk_rows:
-                        df = pd.DataFrame(batch)
-                        path = _build_parquet_path(output_dir, base_name, part)
-                        _write_df_to_parquet(df, path)
-                        all_paths.append(path)
-                        batch = []
-                        part += 1
-                resp = es.scroll(scroll_id=scroll_id, scroll="2m")
-                scroll_id = resp["_scroll_id"]
-                hits = resp["hits"]["hits"]
-
-            if batch:
-                df = pd.DataFrame(batch)
-                path = _build_parquet_path(output_dir, base_name, part)
-                _write_df_to_parquet(df, path)
-                all_paths.append(path)
-
-            es.clear_scroll(scroll_id=scroll_id)
-
-        es.close()
+        try:
+            for index in indices:
+                base_name = self._object_base_name("elasticsearch", index)
+                paths = pio.write_dict_rows(
+                    _scroll_documents(es, index, chunk_rows),
+                    output_dir,
+                    base_name,
+                    fetch_rows=_fetch_rows(pack_config),
+                    chunk_rows=chunk_rows,
+                    min_free_bytes=_min_free_bytes(pack_config),
+                )
+                all_paths.extend(self._record_object(base_name, paths))
+        finally:
+            es.close()
         return all_paths
 
 
-class IbmDb2Source(DataSource):
+def _scroll_documents(es, index: str, page_size: int) -> Iterator[dict]:
+    """Yield an index's documents through the scroll API, one page at a time."""
+    response = es.search(
+        index=index,
+        scroll="2m",
+        size=min(page_size, 10000),
+        body={"query": {"match_all": {}}},
+    )
+    scroll_id = response["_scroll_id"]
+    try:
+        hits = response["hits"]["hits"]
+        while hits:
+            for hit in hits:
+                document = hit["_source"]
+                document["_id"] = hit["_id"]
+                yield document
+            response = es.scroll(scroll_id=scroll_id, scroll="2m")
+            scroll_id = response["_scroll_id"]
+            hits = response["hits"]["hits"]
+    finally:
+        try:
+            es.clear_scroll(scroll_id=scroll_id)
+        except Exception:  # noqa: BLE001 - the scroll expires on its own
+            logger.debug("failed to clear scroll %s", scroll_id)
+
+
+class IbmDb2Source(_SqlAlchemySource):
     """IBM DB2 data source using ibm_db_sa."""
+
+    dialect_name = "ibm_db2"
 
     def __init__(self, config):
         self.config = config or {}
@@ -2548,7 +2350,7 @@ class IbmDb2Source(DataSource):
     def get_data(self, table_or_query=None, pack_config=None):
         """Load data from IBM DB2 and write Parquet chunks."""
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         connection_string = self.config.get("connection_string")
         if not connection_string:
@@ -2578,99 +2380,33 @@ class IbmDb2Source(DataSource):
         schema = self.config.get("schema")
 
         return self._load_data(
-            engine, table_or_query, schema, output_dir, chunk_rows, "ibm_db2"
+            engine,
+            table_or_query,
+            schema,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
 
-    def _load_data(
-        self,
-        engine,
-        table_or_query,
-        schema,
-        output_dir,
-        chunk_rows,
-        dialect_name,
-    ):
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            table_names = inspector.get_table_names(schema=schema)
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
 
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine,
-                table_or_query,
-                schema,
-                output_dir,
-                chunk_rows,
-                dialect_name,
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
-        )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
-    ):
-        qualified = f"{schema}.{table_name}" if schema else table_name
-        base_name = _build_base_name(dialect_name, qualified)
-        sql = f"SELECT * FROM {qualified}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
-
-
-class AthenaSource(DataSource):
+class AthenaSource(_SqlAlchemySource):
     """Amazon Athena data source using PyAthena."""
+
+    dialect_name = "athena"
 
     def __init__(self, config):
         self.config = config or {}
 
+    def _qualify(self, table_name, schema):
+        if schema:
+            return f'"{schema}"."{table_name}"', f"{schema}.{table_name}"
+        return f'"{table_name}"', table_name
+
     def get_data(self, table_or_query=None, pack_config=None):
         """Load data from Amazon Athena and write Parquet chunks."""
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         connection_string = self.config.get("connection_string")
         if not connection_string:
@@ -2709,106 +2445,33 @@ class AthenaSource(DataSource):
         schema = self.config.get("schema") or self.config.get("database")
 
         return self._load_data(
-            engine, table_or_query, schema, output_dir, chunk_rows, "athena"
+            engine,
+            table_or_query,
+            schema,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
 
-    def _load_data(
-        self,
-        engine,
-        table_or_query,
-        schema,
-        output_dir,
-        chunk_rows,
-        dialect_name,
-    ):
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            try:
-                table_names = inspector.get_table_names(schema=schema)
-            except Exception:
-                table_names = []
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
 
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine,
-                table_or_query,
-                schema,
-                output_dir,
-                chunk_rows,
-                dialect_name,
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
-        )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
-    ):
-        qualified = (
-            f'"{schema}"."{table_name}"' if schema else f'"{table_name}"'
-        )
-        base_name = _build_base_name(
-            dialect_name, f"{schema}.{table_name}" if schema else table_name
-        )
-        sql = f"SELECT * FROM {qualified}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
-
-
-class SynapseSource(DataSource):
+class SynapseSource(_SqlAlchemySource):
     """Azure Synapse Analytics data source."""
+
+    dialect_name = "synapse"
 
     def __init__(self, config):
         self.config = config or {}
 
+    def _qualify(self, table_name, schema):
+        if schema:
+            return f"[{schema}].[{table_name}]", f"{schema}.{table_name}"
+        return f"[{table_name}]", table_name
+
     def get_data(self, table_or_query=None, pack_config=None):
         """Load data from Azure Synapse and write Parquet chunks."""
         output_dir = _ensure_output_dir(pack_config)
-        chunk_rows = int((pack_config or {}).get("chunk_rows", 100000))
+        chunk_rows = _chunk_rows(pack_config)
 
         connection_string = self.config.get("connection_string")
         if not connection_string:
@@ -2839,91 +2502,14 @@ class SynapseSource(DataSource):
         schema = self.config.get("schema", "dbo")
 
         return self._load_data(
-            engine, table_or_query, schema, output_dir, chunk_rows, "synapse"
+            engine,
+            table_or_query,
+            schema,
+            output_dir,
+            chunk_rows,
+            self.dialect_name,
+            pack_config=pack_config,
         )
-
-    def _load_data(
-        self,
-        engine,
-        table_or_query,
-        schema,
-        output_dir,
-        chunk_rows,
-        dialect_name,
-    ):
-        if table_or_query is None or (
-            isinstance(table_or_query, str) and table_or_query.strip() == "*"
-        ):
-            inspector = inspect(engine)
-            table_names = inspector.get_table_names(schema=schema)
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                    )
-                )
-            return all_paths
-
-        if isinstance(table_or_query, str):
-            if self._is_sql_query(table_or_query):
-                base_name = _build_base_name(dialect_name, "query")
-                df_iter = pd.read_sql(
-                    table_or_query, engine, chunksize=chunk_rows
-                )
-                return _write_pandas_chunks(df_iter, output_dir, base_name)
-            return self._read_table_to_parquet(
-                engine,
-                table_or_query,
-                schema,
-                output_dir,
-                chunk_rows,
-                dialect_name,
-            )
-
-        raise TypeError(
-            "table_or_query must be None, '*', a string, or a list of table names."
-        )
-
-    def _read_table_to_parquet(
-        self, engine, table_name, schema, output_dir, chunk_rows, dialect_name
-    ):
-        qualified = (
-            f"[{schema}].[{table_name}]" if schema else f"[{table_name}]"
-        )
-        base_name = _build_base_name(
-            dialect_name, f"{schema}.{table_name}" if schema else table_name
-        )
-        sql = f"SELECT * FROM {qualified}"
-        df_iter = pd.read_sql(sql, engine, chunksize=int(chunk_rows))
-        return _write_pandas_chunks(df_iter, output_dir, base_name)
-
-    def _is_sql_query(self, s: str) -> bool:
-        sql = s.strip().lower()
-        if ";" in sql or "\n" in sql:
-            return True
-        starters = ("select", "with", "show", "describe", "explain")
-        return any(sql.startswith(token) for token in starters)
 
 
 class SqliteSource(DataSource):

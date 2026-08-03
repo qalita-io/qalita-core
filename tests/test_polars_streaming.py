@@ -129,29 +129,247 @@ class TestPolarsIO:
         read_df = pl.read_parquet(result_path)
         assert len(read_df) == 1000
 
-    def test_estimate_memory_usage(self, sample_parquet_file):
-        """Test memory usage estimation."""
-        from qalita_core.polars_io import estimate_memory_usage, scan_parquet
+    def test_sink_parts_splits_in_one_pass(self, temp_parquet_dir):
+        """Parts roll at chunk_rows and are named for the object they hold."""
+        from qalita_core.polars_io import sink_parts
 
-        lf = scan_parquet(sample_parquet_file)
-        estimate = estimate_memory_usage(lf)
+        lf = pl.LazyFrame(
+            {"x": range(2500), "y": [f"v_{i}" for i in range(2500)]}
+        )
+        paths = sink_parts(lf, temp_parquet_dir, "obj", chunk_rows=1000)
 
-        assert "row_count" in estimate
-        assert estimate["row_count"] == 100_000
-        assert "estimated_size_mb" in estimate
-        assert estimate["estimated_size_mb"] > 0
+        assert [os.path.basename(p) for p in paths] == [
+            "obj_part_1.parquet",
+            "obj_part_2.parquet",
+            "obj_part_3.parquet",
+        ]
+        # The parts are one dataset: reading them together must not raise.
+        assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 2500
 
-    def test_should_use_streaming(self, sample_parquet_file):
-        """Test streaming recommendation based on data size."""
-        from qalita_core.polars_io import should_use_streaming, scan_parquet
+    def test_sink_parts_writes_an_empty_object(self, temp_parquet_dir):
+        """An empty source still yields a scannable object."""
+        from qalita_core.polars_io import sink_parts
 
-        lf = scan_parquet(sample_parquet_file)
+        paths = sink_parts(
+            pl.LazyFrame({"x": [], "y": []}), temp_parquet_dir, "void"
+        )
+        assert len(paths) == 1
+        assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 0
 
-        # 100K rows should not trigger streaming by default
-        assert not should_use_streaming(lf, threshold_rows=200_000)
+    def test_parts_share_one_pinned_schema(self, temp_parquet_dir):
+        """The regression this module exists for.
 
-        # But should trigger with lower threshold
-        assert should_use_streaming(lf, threshold_rows=50_000)
+        A writer per part infers dtypes per part: an all-null first batch types
+        the column Null and the next one String, and scanning the parts
+        together then raises SchemaError.
+        """
+        import pyarrow as pa
+        from qalita_core.polars_io import ParquetPartWriter
+
+        writer = ParquetPartWriter(
+            temp_parquet_dir,
+            "drift",
+            chunk_rows=2,
+            type_hints={"v": pa.large_string()},
+        )
+        writer.write(pl.DataFrame({"id": [1, 2], "v": [None, None]}))
+        writer.write(pl.DataFrame({"id": [3, 4], "v": ["a", "b"]}))
+        paths = writer.close()
+
+        assert len(paths) == 2
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["v"].to_list() == [None, None, "a", "b"]
+
+    def test_disk_guard_refuses_an_oversized_stage(self, temp_parquet_dir):
+        """Refuse before filling the volume rather than after."""
+        from qalita_core.polars_io import (
+            InsufficientDiskSpaceError,
+            check_disk_space,
+        )
+
+        check_disk_space(temp_parquet_dir, 1024)
+        with pytest.raises(InsufficientDiskSpaceError):
+            check_disk_space(temp_parquet_dir, 1 << 60)
+
+    def test_json_array_is_streamed_element_by_element(self, temp_parquet_dir):
+        """A top-level JSON array is read without loading the document."""
+        import json as _json
+        from qalita_core.polars_io import iter_json_array, sniff_json_format
+
+        path = os.path.join(temp_parquet_dir, "records.json")
+        records = [{"id": i, "name": f"n{i}"} for i in range(50)]
+        with open(path, "w", encoding="utf-8") as handle:
+            _json.dump(records, handle)
+
+        assert sniff_json_format(path) == "array"
+        # A tiny buffer forces the refill path.
+        assert list(iter_json_array(path, buffer_size=8)) == records
+
+    def test_sniff_detects_ndjson(self, temp_parquet_dir):
+        from qalita_core.polars_io import sniff_json_format
+
+        path = os.path.join(temp_parquet_dir, "lines.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"a": 1}\n{"a": 2}\n')
+        assert sniff_json_format(path) == "ndjson"
+
+
+class TestPinnedTypeVersusLaterBatches:
+    """What happens when a batch does not fit the type pinned from the first.
+
+    These paths — rows from a cursor, documents from Mongo/Elasticsearch, an
+    xlsx sheet — carry no declared type, so the type comes from the first
+    ``fetch_rows`` rows. Everything here is about the rows that come after.
+    """
+
+    def test_a_later_decimal_is_not_floored_into_an_int_column(
+        self, temp_parquet_dir
+    ):
+        """A price column whose first chunk is whole numbers.
+
+        ``pa.array([19.99], type=pa.int64())`` truncates instead of raising, so
+        the pinned int64 used to eat the decimals of every later batch with no
+        error, no warning and no way to notice afterwards.
+        """
+        from qalita_core.polars_io import write_row_batches
+
+        rows = [(0, 10), (1, 10), (2, 10), (3, 19.99), (4, 5.25)]
+        paths = write_row_batches(
+            iter(rows),
+            ["qty", "price"],
+            temp_parquet_dir,
+            "prices",
+            chunk_rows=1000,
+            fetch_rows=3,
+        )
+
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["price"].to_list() == [10.0, 10.0, 10.0, 19.99, 5.25]
+        assert frame["qty"].to_list() == [0, 1, 2, 3, 4]
+
+    def test_documents_keep_their_decimals(self, temp_parquet_dir):
+        """Same on the document path (MongoDB, Elasticsearch, JSON arrays).
+
+        BSON mixes int32, int64 and double in one field routinely, so this is
+        the ordinary case there rather than the exotic one.
+        """
+        from qalita_core.polars_io import write_dict_rows
+
+        documents = [{"v": 0}, {"v": 1}, {"v": 2}, {"v": 3.5}]
+        paths = write_dict_rows(
+            iter(documents),
+            temp_parquet_dir,
+            "docs",
+            chunk_rows=1000,
+            fetch_rows=3,
+        )
+
+        assert pl.scan_parquet(paths).collect()["v"].to_list() == [
+            0.0,
+            1.0,
+            2.0,
+            3.5,
+        ]
+
+    def test_a_later_text_value_widens_the_whole_object(
+        self, temp_parquet_dir
+    ):
+        """The "N/A" row: the load completes, as text, parts and all.
+
+        Widening only the parts still to be written would leave the object with
+        two Parquet schemas, so the parts already on disk are rewritten too —
+        ``pl.scan_parquet`` over all of them has to work.
+        """
+        from qalita_core.polars_io import write_row_batches
+
+        rows = [(i, i * 10) for i in range(5)] + [(5, "N/A")]
+        paths = write_row_batches(
+            iter(rows),
+            ["id", "score"],
+            temp_parquet_dir,
+            "scores",
+            # Two rows per part, so the flip happens with parts already closed.
+            chunk_rows=2,
+            fetch_rows=5,
+        )
+
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["score"].dtype == pl.String
+        assert frame["score"].to_list() == ["0", "10", "20", "30", "40", "N/A"]
+
+    def test_mixed_types_inside_one_batch_still_become_text(
+        self, temp_parquet_dir
+    ):
+        """The documented fallback, unchanged: mixed values are text."""
+        from qalita_core.polars_io import write_row_batches
+
+        paths = write_row_batches(
+            iter([(1,), (2,), ("N/A",)]),
+            ["v"],
+            temp_parquet_dir,
+            "mixed",
+            chunk_rows=1000,
+        )
+        assert pl.scan_parquet(paths).collect()["v"].to_list() == [
+            "1",
+            "2",
+            "N/A",
+        ]
+
+    def test_a_missing_column_still_fails_and_leaves_no_parts(
+        self, temp_parquet_dir
+    ):
+        """Not every divergence is widenable, and a failed load cleans up.
+
+        ``Pack.cleanup()`` only knows the paths ``get_data`` returned, and a
+        raising load returns none — so an aborted writer that leaves its parts
+        behind leaks them on the staging volume forever.
+        """
+        from qalita_core.polars_io import (
+            SchemaDriftError,
+            write_arrow_batches,
+        )
+
+        batches = [
+            pl.DataFrame({"a": [1, 2], "b": ["x", "y"]}),
+            pl.DataFrame({"a": [3, 4]}),
+        ]
+        with pytest.raises(SchemaDriftError):
+            write_arrow_batches(
+                iter(batches),
+                temp_parquet_dir,
+                "incomplete",
+                chunk_rows=2,
+            )
+
+        assert not list(Path(temp_parquet_dir).glob("incomplete_part_*"))
+
+    def test_excel_decimals_survive_an_integral_first_chunk(
+        self, temp_parquet_dir
+    ):
+        """End to end through the real Excel path, which cannot be typed."""
+        from openpyxl import Workbook
+
+        from qalita_core.data_source_opener import FileSource
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["qty", "price"])
+        for row in [(0, 10), (1, 10), (2, 10), (3, 19.99), (4, 5.25)]:
+            sheet.append(list(row))
+        path = os.path.join(temp_parquet_dir, "prices.xlsx")
+        workbook.save(path)
+
+        source = FileSource(path)
+        paths = source.get_data(
+            pack_config={
+                "parquet_output_dir": os.path.join(temp_parquet_dir, "out"),
+                "fetch_rows": 3,
+            }
+        )
+
+        frame = pl.scan_parquet(paths).collect()
+        assert frame["price"].to_list() == [10.0, 10.0, 10.0, 19.99, 5.25]
 
 
 class TestCompletenessAggregatorPolars:

@@ -1,42 +1,92 @@
 """
 # QALITA (c) COPYRIGHT 2025 - ALL RIGHTS RESERVED -
 
-Shared aggregation helpers for packs.
+Shared metric accumulators for packs.
 
-This module supports both pandas DataFrames and Polars LazyFrames/DataFrames.
-For big data (100GB+), use Polars methods (add_lf, add_pl) for streaming aggregation.
+Every accumulator here is fed Polars LazyFrames and computes through
+:mod:`qalita_core.analytics`, so the memory it uses is a function of the number
+of columns and of the requested top-K, never of the number of rows. Two shapes
+were removed on purpose because they broke that property:
+
+- a Python dict with one entry per distinct key combination (on a primary key,
+  one entry per row);
+- per-chunk statistics combined afterwards by a row-weighted mean, which is not
+  the statistic of the dataset for anything non-associative — normality above
+  all.
+
+The pandas entry points are kept for packs that have not been ported yet. They
+are the only place pandas is touched, and nothing here imports it: a pandas
+DataFrame cannot exist unless the caller already imported pandas.
 """
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Iterable, Tuple, Union, TYPE_CHECKING
-import math
 import datetime as _dt
 import logging
+import sys
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
+from typing import TYPE_CHECKING
+
+import polars as pl
+
+from . import analytics
 
 logger = logging.getLogger(__name__)
 
-# Pandas support (legacy, for backward compatibility)
-try:
-    import pandas as pd  # type: ignore
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import pandas as pd
 
-    PANDAS_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    pd = None  # type: ignore
+# polars is a hard dependency of qalita_core; the flag is kept because packs
+# still branch on it.
+POLARS_AVAILABLE = True
+
+try:  # pragma: no cover - trivial
+    from importlib.util import find_spec
+
+    # find_spec only searches sys.path; it does NOT import pandas, which is the
+    # whole point — importing qalita_core must not cost a pandas import.
+    PANDAS_AVAILABLE = find_spec("pandas") is not None
+except Exception:  # pragma: no cover
     PANDAS_AVAILABLE = False
 
-# Polars support (recommended for big data)
-try:
-    import polars as pl  # type: ignore
+# Upper bound on the number of aggregate expressions sent in a single pass. One
+# pass is what we want (the source is read once); this only keeps a pathological
+# table of tens of thousands of columns from building one gigantic query plan.
+_MAX_EXPRS_PER_PASS = 2000
 
-    POLARS_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    pl = None  # type: ignore
-    POLARS_AVAILABLE = False
+# Default cap on the number of duplicated keys reported. Row-returning results
+# are bounded by construction here, as in analytics.
+DEFAULT_DUPLICATE_KEYS = 1000
 
-if TYPE_CHECKING:
-    import pandas as pd
-    import polars as pl
+
+def _is_pandas_frame(data: Any) -> bool:
+    """True for a pandas DataFrame, without importing pandas.
+
+    A pandas DataFrame cannot exist unless pandas is already in ``sys.modules``,
+    so its absence is a definitive "no" — and asking the question never drags
+    pandas into a pack that does not use it.
+    """
+    pandas = sys.modules.get("pandas")
+    return pandas is not None and isinstance(data, pandas.DataFrame)
+
+
+def _is_missing(value: Any) -> bool:
+    """None, NaN or NaT — recognised without pandas.
+
+    NaN and NaT are the only values that differ from themselves, which is what
+    ``pandas.isna`` checks for scalars anyway.
+    """
+    if value is None:
+        return True
+    try:
+        return bool(value != value)
+    except Exception:  # noqa: BLE001 - exotic objects compare by identity
+        return False
+
+
+def _schema_of(frame: Union["pl.LazyFrame", "pl.DataFrame"]) -> Dict[str, Any]:
+    """Column names and dtypes, from Parquet footers when the frame is lazy."""
+    return dict(frame.collect_schema())
 
 
 def detect_chunked_from_items(
@@ -133,11 +183,23 @@ def normalize_and_dedupe_recommendations(
     return dedup
 
 
-class CompletenessAggregator:
-    """Accumulate completeness signals across chunks and finalize metrics/schemas.
+def _column_scope(column: str, dataset_scope_name: str) -> Dict[str, Any]:
+    return {
+        "perimeter": "column",
+        "value": column,
+        "parent_scope": {
+            "perimeter": "dataset",
+            "value": dataset_scope_name,
+        },
+    }
 
-    Supports both pandas DataFrames and Polars LazyFrames/DataFrames.
-    For big data (100GB+), use add_lf() with Polars LazyFrame for streaming aggregation.
+
+class CompletenessAggregator:
+    """Accumulate completeness signals and finalize metrics/schemas.
+
+    Feed it LazyFrames (``add_lf``). Every frame costs exactly one streaming
+    pass whatever its width, because all the null counts travel in a single
+    :func:`qalita_core.analytics.agg` call.
     """
 
     def __init__(self) -> None:
@@ -147,110 +209,77 @@ class CompletenessAggregator:
         self.per_column: Dict[str, Dict[str, int]] = {}
         self.unique_columns: set[str] = set()
 
-    def add_df(self, df: "pd.DataFrame") -> None:  # type: ignore[name-defined]
-        """Add pandas DataFrame statistics (legacy method)."""
-        if not PANDAS_AVAILABLE:
-            raise RuntimeError("pandas is required for add_df()")
-        rows = int(len(df))
-        cols_list = list(df.columns)
-        self.unique_columns.update(cols_list)
-        # Per-column non-null
-        for col in cols_list:
-            try:
-                nn = int(df[col].notnull().sum())
-            except Exception:
-                nn = int(
-                    pd.Series([x for x in df[col] if x is not None]).shape[0]
-                )
-            rec = self.per_column.get(col) or {"non_null": 0, "rows": 0}
-            rec["non_null"] += nn
-            rec["rows"] += rows
-            self.per_column[col] = rec
-        # Dataset-level
-        try:
-            non_null_cells = int(df.notnull().sum().sum())
-        except Exception:
-            non_null_cells = sum(
-                self.per_column[c]["non_null"] for c in cols_list
-            )
-        self.total_rows += rows
-        self.total_non_null_cells += non_null_cells
-        self.total_cells += rows * max(len(cols_list), 1)
-
-    def add_lf(self, lf: "pl.LazyFrame", *, streaming: bool = True) -> None:
-        """Add Polars LazyFrame statistics using streaming aggregation.
-
-        This is memory-efficient for big data (100GB+) as it processes
-        data in streaming mode without loading everything into memory.
-
-        Args:
-            lf: Polars LazyFrame
-            streaming: Use streaming mode for collection (default: True)
-        """
-        if not POLARS_AVAILABLE:
-            raise RuntimeError("polars is required for add_lf()")
-
-        # Get schema for column names
-        schema = lf.collect_schema()
-        cols_list = list(schema.keys())
-        self.unique_columns.update(cols_list)
-
-        # Compute statistics in a single streaming aggregation
-        # This is much more efficient than per-column iteration
-        agg_exprs = [
-            pl.len().alias("_row_count"),
-        ]
-        for col in cols_list:
-            agg_exprs.append(
-                pl.col(col).is_not_null().sum().alias(f"_nn_{col}")
-            )
-
-        try:
-            # Use engine="streaming" for Polars 1.25+
-            if streaming:
-                stats = lf.select(agg_exprs).collect(engine="streaming")
-            else:
-                stats = lf.select(agg_exprs).collect()
-        except Exception:
-            # Fallback to non-streaming
-            stats = lf.select(agg_exprs).collect()
-
-        rows = int(stats["_row_count"][0])
-
-        # Update per-column stats
+    def _record(self, rows: int, non_null: Dict[str, int]) -> None:
         total_non_null = 0
-        for col in cols_list:
-            nn = int(stats[f"_nn_{col}"][0])
+        for col, count in non_null.items():
             rec = self.per_column.get(col) or {"non_null": 0, "rows": 0}
-            rec["non_null"] += nn
+            rec["non_null"] += int(count)
             rec["rows"] += rows
             self.per_column[col] = rec
-            total_non_null += nn
+            total_non_null += int(count)
 
         self.total_rows += rows
         self.total_non_null_cells += total_non_null
-        self.total_cells += rows * max(len(cols_list), 1)
+        self.total_cells += rows * max(len(non_null), 1)
+
+    def _accumulate(
+        self, frame: Union["pl.LazyFrame", "pl.DataFrame"]
+    ) -> None:
+        cols = list(_schema_of(frame))
+        self.unique_columns.update(cols)
+
+        # ONE pass: pl.len() plus one null-count expression per column, batched
+        # only to keep the query plan finite on pathologically wide tables.
+        rows = 0
+        non_null: Dict[str, int] = {}
+        batches = list(analytics.batched(cols, _MAX_EXPRS_PER_PASS)) or [[]]
+        for index, batch in enumerate(batches):
+            exprs: Dict[str, pl.Expr] = {
+                f"nn|{name}": pl.col(name).is_not_null().sum()
+                for name in batch
+            }
+            if index == 0:
+                exprs["__rows"] = pl.len()
+            result = analytics.agg(frame, exprs)
+            if index == 0:
+                rows = int(result.get("__rows") or 0)
+            for name in batch:
+                non_null[name] = int(result.get(f"nn|{name}") or 0)
+
+        self._record(rows, non_null)
+
+    def add_lf(self, lf: "pl.LazyFrame", *, streaming: bool = True) -> None:
+        """Add a LazyFrame in one streaming pass.
+
+        ``streaming`` is accepted for backward compatibility and ignored: every
+        collect goes through :mod:`qalita_core.analytics`, which is
+        streaming-only and raises rather than retrying in memory.
+        """
+        self._accumulate(lf)
 
     def add_pl(self, df: "pl.DataFrame") -> None:
-        """Add Polars DataFrame statistics.
+        """Add a Polars DataFrame that is already in memory."""
+        self._accumulate(df)
 
-        For LazyFrames, use add_lf() instead for better memory efficiency.
-        """
-        if not POLARS_AVAILABLE:
-            raise RuntimeError("polars is required for add_pl()")
-
-        # Convert to lazy and use streaming aggregation
-        self.add_lf(df.lazy(), streaming=False)
+    def add_df(self, df: "pd.DataFrame") -> None:  # type: ignore[name-defined]
+        """Add a pandas DataFrame (legacy path, frame already in memory)."""
+        rows = int(len(df))
+        cols_list = [str(c) for c in df.columns]
+        self.unique_columns.update(cols_list)
+        counts = df.notnull().sum()
+        non_null = {
+            name: int(counts.iloc[position])
+            for position, name in enumerate(cols_list)
+        }
+        self._record(rows, non_null)
 
     def add(
         self, data: Union["pd.DataFrame", "pl.DataFrame", "pl.LazyFrame"]
     ) -> None:
         """Add statistics from any supported data type (auto-detection)."""
-        if POLARS_AVAILABLE and isinstance(data, pl.LazyFrame):
-            self.add_lf(data)
-        elif POLARS_AVAILABLE and isinstance(data, pl.DataFrame):
-            self.add_pl(data)
-        elif PANDAS_AVAILABLE and isinstance(data, pd.DataFrame):
+        if isinstance(data, (pl.LazyFrame, pl.DataFrame)):
+            self._accumulate(data)
+        elif _is_pandas_frame(data):
             self.add_df(data)
         else:
             raise TypeError(f"Unsupported data type: {type(data)}")
@@ -269,14 +298,7 @@ class CompletenessAggregator:
                 {
                     "key": "completeness_score",
                     "value": str(completeness),
-                    "scope": {
-                        "perimeter": "column",
-                        "value": col,
-                        "parent_scope": {
-                            "perimeter": "dataset",
-                            "value": dataset_scope_name,
-                        },
-                    },
+                    "scope": _column_scope(col, dataset_scope_name),
                 }
             )
 
@@ -327,14 +349,7 @@ class CompletenessAggregator:
                 {
                     "key": "column",
                     "value": variable_name,
-                    "scope": {
-                        "perimeter": "column",
-                        "value": variable_name,
-                        "parent_scope": {
-                            "perimeter": "dataset",
-                            "value": dataset_scope_name,
-                        },
-                    },
+                    "scope": _column_scope(variable_name, dataset_scope_name),
                 }
             )
         schemas.append(
@@ -348,39 +363,207 @@ class CompletenessAggregator:
         return metrics, schemas
 
 
+def streaming_outliers(
+    lf: Union["pl.LazyFrame", "pl.DataFrame"],
+    columns: Sequence[str],
+    *,
+    method: str = "iqr",
+    threshold: float | None = None,
+    exact: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Count outliers over a whole dataset, in bounded memory.
+
+    Two passes. Pass 1 computes GLOBAL fences for every column; pass 2 counts,
+    in ONE aggregation covering every column at once, the rows that fall outside
+    them. Global fences are the whole point: an outlier is defined relative to
+    the entire column, so fences computed per chunk answer a different question,
+    and a row-weighted mean of per-chunk normality is not the normality of the
+    dataset.
+
+    Args:
+        lf: LazyFrame (or DataFrame) to scan. It is read twice with
+            ``method="zscore"``, three times with ``method="iqr"`` and
+            ``exact=False`` (the histogram needs the min/max first).
+        columns: numeric columns to check — see
+            :func:`qalita_core.analytics.numeric_columns`, which reads them off
+            the Parquet footers.
+        method: ``"iqr"`` puts the fences at ``q1 - threshold * IQR`` and
+            ``q3 + threshold * IQR``; ``"zscore"`` at ``mean ± threshold * std``.
+        threshold: defaults to ``1.5`` for ``"iqr"`` and ``3.0`` for
+            ``"zscore"``.
+        exact: compute the quartiles exactly instead of from a histogram. That
+            orders each column in RAM — Polars 1.37 has no out-of-core
+            execution — so its cost follows the row count. Use it only when the
+            columns are known to fit.
+
+    Returns:
+        ``{column: {...}}`` with, per column:
+
+        - ``outlier_count`` (int): rows outside the fences, nulls excluded;
+        - ``non_null`` (int): rows the score is computed on;
+        - ``normality_score`` (float): ``1 - outlier_count / non_null``, ``1.0``
+          when the column has no usable fence (all-null or zero spread);
+        - ``lower`` / ``upper`` (float or None): the fences themselves;
+        - ``method`` (str): the method asked for;
+        - ``bounds_method`` (str): ``"histogram"`` when the fences come from
+          approximate quantiles, ``"exact"`` otherwise. Feed it to the
+          ``<key>_method`` sibling metric so the UI can label the number.
+
+    Example:
+        >>> schema = pack.schema("source")
+        >>> results = streaming_outliers(
+        ...     pack.scan("source"), analytics.numeric_columns(schema)
+        ... )
+        >>> results["price"]["outlier_count"]
+        1734
+    """
+    names = list(columns)
+    if not names:
+        return {}
+
+    if method not in ("iqr", "zscore"):
+        raise ValueError(
+            f"unknown outlier method {method!r}, expected 'iqr' or 'zscore'"
+        )
+    if threshold is None:
+        threshold = 1.5 if method == "iqr" else 3.0
+    threshold = float(threshold)
+
+    bounds: Dict[str, Tuple[float, float]] = {}
+    if method == "iqr":
+        bounds_method = "exact" if exact else "histogram"
+        quartiles = analytics.quantiles(lf, names, (0.25, 0.75), exact=exact)
+        for name in names:
+            values = quartiles.get(name) or {}
+            q1, q3 = values.get(0.25), values.get(0.75)
+            if q1 is None or q3 is None:
+                continue
+            spread = float(q3) - float(q1)
+            if spread <= 0:
+                # Constant (or near-constant) column: any fence would flag
+                # either nothing or everything.
+                continue
+            bounds[name] = (
+                float(q1) - threshold * spread,
+                float(q3) + threshold * spread,
+            )
+    else:
+        # mean/std are exact streaming aggregates, so no approximation label.
+        bounds_method = "exact"
+        moments = analytics.agg(
+            lf,
+            {
+                **{f"mean|{i}": pl.col(c).mean() for i, c in enumerate(names)},
+                **{f"std|{i}": pl.col(c).std() for i, c in enumerate(names)},
+            },
+        )
+        for index, name in enumerate(names):
+            mean = moments.get(f"mean|{index}")
+            std = moments.get(f"std|{index}")
+            if mean is None or std is None or float(std) <= 0:
+                continue
+            bounds[name] = (
+                float(mean) - threshold * float(std),
+                float(mean) + threshold * float(std),
+            )
+
+    # Pass 2: every column counted in the same pass over the source.
+    exprs: Dict[str, pl.Expr] = {}
+    for index, name in enumerate(names):
+        exprs[f"cnt|{index}"] = pl.col(name).count()
+        if name in bounds:
+            low, high = bounds[name]
+            exprs[f"out|{index}"] = (
+                (pl.col(name) < low) | (pl.col(name) > high)
+            ).sum()
+    counted = analytics.agg(lf, exprs)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    for index, name in enumerate(names):
+        non_null = int(counted.get(f"cnt|{index}") or 0)
+        outliers = int(counted.get(f"out|{index}") or 0)
+        low, high = bounds.get(name, (None, None))
+        results[name] = {
+            "outlier_count": outliers,
+            "non_null": non_null,
+            "normality_score": (
+                1.0 - (outliers / non_null) if non_null else 1.0
+            ),
+            "lower": low,
+            "upper": high,
+            "method": method,
+            "bounds_method": bounds_method,
+        }
+    return results
+
+
 class OutlierAggregator:
-    """Accumulate outlier and normality signals across chunks and finalize metrics/recommendations."""
+    """Turn global outlier results into metrics and recommendations.
+
+    It stores results, it does not combine chunks: the counts handed to it by
+    :func:`streaming_outliers` already cover the whole dataset. The previous
+    shape asked the caller for per-chunk normality and averaged it weighted by
+    rows, which is not the normality of the dataset — the statistic is not
+    associative, so no combination of per-chunk values can reconstruct it.
+    """
 
     def __init__(self) -> None:
-        self.col_outliers: Dict[str, int] = {}
-        self.col_norm_weighted_sum: Dict[str, float] = {}
-        self.col_rows: Dict[str, int] = {}
+        self.columns: Dict[str, Dict[str, Any]] = {}
         self.dataset_outliers: int = 0
-        self.dataset_norm_weighted_sum: float = 0.0
-        self.dataset_norm_weight: int = 0
         self.total_rows: int = 0
+        self.bounds_method: str = "exact"
 
-    def add_column_stats(
-        self, column: str, mean_normality: float, outlier_count: int, rows: int
-    ) -> None:
-        self.col_outliers[column] = self.col_outliers.get(column, 0) + int(
-            outlier_count
-        )
-        self.col_norm_weighted_sum[column] = self.col_norm_weighted_sum.get(
-            column, 0.0
-        ) + (float(mean_normality) * int(rows))
-        self.col_rows[column] = self.col_rows.get(column, 0) + int(rows)
-
-    def add_dataset_stats(
+    def add_column_result(
         self,
-        mean_normality: float,
-        rows: int,
-        multivariate_outliers_count: int,
+        column: str,
+        *,
+        outlier_count: int,
+        normality_score: float,
+        rows: int = 0,
+        method: str = "iqr",
+        bounds_method: str = "exact",
+        lower: float | None = None,
+        upper: float | None = None,
     ) -> None:
+        """Record the GLOBAL result of one column."""
+        self.columns[column] = {
+            "outlier_count": int(outlier_count),
+            "normality_score": float(normality_score),
+            "rows": int(rows),
+            "method": method,
+            "bounds_method": bounds_method,
+            "lower": lower,
+            "upper": upper,
+        }
+        if bounds_method != "exact":
+            # One approximate column makes the dataset score approximate.
+            self.bounds_method = bounds_method
+
+    def add_streaming_outliers(
+        self, results: Dict[str, Dict[str, Any]], *, rows: int = 0
+    ) -> None:
+        """Record a whole :func:`streaming_outliers` result at once."""
+        for column, stats in results.items():
+            self.add_column_result(
+                column,
+                outlier_count=stats.get("outlier_count", 0),
+                normality_score=stats.get("normality_score", 1.0),
+                rows=stats.get("non_null", 0),
+                method=stats.get("method", "iqr"),
+                bounds_method=stats.get("bounds_method", "exact"),
+                lower=stats.get("lower"),
+                upper=stats.get("upper"),
+            )
+        if rows:
+            self.total_rows = int(rows)
+
+    def add_dataset_result(
+        self, *, rows: int = 0, multivariate_outliers_count: int = 0
+    ) -> None:
+        """Record dataset-level counts (row count, multivariate outliers)."""
         self.dataset_outliers += int(multivariate_outliers_count)
-        self.dataset_norm_weighted_sum += float(mean_normality) * int(rows)
-        self.dataset_norm_weight += int(rows)
-        self.total_rows += int(rows)
+        if rows:
+            self.total_rows = int(rows)
 
     def finalize_metrics_and_recommendations(
         self, root_dataset_name: str, normality_threshold: float
@@ -388,110 +571,112 @@ class OutlierAggregator:
         metrics: List[Dict[str, Any]] = []
         recommendations: List[Dict[str, Any]] = []
 
-        # Columns
-        for col, rows in self.col_rows.items():
-            r = max(int(rows), 1)
-            mean_norm = round(self.col_norm_weighted_sum.get(col, 0.0) / r, 2)
+        dataset_scope = {"perimeter": "dataset", "value": root_dataset_name}
+
+        for col, stats in self.columns.items():
+            scope = _column_scope(col, root_dataset_name)
+            normality = round(float(stats["normality_score"]), 2)
             metrics.append(
-                {
-                    "key": "normality_score",
-                    "value": mean_norm,
-                    "scope": {
-                        "perimeter": "column",
-                        "value": col,
-                        "parent_scope": {
-                            "perimeter": "dataset",
-                            "value": root_dataset_name,
-                        },
-                    },
-                }
+                {"key": "normality_score", "value": normality, "scope": scope}
             )
             metrics.append(
                 {
                     "key": "outliers",
-                    "value": int(self.col_outliers.get(col, 0)),
-                    "scope": {
-                        "perimeter": "column",
-                        "value": col,
-                        "parent_scope": {
-                            "perimeter": "dataset",
-                            "value": root_dataset_name,
-                        },
-                    },
+                    "value": int(stats["outlier_count"]),
+                    "scope": scope,
                 }
             )
-            if mean_norm < normality_threshold:
+            # Both numbers are derived from the fences, so both carry the label
+            # that says how the fences were obtained.
+            for key in ("normality_score_method", "outliers_method"):
+                metrics.append(
+                    {
+                        "key": key,
+                        "value": stats["bounds_method"],
+                        "scope": scope,
+                    }
+                )
+            if normality < normality_threshold:
                 recommendations.append(
                     {
-                        "content": f"Column '{col}' has a normality score of {mean_norm*100}%.",
+                        "content": (
+                            f"Column '{col}' has a normality score of "
+                            f"{normality * 100}%."
+                        ),
                         "type": "Outliers",
-                        "scope": {
-                            "perimeter": "column",
-                            "value": col,
-                            "parent_scope": {
-                                "perimeter": "dataset",
-                                "value": root_dataset_name,
-                            },
-                        },
+                        "scope": scope,
                         "level": _determine_recommendation_level(
-                            1 - mean_norm
+                            1 - normality
                         ),
                     }
                 )
 
-        # Dataset
-        dataset_norm = round(
-            self.dataset_norm_weighted_sum / max(self.dataset_norm_weight, 1),
-            2,
-        )
+        scores = [
+            float(stats["normality_score"]) for stats in self.columns.values()
+        ]
+        dataset_norm = round(sum(scores) / len(scores), 2) if scores else 1.0
+
         metrics.append(
             {
                 "key": "outliers",
                 "value": int(self.dataset_outliers),
-                "scope": {"perimeter": "dataset", "value": root_dataset_name},
+                "scope": dataset_scope,
             }
         )
         metrics.append(
             {
                 "key": "normality_score_dataset",
                 "value": dataset_norm,
-                "scope": {"perimeter": "dataset", "value": root_dataset_name},
+                "scope": dataset_scope,
             }
         )
         metrics.append(
             {
                 "key": "score",
                 "value": str(dataset_norm),
-                "scope": {"perimeter": "dataset", "value": root_dataset_name},
+                "scope": dataset_scope,
             }
         )
-        total_outliers_count = int(sum(self.col_outliers.values()))
+        total_outliers_count = int(
+            sum(int(s["outlier_count"]) for s in self.columns.values())
+        )
         metrics.append(
             {
                 "key": "total_outliers_count",
                 "value": total_outliers_count,
-                "scope": {"perimeter": "dataset", "value": root_dataset_name},
+                "scope": dataset_scope,
+            }
+        )
+        metrics.append(
+            {
+                "key": "outliers_method",
+                "value": self.bounds_method,
+                "scope": dataset_scope,
             }
         )
 
         if dataset_norm < normality_threshold:
             recommendations.append(
                 {
-                    "content": f"The dataset '{root_dataset_name}' has a normality score of {dataset_norm*100}%.",
+                    "content": (
+                        f"The dataset '{root_dataset_name}' has a normality "
+                        f"score of {dataset_norm * 100}%."
+                    ),
                     "type": "Outliers",
-                    "scope": {
-                        "perimeter": "dataset",
-                        "value": root_dataset_name,
-                    },
+                    "scope": dataset_scope,
                     "level": _determine_recommendation_level(1 - dataset_norm),
                 }
             )
 
         recommendations.append(
             {
-                "content": f"The dataset '{root_dataset_name}' has a total of {total_outliers_count} outliers. Check them in output file.",
+                "content": (
+                    f"The dataset '{root_dataset_name}' has a total of "
+                    f"{total_outliers_count} outliers. Check them in output "
+                    "file."
+                ),
                 "type": "Outliers",
-                "scope": {"perimeter": "dataset", "value": root_dataset_name},
+                "scope": dataset_scope,
                 "level": _determine_recommendation_level(
                     total_outliers_count / max(1, self.total_rows)
                 ),
@@ -510,39 +695,58 @@ def _determine_recommendation_level(proportion_outliers: float) -> str:
 
 
 class DuplicateAggregator:
-    """Aggregate duplicate statistics across chunks for a set of uniqueness columns.
+    """Count duplicated key combinations over a whole dataset.
 
-    Supports both pandas DataFrames and Polars LazyFrames/DataFrames.
-    For big data (100GB+), use add_lf() with Polars LazyFrame for streaming aggregation.
+    Polars owns the counting state: every frame added is registered in a single
+    lazy plan and grouped once at the end, instead of the previous shape, which
+    collected the group-by result into a Python dict with one entry per distinct
+    key combination.
+
+    That removes the Python-side copy but not the underlying limit: the engine
+    keeps its own hash table, and this Polars build has no spilling, so a
+    near-unique key still costs memory proportional to the source. Callers that
+    may face one should check ``analytics.estimate_groups`` first —
+    duplicates_finder_pack does — and fall back to the approximate count.
+
+    ``add_df`` (pandas) still fills :attr:`combo_to_count`, because the frames
+    it is handed are already in memory; do not use it on a large source.
     """
 
     def __init__(self, uniqueness_columns: Iterable[str]):
         self.uniqueness_columns = list(uniqueness_columns)
-        self.total_rows: int = 0
         self.combo_to_count: Dict[Tuple[Any, ...], int] = {}
+        self._frames: List["pl.LazyFrame"] = []
+        self._eager_rows: int = 0
+        self._lazy_rows: int | None = None
+        self._lazy_duplicates: int | None = None
 
-    def _sanitize_key_tuple(self, values: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        sanitized: List[Any] = []
-        for v in values:
-            if v is None:
-                sanitized.append(None)
-                continue
-            try:
-                if PANDAS_AVAILABLE and pd.isna(v):  # type: ignore[attr-defined]
-                    sanitized.append(None)
-                else:
-                    sanitized.append(v)
-            except Exception:
-                sanitized.append(v)
-        return tuple(sanitized)
+    # -- accumulation ----------------------------------------------------
+
+    def _invalidate(self) -> None:
+        self._lazy_rows = None
+        self._lazy_duplicates = None
+
+    def add_lf(self, lf: "pl.LazyFrame", *, streaming: bool = True) -> None:
+        """Register a LazyFrame. Nothing is read here.
+
+        The counting is deferred so that every registered frame is grouped by
+        the SAME plan: a key duplicated across two chunks is only visible to a
+        group-by that sees both.
+
+        ``streaming`` is accepted for backward compatibility and ignored.
+        """
+        self._frames.append(lf)
+        self._invalidate()
+
+    def add_pl(self, df: "pl.DataFrame") -> None:
+        """Register a Polars DataFrame already in memory."""
+        self.add_lf(df.lazy())
 
     def add_df(self, df: "pd.DataFrame") -> None:  # type: ignore[name-defined]
-        """Add pandas DataFrame statistics (legacy method)."""
-        if not PANDAS_AVAILABLE:
-            raise RuntimeError("pandas is required for add_df()")
-        self.total_rows += int(len(df))
+        """Add a pandas DataFrame (legacy path, frame already in memory)."""
+        self._eager_rows += int(len(df))
         subset = df[self.uniqueness_columns]
-        # value_counts on DataFrame returns a Series with MultiIndex keys
+        # value_counts on a DataFrame returns a Series with MultiIndex keys
         counts = subset.value_counts(dropna=False)
         if hasattr(counts, "items"):
             for key, count in counts.items():
@@ -553,86 +757,154 @@ class DuplicateAggregator:
                     key_t, 0
                 ) + int(count)
 
-    def add_lf(self, lf: "pl.LazyFrame", *, streaming: bool = True) -> None:
-        """Add Polars LazyFrame statistics using streaming aggregation.
-
-        This uses Polars group_by().count() which is memory-efficient for big data.
-
-        Args:
-            lf: Polars LazyFrame
-            streaming: Use streaming mode for collection (default: True)
-        """
-        if not POLARS_AVAILABLE:
-            raise RuntimeError("polars is required for add_lf()")
-
-        # Get row count first (use engine="streaming" for Polars 1.25+)
-        try:
-            if streaming:
-                row_count = (
-                    lf.select(pl.len()).collect(engine="streaming").item()
-                )
-            else:
-                row_count = lf.select(pl.len()).collect().item()
-        except Exception:
-            row_count = lf.select(pl.len()).collect().item()
-        self.total_rows += int(row_count)
-
-        # Use group_by().count() for memory-efficient duplicate detection
-        # This aggregates without loading all unique combinations into memory
-        counts_lf = (
-            lf.select(self.uniqueness_columns)
-            .group_by(self.uniqueness_columns)
-            .agg(pl.len().alias("_count"))
-        )
-
-        try:
-            if streaming:
-                counts_df = counts_lf.collect(engine="streaming")
-            else:
-                counts_df = counts_lf.collect()
-        except Exception:
-            counts_df = counts_lf.collect()
-
-        # Update combo counts
-        for row in counts_df.iter_rows(named=True):
-            key = tuple(row[col] for col in self.uniqueness_columns)
-            key_t = self._sanitize_key_tuple(key)
-            count = int(row["_count"])
-            self.combo_to_count[key_t] = (
-                self.combo_to_count.get(key_t, 0) + count
-            )
-
-    def add_pl(self, df: "pl.DataFrame") -> None:
-        """Add Polars DataFrame statistics."""
-        if not POLARS_AVAILABLE:
-            raise RuntimeError("polars is required for add_pl()")
-        self.add_lf(df.lazy(), streaming=False)
-
     def add(
         self, data: Union["pd.DataFrame", "pl.DataFrame", "pl.LazyFrame"]
     ) -> None:
         """Add statistics from any supported data type (auto-detection)."""
-        if POLARS_AVAILABLE and isinstance(data, pl.LazyFrame):
+        if isinstance(data, pl.LazyFrame):
             self.add_lf(data)
-        elif POLARS_AVAILABLE and isinstance(data, pl.DataFrame):
+        elif isinstance(data, pl.DataFrame):
             self.add_pl(data)
-        elif PANDAS_AVAILABLE and isinstance(data, pd.DataFrame):
+        elif _is_pandas_frame(data):
             self.add_df(data)
         else:
             raise TypeError(f"Unsupported data type: {type(data)}")
+
+    def _sanitize_key_tuple(self, values: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        return tuple(None if _is_missing(v) else v for v in values)
+
+    # -- lazy plan -------------------------------------------------------
+
+    def _plan(self) -> "pl.LazyFrame | None":
+        if not self._frames:
+            return None
+        parts = [
+            frame.select(self.uniqueness_columns) for frame in self._frames
+        ]
+        if len(parts) == 1:
+            return parts[0]
+        # relaxed: two chunks of the same table can disagree on an integer width
+        # when they came from different files.
+        return pl.concat(parts, how="vertical_relaxed")
+
+    def _key_counts(self) -> "pl.LazyFrame | None":
+        plan = self._plan()
+        if plan is None:
+            return None
+        return plan.group_by(self.uniqueness_columns).agg(
+            pl.len().alias("count")
+        )
+
+    @property
+    def total_rows(self) -> int:
+        """Rows seen, lazy frames included.
+
+        On Parquet the lazy part answers from the file footers, so this costs
+        no data read.
+        """
+        if self._lazy_rows is None:
+            plan = self._plan()
+            self._lazy_rows = 0 if plan is None else analytics.row_count(plan)
+        return self._eager_rows + self._lazy_rows
+
+    def duplicate_count(self) -> int:
+        """Rows in excess of one per key combination, over the whole dataset."""
+        pandas_dups = sum(
+            count - 1 for count in self.combo_to_count.values() if count > 1
+        )
+        if self._lazy_duplicates is None:
+            grouped = self._key_counts()
+            if grouped is None:
+                self._lazy_duplicates = 0
+            else:
+                # (n - 1) summed inside the engine: no per-key Python object is
+                # ever created, whatever the cardinality of the key.
+                self._lazy_duplicates = int(
+                    analytics.agg(
+                        grouped,
+                        {
+                            "duplicates": (
+                                (pl.col("count").cast(pl.Int64) - 1)
+                                .clip(lower_bound=0)
+                                .sum()
+                            )
+                        },
+                    )["duplicates"]
+                    or 0
+                )
+        return int(pandas_dups + self._lazy_duplicates)
+
+    def get_duplicate_key_counts(
+        self, limit: int = DEFAULT_DUPLICATE_KEYS
+    ) -> "pl.DataFrame":
+        """The ``limit`` most duplicated key combinations, worst first.
+
+        Bounded by construction: the ordering happens inside the engine and only
+        ``limit`` rows ever reach Python. Columns are the uniqueness columns
+        plus ``count``.
+        """
+        if limit <= 0:
+            raise ValueError(f"limit must be positive, got {limit}")
+
+        grouped = self._key_counts()
+        if grouped is not None:
+            top = analytics.top_k(
+                grouped.filter(pl.col("count") > 1), "count", limit
+            )
+            frame = top.select([*self.uniqueness_columns, "count"])
+        else:
+            frame = pl.DataFrame(
+                schema={
+                    **{name: pl.Null for name in self.uniqueness_columns},
+                    "count": pl.Int64,
+                }
+            )
+
+        if not self.combo_to_count:
+            return frame
+
+        # The pandas path keeps its own counts; merge them in and re-cap.
+        eager = [
+            {
+                **dict(zip(self.uniqueness_columns, key)),
+                "count": count,
+            }
+            for key, count in self.combo_to_count.items()
+            if count > 1
+        ]
+        eager.sort(key=lambda row: row["count"], reverse=True)
+        merged = frame.to_dicts() + eager[:limit]
+        merged.sort(key=lambda row: row["count"], reverse=True)
+        return pl.DataFrame(
+            merged[:limit],
+            schema=[*self.uniqueness_columns, "count"],
+            strict=False,
+        )
+
+    def get_duplicate_keys(
+        self, limit: int = DEFAULT_DUPLICATE_KEYS
+    ) -> List[Tuple[Any, ...]]:
+        """The ``limit`` most duplicated key combinations, as tuples.
+
+        BOUNDED on purpose: the previous version returned every duplicated key,
+        which on a badly-keyed source is the whole dataset in a Python list.
+        """
+        counts = self.get_duplicate_key_counts(limit)
+        if counts.height == 0:
+            return []
+        keys = counts.select(self.uniqueness_columns).rows()
+        return [self._sanitize_key_tuple(key) for key in keys]
 
     def finalize_metrics(
         self, dataset_scope_name: str
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         metrics: List[Dict[str, Any]] = []
         recommendations: List[Dict[str, Any]] = []
-        total_dups = 0
-        for c in self.combo_to_count.values():
-            if c > 1:
-                total_dups += c - 1
+        total_dups = self.duplicate_count()
+        total_rows = self.total_rows
         duplication_rate = (
-            (float(total_dups) / float(max(self.total_rows, 1)))
-            if self.total_rows
+            (float(total_dups) / float(max(total_rows, 1)))
+            if total_rows
             else 0.0
         )
         score = max(0.0, min(1.0, 1.0 - duplication_rate))
@@ -652,16 +924,73 @@ class DuplicateAggregator:
         )
         return metrics, recommendations
 
-    def get_duplicate_keys(self) -> List[Tuple[Any, ...]]:
-        return [k for k, c in self.combo_to_count.items() if c and c > 1]
-
 
 class TimelinessAggregator:
-    """Aggregate earliest/latest per column across chunks to compute timeliness metrics consistently."""
+    """Aggregate earliest/latest per column to compute timeliness metrics."""
 
     def __init__(self) -> None:
         self.date_cols: Dict[str, Dict[str, Any]] = {}
         # structure: col -> {kind: "date"|"year", min: value, max: value}
+
+    def add_lf(
+        self,
+        lf: Union["pl.LazyFrame", "pl.DataFrame"],
+        date_columns: Sequence[str] | None = None,
+        *,
+        schema: Dict[str, Any] | None = None,
+    ) -> None:
+        """Observe min/max of every date column in ONE streaming pass.
+
+        Temporal columns produce date observations; numeric columns are read as
+        years, which is what the caller asked for by listing them. Columns of
+        any other dtype are skipped.
+
+        This exists so packs stop calling ``unique()``/``dropna()`` per column:
+        that idiom re-read the source once per column and built one Python
+        object per distinct value, to end up keeping two of them.
+
+        Args:
+            lf: LazyFrame (or DataFrame) to scan.
+            date_columns: columns to observe. Defaults to every column, which
+                is only sensible on an already-filtered frame.
+            schema: pre-computed schema, e.g. from ``Pack.schema()``. Avoids
+                touching the Parquet footers twice.
+        """
+        resolved = schema if schema is not None else _schema_of(lf)
+        names = (
+            list(date_columns) if date_columns is not None else list(resolved)
+        )
+        if not names:
+            return
+
+        stats: Dict[str, Any] = {}
+        for batch in analytics.batched(names, _MAX_EXPRS_PER_PASS // 2):
+            stats.update(
+                analytics.agg(
+                    lf,
+                    {
+                        **{f"min|{c}": pl.col(c).min() for c in batch},
+                        **{f"max|{c}": pl.col(c).max() for c in batch},
+                    },
+                )
+            )
+
+        for name in names:
+            low, high = stats.get(f"min|{name}"), stats.get(f"max|{name}")
+            if low is None or high is None:
+                continue
+            dtype = resolved.get(name)
+            if dtype in (pl.Date, pl.Datetime):
+                self.add_date_obs(name, low, high)
+            elif dtype is not None and dtype.is_numeric():
+                self.add_year_obs(name, int(low), int(high))
+            else:
+                logger.debug(
+                    "timeliness: column %r has dtype %s, neither a date nor a "
+                    "year — skipped",
+                    name,
+                    dtype,
+                )
 
     def add_year_obs(
         self, column: str, earliest_year: int, latest_year: int
@@ -720,6 +1049,7 @@ class TimelinessAggregator:
         scores: List[float] = []
 
         for col, info in self.date_cols.items():
+            scope = _column_scope(col, dataset_scope_name)
             kind = info.get("kind")
             if kind == "year":
                 earliest_year = (
@@ -739,84 +1069,44 @@ class TimelinessAggregator:
                 timeliness_score = calc_timeliness_score(
                     days_since_latest_year
                 )
-                # metrics
                 metrics.extend(
                     [
                         {
                             "key": "earliest_year",
                             "value": str(earliest_year),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "latest_year",
                             "value": str(latest_year),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "days_since_earliest_year",
                             "value": str(days_since_earliest_year),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "days_since_latest_year",
                             "value": str(days_since_latest_year),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "timeliness_score",
                             "value": str(round(timeliness_score, 2)),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                     ]
                 )
                 if days_since_latest_year > 365:
                     recommendations.append(
                         {
-                            "content": f"The latest date in column '{col}' is more than one year old.",
+                            "content": (
+                                f"The latest date in column '{col}' is more "
+                                "than one year old."
+                            ),
                             "type": "Latest Date far in the past",
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                             "level": "high",
                         }
                     )
@@ -840,78 +1130,39 @@ class TimelinessAggregator:
                         {
                             "key": "earliest_date",
                             "value": earliest_date.strftime("%Y-%m-%d"),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "latest_date",
                             "value": latest_date.strftime("%Y-%m-%d"),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "days_since_earliest_date",
                             "value": str(days_since_earliest),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "days_since_latest_date",
                             "value": str(days_since_latest),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                         {
                             "key": "timeliness_score",
                             "value": str(round(timeliness_score, 2)),
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                         },
                     ]
                 )
                 if days_since_latest > 365:
                     recommendations.append(
                         {
-                            "content": f"The latest date in column '{col}' is more than one year old.",
+                            "content": (
+                                f"The latest date in column '{col}' is more "
+                                "than one year old."
+                            ),
                             "type": "Latest Date far in the past",
-                            "scope": {
-                                "perimeter": "column",
-                                "value": col,
-                                "parent_scope": {
-                                    "perimeter": "dataset",
-                                    "value": dataset_scope_name,
-                                },
-                            },
+                            "scope": scope,
                             "level": "high",
                         }
                     )

@@ -8,6 +8,14 @@ DEPRECATION NOTICE:
 
     This module is kept for backward compatibility with existing packs that
     still use pandas DataFrames.
+
+It is the only module of qalita_core that imports pandas at module level, and
+nothing imports it eagerly: ``qalita_core.__getattr__`` resolves the two public
+helpers on first use. In particular
+:func:`install_pandas_parquet_sanitization` is NOT called on import any more —
+the hook it installs copies the frame on every ``to_parquet``, which doubles
+peak RAM on exactly the writes this package exists to keep small. A pack that
+wants it must ask for it.
 """
 
 import warnings
@@ -74,7 +82,7 @@ def sanitize_dataframe_for_parquet(
             # Check for bytes using sampling (faster for large columns)
             try:
                 sample = series.dropna().head(1000)
-                has_bytes_like = sample.apply(
+                has_bytes_like = sample.apply(  # streaming-ok: opt-in pandas path, frame already in RAM
                     lambda x: isinstance(x, (bytes, bytearray))
                 ).any()
             except Exception:
@@ -82,7 +90,7 @@ def sanitize_dataframe_for_parquet(
 
             if has_bytes_like:
                 # Vectorized decode where possible
-                series = series.apply(
+                series = series.apply(  # streaming-ok: opt-in pandas path, frame already in RAM
                     lambda x: (
                         x.decode("utf-8", errors="replace")
                         if isinstance(x, (bytes, bytearray))
@@ -99,7 +107,7 @@ def sanitize_dataframe_for_parquet(
                 try:
                     series = series.astype("string")
                 except Exception:
-                    series = series.apply(
+                    series = series.apply(  # streaming-ok: opt-in pandas path, frame already in RAM
                         lambda x: None if pd.isna(x) else str(x)
                     )
 
@@ -119,6 +127,10 @@ def install_pandas_parquet_sanitization() -> None:
 
     DEPRECATION: This function is deprecated for big data processing.
     Use Polars via qalita_core.polars_io for better memory efficiency.
+
+    It is never called automatically: the hook sanitizes into a COPY of the
+    frame, so every write costs a second frame in RAM. Call it only when a pack
+    genuinely writes unsanitized pandas frames it cannot fix at the source.
 
     This is idempotent and safe to call multiple times.
     """
@@ -149,7 +161,7 @@ def install_pandas_parquet_sanitization() -> None:
                     if pd.api.types.is_object_dtype(series) or isinstance(
                         series.dtype, pd.CategoricalDtype
                     ):
-                        series = series.apply(
+                        series = series.apply(  # streaming-ok: opt-in pandas path, frame already in RAM
                             lambda x: (
                                 x.decode("utf-8", errors="replace")
                                 if isinstance(x, (bytes, bytearray))
@@ -159,7 +171,7 @@ def install_pandas_parquet_sanitization() -> None:
                         try:
                             series = series.astype("string")
                         except Exception:
-                            series = series.apply(
+                            series = series.apply(  # streaming-ok: opt-in pandas path, frame already in RAM
                                 lambda x: None if pd.isna(x) else str(x)
                             )
                     fallback[column_name] = series

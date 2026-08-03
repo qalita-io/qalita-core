@@ -21,8 +21,14 @@ classifiers = [
     "Natural Language :: English"
 ]
 dependencies = [
-    "polars>=1.0.0",  # Primary data processing library for big data (100GB+)
-    "pandas>=2.2.0",  # Keep for backward compatibility with packs
+    # Primary data processing library for big data (100GB+).
+    # Floor is 1.30.0, not 1.0.0: below 1.25 `collect(engine="streaming")` is
+    # swallowed by polars' **kwargs and silently runs the in-memory engine (the
+    # exact OOM this library exists to prevent), `pl.PartitionMaxSize` does not
+    # exist below 1.25.2 nor accept `file_path` below 1.27, and 1.27-1.29 panic
+    # inside the streaming parquet reader. 1.30.0 is the lowest version on which
+    # tests/test_polars_streaming.py and tests/test_analytics.py are green.
+    "polars>=1.30.0",
     "sqlalchemy>=2.0.27",
     "pyarrow>=19.0.0",
     "openpyxl>=3.1.2",
@@ -55,12 +61,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# pandas is no longer on the hot path: nothing in qalita_core imports it at
+# module level, and a pack that uses Polars must not pay for it. Install
+# qalita_core[pandas] for the legacy DataFrame entry points
+# (aggregation.add_df, pandas_sanitization) or for a pack wrapping a
+# pandas-only third party.
+pandas = [
+    "pandas>=2.2.0",
+]
 dev = [
+    "pandas>=2.2.0",
     "flake8>=3.8.1,<8.0",
     "pylint>=2.17.4",
     "black>=23.3.0",
     "pre-commit>=3.3.3",
     "pytest>=7.4.0",
+    # tests/test_release_contract.py reads pyproject/properties/workflow files.
+    # These three arrive transitively today; declared here so the guard cannot
+    # start erroring out because an unrelated dependency dropped them.
+    "pyyaml>=6.0",
+    "packaging>=23.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [build-system]
@@ -74,3 +95,12 @@ include = ["version.json"]
 [tool.black]
 line-length = 79
 target-version = ["py313"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    # Memory-ceiling tests. They run a small dataset by default; set
+    # QALITA_BIGDATA_ROWS to make them meaningful, and deselect with
+    # `-m "not slow"` when you only want the semantic suite.
+    "slow: exercises the streaming engine against a large generated dataset",
+]

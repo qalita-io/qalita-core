@@ -3,10 +3,11 @@
 """
 
 import os
+import re
 import json
 import base64
 import logging
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 from qalita_core.data_source_opener import (
     get_data_source,
     cleanup_parquet_files,
@@ -16,17 +17,26 @@ import math
 from decimal import Decimal
 import datetime as _dt
 
-# Polars support for big data (100GB+)
-try:
-    import polars as pl
+# Polars is a hard requirement of qalita_core: it is how packs read data at all.
+# It is deliberately imported unguarded so a broken install fails loudly here
+# rather than silently degrading to a pandas path that cannot stream.
+import polars as pl
 
-    POLARS_AVAILABLE = True
-except ImportError:
-    pl = None  # type: ignore
-    POLARS_AVAILABLE = False
+POLARS_AVAILABLE = True
 
 if TYPE_CHECKING:
     import polars as pl
+
+
+# `<source>_<object>_part_<n>.parquet` — written by
+# data_source_opener._build_parquet_path. The base name identifies the logical
+# object the parts belong to.
+_PART_SUFFIX = re.compile(r"_part_\d+\.parquet$", re.IGNORECASE)
+
+
+def _object_key(path: str) -> str:
+    """Logical object name a parquet part belongs to."""
+    return _PART_SUFFIX.sub("", os.path.basename(path))
 
 
 class Pack:
@@ -77,6 +87,12 @@ class Pack:
         self.paths_target = None
         self.df_source = None
         self.df_target = None
+        # Logical object name -> its parquet parts. Built by load_data(). This
+        # mapping is what makes zip(table_names, parquet_paths) unnecessary: the
+        # pairing is recorded at load time instead of guessed afterwards, which
+        # is how chunks 2..N used to be silently dropped or relabelled.
+        self.objects_source: Dict[str, List[str]] = {}
+        self.objects_target: Dict[str, List[str]] = {}
 
         # Validate configurations
         if not self.source_config:
@@ -190,124 +206,161 @@ class Pack:
             "_trigger": trigger,
         }
         paths = ds.get_data(table_or_query, pack_config=effective_pack_conf)
+        objects = self._group_by_object(ds, paths)
         if trigger == "source":
             # Keep legacy attribute names for backward compatibility
             self.paths_source = paths
             self.df_source = paths
+            self.objects_source = objects
             return self.paths_source
         elif trigger == "target":
             self.paths_target = paths
             self.df_target = paths
+            self.objects_target = objects
             return self.paths_target
 
-    def scan_data(self, trigger: str) -> "pl.LazyFrame":
-        """
-        Return a Polars LazyFrame for streaming data processing.
+    @staticmethod
+    def _group_by_object(ds, paths: List[str]) -> Dict[str, List[str]]:
+        """Map each logical object to the parquet parts that hold it.
 
-        This is the recommended method for big data (100GB+) as it uses
-        lazy evaluation and streaming to process data without loading
-        everything into memory.
+        A source that records the mapping while writing wins; otherwise it is
+        recovered from the part file names, which encode the object they came
+        from.
+        """
+        recorded = getattr(ds, "object_paths", None)
+        if isinstance(recorded, dict) and recorded:
+            return {name: list(parts) for name, parts in recorded.items()}
+
+        grouped: Dict[str, List[str]] = {}
+        for path in paths or []:
+            if not isinstance(path, str):
+                continue
+            grouped.setdefault(_object_key(path), []).append(path)
+        return grouped
+
+    def _objects(self, trigger: str) -> Dict[str, List[str]]:
+        if trigger not in ("source", "target"):
+            raise ValueError(
+                f"trigger must be 'source' or 'target', got {trigger!r}"
+            )
+        objects = (
+            self.objects_source if trigger == "source" else self.objects_target
+        )
+        if not objects:
+            raise RuntimeError(
+                f"No data loaded for trigger '{trigger}'. "
+                f"Call load_data('{trigger}') first."
+            )
+        return objects
+
+    def tables(self, trigger: str) -> List[str]:
+        """Logical objects available for a trigger, in load order.
+
+        For a single-table source this is a one-element list. For a database
+        scanned with ``*`` it is one entry per table.
+        """
+        return list(self._objects(trigger).keys())
+
+    def scan(
+        self, trigger: str, table: Optional[str] = None
+    ) -> "pl.LazyFrame":
+        """Lazily scan every parquet part of one logical object.
+
+        This is the only door through which a pack should reach data. Nothing is
+        read here — the returned LazyFrame is a query plan, and the parts of a
+        chunked object are seen by Polars as one dataset, so the streaming
+        engine owns the cross-chunk state instead of the pack.
 
         Args:
-            trigger: "source" or "target"
-
-        Returns:
-            Polars LazyFrame for deferred/streaming execution.
+            trigger: "source" or "target".
+            table: which object to scan. May be omitted only when the trigger
+                holds exactly one object; with several, omitting it raises
+                rather than silently picking the first one.
 
         Example:
             ```python
             with Pack() as pack:
                 pack.load_data("source")
-                lf = pack.scan_data("source")
-
-                # Streaming aggregation (memory efficient)
-                stats = lf.select([
-                    pl.len().alias("row_count"),
-                    pl.all().is_not_null().sum()
-                ]).collect(engine="streaming")
+                stats = analytics.agg(pack.scan("source"), {
+                    "rows": pl.len(),
+                    "nulls": pl.col("email").null_count(),
+                })
             ```
-
-        Raises:
-            ImportError: If Polars is not installed
-            RuntimeError: If data has not been loaded yet
         """
-        if not POLARS_AVAILABLE:
-            raise ImportError(
-                "Polars is required for scan_data(). "
-                "Install with: pip install polars>=1.0.0"
-            )
+        objects = self._objects(trigger)
 
+        if table is None:
+            if len(objects) > 1:
+                raise ValueError(
+                    f"'{trigger}' holds {len(objects)} objects "
+                    f"({', '.join(sorted(objects))}). Pass table= to choose "
+                    f"one, or iterate over pack.tables('{trigger}')."
+                )
+            table = next(iter(objects))
+
+        parts = objects.get(table)
+        if not parts:
+            raise KeyError(
+                f"unknown object {table!r} for trigger '{trigger}'. "
+                f"Available: {', '.join(sorted(objects))}"
+            )
+        return pl.scan_parquet(parts)
+
+    def scan_all(self, trigger: str) -> Dict[str, "pl.LazyFrame"]:
+        """One LazyFrame per logical object, keyed by object name."""
+        return {
+            name: pl.scan_parquet(parts)
+            for name, parts in self._objects(trigger).items()
+        }
+
+    def schema(
+        self, trigger: str, table: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Column names and dtypes, read from the parquet footers.
+
+        No data page is touched, so this is effectively free whatever the
+        dataset size — which is the whole of what schema_scanner_pack needs.
+        """
+        return dict(self.scan(trigger, table).collect_schema())
+
+    def scan_data(self, trigger: str) -> "pl.LazyFrame":
+        """Lazily scan every parquet part of every object for a trigger.
+
+        Kept for packs written against the previous API. Prefer
+        :meth:`scan`, which is explicit about which object it reads and cannot
+        silently concatenate unrelated tables.
+        """
         paths = self.paths_source if trigger == "source" else self.paths_target
         if not paths:
             raise RuntimeError(
                 f"No data loaded for trigger '{trigger}'. "
                 f"Call load_data('{trigger}') first."
             )
-
-        # Scan parquet files lazily (does not load into memory)
         return pl.scan_parquet(paths)
 
-    def get_row_count(self, trigger: str) -> int:
-        """
-        Get row count efficiently without loading all data into memory.
-
-        Uses Polars streaming if available, falls back to parquet metadata.
-
-        Args:
-            trigger: "source" or "target"
-
-        Returns:
-            Total number of rows across all parquet files.
-        """
-        paths = self.paths_source if trigger == "source" else self.paths_target
-        if not paths:
+    def get_row_count(self, trigger: str, table: Optional[str] = None) -> int:
+        """Exact row count, answered from parquet footers."""
+        objects = (
+            self.objects_source if trigger == "source" else self.objects_target
+        )
+        if not objects:
             return 0
-
-        if POLARS_AVAILABLE:
-            try:
-                lf = pl.scan_parquet(paths)
-                return lf.select(pl.len()).collect(engine="streaming").item()
-            except Exception:
-                pass
-
-        # Fallback: read parquet metadata
-        try:
-            import pyarrow.parquet as pq
-
-            total = 0
-            for path in paths:
-                pf = pq.ParquetFile(path)
-                total += pf.metadata.num_rows
-            return total
-        except Exception:
-            return 0
-
-    def estimate_memory_mb(self, trigger: str) -> float:
-        """
-        Estimate memory required to load all data into memory.
-
-        Useful for deciding whether to use streaming or full load.
-
-        Args:
-            trigger: "source" or "target"
-
-        Returns:
-            Estimated memory in megabytes.
-        """
-        paths = self.paths_source if trigger == "source" else self.paths_target
-        if not paths:
-            return 0.0
-
-        # Sum file sizes as rough estimate (parquet is compressed)
-        total_bytes = 0
-        for path in paths:
-            try:
-                total_bytes += os.path.getsize(path)
-            except OSError:
-                pass
-
-        # Multiply by ~3-5x for decompression overhead
-        return (total_bytes * 4) / (1024 * 1024)
+        if table is None and len(objects) > 1:
+            return sum(
+                int(
+                    pl.scan_parquet(parts)
+                    .select(pl.len())
+                    .collect(engine="streaming")
+                    .item()
+                )
+                for parts in objects.values()
+            )
+        return int(
+            self.scan(trigger, table)
+            .select(pl.len())
+            .collect(engine="streaming")
+            .item()
+        )
 
 
 class ConfigLoader:

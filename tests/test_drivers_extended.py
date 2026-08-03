@@ -906,6 +906,36 @@ class TestHelperFunctionsExtended:
         result = _build_base_name("source", "Table Name with spaces!")
         assert " " not in result or "_" in result
 
+    def test_object_base_name_disambiguates_colliding_slugs(self):
+        """Two objects whose names slugify alike get two base names.
+
+        The base name is the part-file prefix and the object key at once, so
+        handing the same one to two objects makes the second overwrite the
+        first one's parts. Names that do not collide keep the plain slug —
+        packs and stored metrics are keyed on it.
+        """
+        from qalita_core.data_source_opener import FileSource
+
+        source = FileSource("unused")
+
+        assert (
+            source._object_base_name("elasticsearch", "logs-2024.01")
+            == "elasticsearch_logs_2024_01"
+        )
+        # Asking again for the same index is not a collision.
+        assert (
+            source._object_base_name("elasticsearch", "logs-2024.01")
+            == "elasticsearch_logs_2024_01"
+        )
+
+        other = source._object_base_name("elasticsearch", "logs_2024_01")
+        assert other != "elasticsearch_logs_2024_01"
+        assert other.startswith("elasticsearch_logs_2024_01_")
+        # Stable: the suffix is derived from the raw name, not from the order.
+        assert (
+            source._object_base_name("elasticsearch", "logs_2024_01") == other
+        )
+
     def test_build_parquet_path_format(self, tmp_path):
         """Test parquet path format."""
         path = _build_parquet_path(str(tmp_path), "test", 5)

@@ -1,44 +1,863 @@
 """
 # QALITA (c) COPYRIGHT 2025 - ALL RIGHTS RESERVED -
 
-Polars-based I/O utilities for streaming large datasets (100GB+).
+Loader-side streaming helpers.
 
-This module provides memory-efficient data loading using Polars lazy evaluation
-and streaming capabilities. It replaces pandas-based loading for better performance
-with large datasets.
+``data_source_opener`` turns a source into Parquet parts; this module holds the
+mechanics it uses to do that without ever holding a dataset in memory. Three
+invariants matter more than anything else here:
+
+1. **One pinned Arrow schema per logical object.** A writer that infers its own
+   dtypes per part lets ``*_part_1`` type a column ``Int64`` and ``*_part_7``
+   ``String``; ``pl.scan_parquet(parts)`` then raises ``SchemaError`` on exactly
+   the large datasets this module exists for. The schema is decided once, up
+   front, and every batch is cast to it.
+
+2. **Nothing accumulates.** Every writer here consumes an iterator and forgets
+   each batch as soon as it is on disk. The only bounded buffer is one chunk.
+
+3. **Disk is checked before it is filled.** A 100 GiB source stages to tens of
+   GiB; running the volume to zero mid-load leaves a half-written dataset and an
+   unusable worker.
+
+The previous version of this module exported fake-lazy helpers (``scan_excel``,
+``scan_json`` and ``read_database_streaming`` all read the whole source, then
+called ``.lazy()`` on it) plus ``stream_to_parquet_chunks``, which re-executed
+the query plan once per slice — writing N parts meant N full scans of the
+source. Nothing imported any of them, and ``data_source_opener`` had grown its
+own drifting copies instead; those copies now live here, once.
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Union, Iterator
+import datetime as _dt
+import json
 import logging
+import os
+import shutil
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
-try:
-    import polars as pl
-
-    POLARS_AVAILABLE = True
-except ImportError:
-    POLARS_AVAILABLE = False
-    pl = None  # type: ignore
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "DEFAULT_CHUNK_ROWS",
+    "DEFAULT_FETCH_ROWS",
+    "DEFAULT_MIN_FREE_BYTES",
+    "InsufficientDiskSpaceError",
+    "ParquetPartWriter",
+    "SchemaDriftError",
+    "arrow_type_hints",
+    "check_disk_space",
+    "iter_excel_rows",
+    "iter_json_array",
+    "part_path",
+    "scan_csv",
+    "scan_ndjson",
+    "scan_parquet",
+    "sink_parts",
+    "sniff_json_format",
+    "stream_sql_to_parquet",
+    "stream_to_parquet",
+    "write_arrow_batches",
+    "write_dict_rows",
+    "write_row_batches",
+]
 
-# Default configuration
+
+# Rows per Parquet part file, and per row group inside it. Parts are what makes
+# a load restartable and what bounds the writer's memory.
 DEFAULT_CHUNK_ROWS = 100_000
-DEFAULT_ROW_GROUP_SIZE = 100_000
-MAX_ROWS_FOR_FULL_LOAD = 10_000_000  # 10M rows threshold for streaming
+
+# Rows pulled from a driver at a time. Smaller than a part on purpose: this is
+# what is alive in Python, and a driver row costs an order of magnitude more
+# there than in an Arrow buffer.
+DEFAULT_FETCH_ROWS = 10_000
+
+# Refuse to start (or to open another part) with less than this much free space
+# on the staging volume. Two thirds of a GiB is roughly one 100k-row part of a
+# wide table plus the room Parquet needs to close it.
+DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024
+
+# Compression is pinned so that every path in the loader produces the same kind
+# of file. The pandas path used to write snappy silently while the Polars path
+# wrote zstd, which made part files of the same object differ in size by 3x.
+PARQUET_COMPRESSION = "zstd"
 
 
-def ensure_polars() -> None:
-    """Raise ImportError if polars is not available."""
-    if not POLARS_AVAILABLE:
-        raise ImportError(
-            "polars is required for big data processing. "
-            "Install with: pip install polars>=1.0.0"
+class InsufficientDiskSpaceError(RuntimeError):
+    """The staging volume cannot hold what is about to be written."""
+
+
+class SchemaDriftError(RuntimeError):
+    """A batch could not be cast to the object's pinned schema.
+
+    Raised instead of writing a part with a different schema: the divergence
+    would only surface later, as a ``SchemaError`` from ``pl.scan_parquet`` over
+    the parts, with nothing left to say which part introduced it.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Paths and disk
+# ---------------------------------------------------------------------------
+
+
+def part_path(output_dir: str, base_name: str, part_index: int) -> str:
+    """Path of one part file. ``Pack`` recovers the object name from this."""
+    return os.path.join(output_dir, f"{base_name}_part_{part_index}.parquet")
+
+
+def check_disk_space(
+    directory: str,
+    estimated_bytes: Optional[int] = None,
+    *,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+) -> int:
+    """Refuse to stage data that will not fit, before writing a single byte.
+
+    Returns the number of free bytes so callers can log it.
+    """
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(directory).free
+
+    if estimated_bytes and free < estimated_bytes:
+        raise InsufficientDiskSpaceError(
+            f"staging to {directory} needs about "
+            f"{estimated_bytes / 2**30:.1f} GiB but only "
+            f"{free / 2**30:.1f} GiB are free. Point "
+            f"'parquet_output_dir' at a larger volume, or restrict the load "
+            f"with a table name or a SQL query."
         )
+    if free < min_free_bytes:
+        raise InsufficientDiskSpaceError(
+            f"only {free / 2**20:.0f} MiB free on the volume holding "
+            f"{directory}; at least {min_free_bytes / 2**20:.0f} MiB are "
+            f"required to stage a source safely."
+        )
+    return free
+
+
+# ---------------------------------------------------------------------------
+# Schema pinning
+# ---------------------------------------------------------------------------
+
+
+# Python types are what every DB-API driver and every SQLAlchemy dialect agree
+# on, so the hint is derived from those rather than from dialect-specific SQL
+# types. The Arrow types chosen here are the ones Polars itself produces, which
+# keeps the common case cast-free.
+_PYTHON_TO_ARROW = {
+    bool: pa.bool_(),
+    int: pa.int64(),
+    float: pa.float64(),
+    str: pa.large_string(),
+    bytes: pa.large_binary(),
+    _dt.datetime: pa.timestamp("us"),
+    _dt.date: pa.date32(),
+    _dt.time: pa.time64("us"),
+}
+
+
+def arrow_type_hints(columns: Iterable[Any]) -> Dict[str, "pa.DataType"]:
+    """Arrow types for SQLAlchemy column descriptions, best effort.
+
+    Used to type columns that are entirely NULL in the first batch. Without it
+    such a column is inferred as Arrow ``null`` and every later batch that
+    actually has values fails to cast into it.
+    """
+    hints: Dict[str, pa.DataType] = {}
+    for column in columns or []:
+        try:
+            name = column["name"]
+            python_type = column["type"].python_type
+        except Exception:  # noqa: BLE001 - exotic dialect types have none
+            continue
+        arrow_type = _PYTHON_TO_ARROW.get(python_type)
+        if arrow_type is not None:
+            hints[name] = arrow_type
+    return hints
+
+
+def _pin_schema(
+    schema: "pa.Schema",
+    type_hints: Optional[Dict[str, "pa.DataType"]] = None,
+) -> "pa.Schema":
+    """Resolve the schema every part of an object will be written with.
+
+    Only columns inferred as ``null`` are overridden: an all-null first batch
+    says nothing about the column, whereas an inferred concrete type is evidence
+    from the data itself and outranks any metadata hint.
+    """
+    hints = type_hints or {}
+    fields = []
+    for field in schema:
+        if pa.types.is_null(field.type):
+            fields.append(
+                pa.field(field.name, hints.get(field.name, pa.large_string()))
+            )
+        else:
+            fields.append(field)
+    return pa.schema(fields)
+
+
+def _conform(table: "pa.Table", schema: "pa.Schema") -> "pa.Table":
+    """Cast a batch to the pinned schema, or say precisely what diverged."""
+    if table.schema.equals(schema):
+        return table
+
+    missing = [n for n in schema.names if n not in table.schema.names]
+    if missing:
+        raise SchemaDriftError(
+            f"batch is missing column(s) {missing} present in the pinned "
+            f"schema {schema.names}"
+        )
+
+    try:
+        return table.select(schema.names).cast(schema)
+    except Exception as exc:  # noqa: BLE001 - re-raised with the diff below
+        diff = [
+            f"{f.name}: {table.schema.field(f.name).type} -> {f.type}"
+            for f in schema
+            if table.schema.field(f.name).type != f.type
+        ]
+        raise SchemaDriftError(
+            f"a batch could not be cast to the schema pinned for this object "
+            f"({'; '.join(diff) or exc}). Load the object with an explicit "
+            f"query that casts the column, or split it into two objects."
+        ) from exc
+
+
+def _castable(column: Any, target: "pa.DataType") -> bool:
+    """Whether ``column`` fits ``target`` under Arrow's *checked* cast rules."""
+    try:
+        column.cast(target)
+    except Exception:  # noqa: BLE001 - any refusal means "does not fit"
+        return False
+    return True
+
+
+def _wider_types(
+    pinned: "pa.DataType", incoming: "pa.DataType"
+) -> List["pa.DataType"]:
+    """Types that could hold both the pinned column and the new batch.
+
+    The ladder is monotone and short — integer -> float64 -> text — so a
+    pathological source can trigger at most two rewrites of a column, and never
+    a rewrite back towards a narrower type. ``large_string`` is terminal: once a
+    column is text there is nothing wider to promote it to.
+    """
+    candidates: List["pa.DataType"] = []
+    if pa.types.is_integer(pinned) and (
+        pa.types.is_floating(incoming) or pa.types.is_decimal(incoming)
+    ):
+        candidates.append(pa.float64())
+    candidates.append(pa.large_string())
+    return [c for c in candidates if not c.equals(pinned)]
+
+
+def _promotions(
+    table: "pa.Table", schema: "pa.Schema"
+) -> Dict[str, List["pa.DataType"]]:
+    """Columns the batch does not fit, and the wider types that would hold it.
+
+    Empty when every divergent column can simply be cast down to the pinned
+    type, which is the ordinary case (an int32 batch into an int64 column).
+    """
+    promotions: Dict[str, List["pa.DataType"]] = {}
+    for field in schema:
+        if field.name not in table.schema.names:
+            continue
+        column = table.column(field.name)
+        if column.type.equals(field.type) or _castable(column, field.type):
+            continue
+        wider = [
+            candidate
+            for candidate in _wider_types(field.type, column.type)
+            if _castable(column, candidate)
+        ]
+        if wider:
+            promotions[field.name] = wider
+    return promotions
+
+
+def _with_types(
+    schema: "pa.Schema", types: Dict[str, "pa.DataType"]
+) -> "pa.Schema":
+    return pa.schema(
+        [pa.field(f.name, types.get(f.name, f.type)) for f in schema]
+    )
+
+
+def _batch_rows(chunk_rows: int, fetch_rows: Optional[int]) -> int:
+    """Rows held in Python at once, never more than one part."""
+    return max(1, min(int(chunk_rows), int(fetch_rows or DEFAULT_FETCH_ROWS)))
+
+
+def _as_table(data: Any) -> "pa.Table":
+    if isinstance(data, pa.Table):
+        return data
+    if isinstance(data, pa.RecordBatch):
+        return pa.Table.from_batches([data])
+    if isinstance(data, pl.DataFrame):
+        return data.to_arrow()
+    raise TypeError(
+        f"expected a pyarrow Table/RecordBatch or a polars DataFrame, got "
+        f"{type(data).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The writer
+# ---------------------------------------------------------------------------
+
+
+class ParquetPartWriter:
+    """Append Arrow batches to ``<base>_part_<n>.parquet`` files.
+
+    One ``ParquetWriter`` is open at a time and it holds a single schema, so the
+    parts of an object are readable as one dataset by construction. Parts roll
+    at exactly ``chunk_rows`` rows, which keeps the file names meaningful and
+    the peak memory equal to one batch.
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        base_name: str,
+        *,
+        schema: Optional["pa.Schema"] = None,
+        type_hints: Optional[Dict[str, "pa.DataType"]] = None,
+        chunk_rows: int = DEFAULT_CHUNK_ROWS,
+        compression: str = PARQUET_COMPRESSION,
+        min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+    ) -> None:
+        self.output_dir = output_dir
+        self.base_name = base_name
+        self.chunk_rows = max(1, int(chunk_rows))
+        self.compression = compression
+        self.min_free_bytes = min_free_bytes
+        self.type_hints = type_hints or {}
+        self.schema = _pin_schema(schema, self.type_hints) if schema else None
+
+        self.paths: List[str] = []
+        self._writer: Optional["pq.ParquetWriter"] = None
+        self._current_path: Optional[str] = None
+        self._rows_in_part = 0
+        self._part_index = 0
+
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    def __enter__(self) -> "ParquetPartWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.close()
+        return False
+
+    def write(self, data: Any) -> None:
+        """Write one batch: a pyarrow Table/RecordBatch or a Polars DataFrame."""
+        table = _as_table(data)
+        if self.schema is None:
+            self.schema = _pin_schema(table.schema, self.type_hints)
+        if not table.schema.equals(self.schema):
+            promotions = _promotions(table, self.schema)
+            if promotions:
+                self._promote(promotions)
+        table = _conform(table, self.schema)
+
+        offset = 0
+        total = table.num_rows
+        while offset < total:
+            if self._writer is None:
+                self._open_part()
+            room = self.chunk_rows - self._rows_in_part
+            take = min(room, total - offset)
+            self._writer.write_table(
+                table.slice(offset, take), row_group_size=self.chunk_rows
+            )
+            offset += take
+            self._rows_in_part += take
+            if self._rows_in_part >= self.chunk_rows:
+                self._close_part()
+
+    def close(self) -> List[str]:
+        """Finish the object and return its parts, in order.
+
+        An object that yielded no row still gets one empty part when its schema
+        is known: downstream every object is expected to be scannable, and an
+        empty table is a legitimate answer whereas a missing file is a crash.
+        """
+        self._close_part()
+        if not self.paths and self.schema is not None:
+            self._open_part()
+            self._writer.write_table(self.schema.empty_table())
+            self._close_part()
+        return list(self.paths)
+
+    def abort(self, discard: bool = False) -> None:
+        """Close the current part after a failure.
+
+        ``discard`` also unlinks what was written. Every caller that aborts
+        re-raises, so ``get_data`` never returns those paths and
+        ``Pack.cleanup()`` — which only knows the paths ``get_data`` returned —
+        cannot delete them: without this, each failed load leaks a part on the
+        staging volume until someone notices the volume is full.
+        """
+        current = self._current_path
+        try:
+            self._close_part()
+        except Exception:  # noqa: BLE001 - the original error is the story
+            logger.exception(
+                "failed to close parquet part for %s", self.base_name
+            )
+        if not discard:
+            return
+        for path in list(dict.fromkeys([*self.paths, current])):
+            if not path:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:  # noqa: PERF203 - best effort, we are failing
+                logger.debug("could not remove partial part %s", path)
+        self.paths.clear()
+
+    def _promote(self, promotions: Dict[str, List["pa.DataType"]]) -> None:
+        """Widen the pinned schema, rewriting the parts already on disk.
+
+        Widening only the parts still to be written would leave the object with
+        two Parquet schemas, and ``pl.scan_parquet(parts)`` then raises with
+        nothing to say which part diverged — invariant #1 above. So the promotion
+        is all-or-nothing: every existing part is rewritten to the wider type
+        first, and if that cannot be done the schema stays as it was and
+        ``_conform`` raises ``SchemaDriftError`` as before.
+        """
+        levels = max(len(v) for v in promotions.values())
+        for level in range(levels):
+            widened = _with_types(
+                self.schema,
+                {
+                    name: types[min(level, len(types) - 1)]
+                    for name, types in promotions.items()
+                },
+            )
+            if widened.equals(self.schema):
+                continue
+            self._close_part()
+            if not self._rewrite_parts(widened):
+                continue
+            for field in widened:
+                old = self.schema.field(field.name).type
+                if not old.equals(field.type):
+                    logger.warning(
+                        "%s: column %r holds values that do not fit %s; the "
+                        "object is being rewritten as %s. Metrics computed on "
+                        "that column change accordingly.",
+                        self.base_name,
+                        field.name,
+                        old,
+                        field.type,
+                    )
+            self.schema = widened
+            return
+
+    def _rewrite_parts(self, schema: "pa.Schema") -> bool:
+        """Recast every part already written to ``schema``. All or nothing.
+
+        Each part is streamed through a temporary file so a failure halfway
+        leaves the object exactly as it was; the temporaries also mean the
+        rewrite transiently needs one extra part's worth of space, which is why
+        the disk guard runs first.
+        """
+        if not self.paths:
+            return True
+        check_disk_space(self.output_dir, min_free_bytes=self.min_free_bytes)
+        rewritten: List[tuple] = []
+        batch_rows = _batch_rows(self.chunk_rows, None)
+        try:
+            for path in self.paths:
+                temporary = f"{path}.widening"
+                rewritten.append((path, temporary))
+                reader = pq.ParquetFile(path)
+                writer = pq.ParquetWriter(
+                    temporary, schema, compression=self.compression
+                )
+                try:
+                    for batch in reader.iter_batches(batch_size=batch_rows):
+                        writer.write_table(
+                            _conform(pa.Table.from_batches([batch]), schema),
+                            row_group_size=self.chunk_rows,
+                        )
+                finally:
+                    writer.close()
+                    reader.close()
+        except Exception:  # noqa: BLE001 - the caller falls back or raises
+            logger.debug(
+                "could not rewrite the parts of %s as %s",
+                self.base_name,
+                schema,
+                exc_info=True,
+            )
+            for _, temporary in rewritten:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            return False
+
+        for path, temporary in rewritten:
+            os.replace(temporary, path)
+        return True
+
+    def _open_part(self) -> None:
+        check_disk_space(self.output_dir, min_free_bytes=self.min_free_bytes)
+        self._part_index += 1
+        path = part_path(self.output_dir, self.base_name, self._part_index)
+        self._writer = pq.ParquetWriter(
+            path, self.schema, compression=self.compression
+        )
+        self._current_path = path
+        self._rows_in_part = 0
+
+    def _close_part(self) -> None:
+        if self._writer is None:
+            return
+        self._writer.close()
+        self._writer = None
+        self.paths.append(self._current_path)
+        self._rows_in_part = 0
+
+
+# ---------------------------------------------------------------------------
+# Producers -> parts
+# ---------------------------------------------------------------------------
+
+
+def write_arrow_batches(
+    batches: Iterable[Any],
+    output_dir: str,
+    base_name: str,
+    *,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    schema: Optional["pa.Schema"] = None,
+    type_hints: Optional[Dict[str, "pa.DataType"]] = None,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+) -> List[str]:
+    """Drain an iterator of Arrow batches into part files."""
+    writer = ParquetPartWriter(
+        output_dir,
+        base_name,
+        schema=schema,
+        type_hints=type_hints,
+        chunk_rows=chunk_rows,
+        min_free_bytes=min_free_bytes,
+    )
+    try:
+        for batch in batches:
+            if batch is None:
+                continue
+            writer.write(batch)
+    except Exception:
+        writer.abort(discard=True)
+        raise
+    return writer.close()
+
+
+def write_row_batches(
+    rows: Iterable[Sequence[Any]],
+    columns: Sequence[str],
+    output_dir: str,
+    base_name: str,
+    *,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    fetch_rows: Optional[int] = None,
+    type_hints: Optional[Dict[str, "pa.DataType"]] = None,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+) -> List[str]:
+    """Drain a DB-API style row iterator into part files, column-major.
+
+    Row-major buffering (one Python dict per row, then a DataFrame per chunk) is
+    what made the cursor-driven drivers allocate ``chunk_rows`` dicts per batch.
+    Building one list per column and handing them to Arrow costs one list per
+    column instead, and lets the schema be pinned on the first batch. The Python
+    buffer holds ``fetch_rows`` rows, not a whole part: part size is a layout
+    decision and should not set the memory bill.
+    """
+    names = list(columns)
+    batch_rows = _batch_rows(chunk_rows, fetch_rows)
+    writer = ParquetPartWriter(
+        output_dir,
+        base_name,
+        type_hints=type_hints,
+        chunk_rows=chunk_rows,
+        min_free_bytes=min_free_bytes,
+    )
+    try:
+        buffer: List[List[Any]] = [[] for _ in names]
+        buffered = 0
+        for row in rows:
+            for index, value in enumerate(row):
+                if index < len(buffer):
+                    buffer[index].append(_arrow_safe(value))
+            buffered += 1
+            if buffered >= batch_rows:
+                writer.write(_columns_to_table(names, buffer, writer.schema))
+                buffer = [[] for _ in names]
+                buffered = 0
+        if buffered:
+            writer.write(_columns_to_table(names, buffer, writer.schema))
+    except Exception:
+        writer.abort(discard=True)
+        raise
+    return writer.close()
+
+
+def write_dict_rows(
+    documents: Iterable[Dict[str, Any]],
+    output_dir: str,
+    base_name: str,
+    *,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    fetch_rows: Optional[int] = None,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+) -> List[str]:
+    """Drain schemaless documents (MongoDB, Elasticsearch) into part files.
+
+    The column set is fixed by the first batch. Keys that only appear later are
+    dropped with a warning rather than silently widening part N and not part 1 —
+    that widening is the schema drift that makes the parts unreadable together.
+    """
+    batch_rows = _batch_rows(chunk_rows, fetch_rows)
+    writer = ParquetPartWriter(
+        output_dir,
+        base_name,
+        chunk_rows=chunk_rows,
+        min_free_bytes=min_free_bytes,
+    )
+    names: Optional[List[str]] = None
+    dropped: set = set()
+    try:
+        buffer: List[Dict[str, Any]] = []
+        for document in documents:
+            buffer.append(document)
+            if len(buffer) < batch_rows:
+                continue
+            names = names or _union_keys(buffer)
+            _note_unknown_keys(buffer, names, dropped, base_name)
+            writer.write(_documents_to_table(names, buffer, writer.schema))
+            buffer = []
+        if buffer:
+            names = names or _union_keys(buffer)
+            _note_unknown_keys(buffer, names, dropped, base_name)
+            writer.write(_documents_to_table(names, buffer, writer.schema))
+    except Exception:
+        writer.abort(discard=True)
+        raise
+    return writer.close()
+
+
+def _union_keys(documents: Sequence[Dict[str, Any]]) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for document in documents:
+        for key in document:
+            if key not in seen:
+                seen.add(key)
+                names.append(str(key))
+    return names
+
+
+def _note_unknown_keys(
+    documents: Sequence[Dict[str, Any]],
+    names: Sequence[str],
+    dropped: set,
+    base_name: str,
+) -> None:
+    known = set(names)
+    for document in documents:
+        for key in document:
+            if key not in known and key not in dropped:
+                dropped.add(key)
+                logger.warning(
+                    "%s: field %r appears after the first chunk and is not "
+                    "part of the pinned schema; it is not exported",
+                    base_name,
+                    key,
+                )
+
+
+def _arrow_safe(value: Any) -> Any:
+    """Make a driver value representable in a stable Arrow column.
+
+    Nested documents and arrays are the reason a per-chunk inferred schema
+    drifts; JSON is a representation Arrow can type identically in every part.
+    """
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, default=str)
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (str, bytes, bool, int, float, type(None))):
+        return value
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return value
+    return str(value)
+
+
+def _columns_to_table(
+    names: Sequence[str],
+    columns: Sequence[Sequence[Any]],
+    schema: Optional["pa.Schema"],
+) -> "pa.Table":
+    arrays = []
+    for index, name in enumerate(names):
+        target = (
+            schema.field(name).type
+            if schema is not None and name in schema.names
+            else None
+        )
+        arrays.append(_safe_array(columns[index], target))
+    return pa.Table.from_arrays(arrays, names=list(names))
+
+
+def _documents_to_table(
+    names: Sequence[str],
+    documents: Sequence[Dict[str, Any]],
+    schema: Optional["pa.Schema"],
+) -> "pa.Table":
+    columns = [
+        [_arrow_safe(document.get(name)) for document in documents]
+        for name in names
+    ]
+    return _columns_to_table(names, columns, schema)
+
+
+def _safe_array(
+    values: Sequence[Any], target: Optional["pa.DataType"]
+) -> "pa.Array":
+    """Build an Arrow array, falling back to text when the values are mixed.
+
+    A driver that returns an int for some rows and a string for others would
+    otherwise abort the whole load; representing that column as text keeps every
+    part of the object identically typed, which is what makes them scannable.
+
+    The array is built untyped and *then* cast, never handed to
+    ``pa.array(values, type=target)``: pyarrow's Python-sequence converter is
+    unsafe, so ``pa.array([19.99], type=pa.int64())`` silently returns ``19``
+    while ``pa.array([19.99]).cast(pa.int64())`` refuses. A spreadsheet or Mongo
+    collection whose first batch happens to hold whole numbers would otherwise
+    have every later decimal floored, with no warning anywhere.
+
+    A batch that does not fit the pinned type is returned as it is, so the
+    writer can widen the object's schema (or ``_conform`` can name the column);
+    deciding that here is impossible, since the parts already on disk have to be
+    rewritten with it.
+    """
+    errors = (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError)
+    try:
+        array = pa.array(values)
+    except errors:
+        array = pa.array(
+            [None if v is None else str(v) for v in values],
+            type=pa.large_string(),
+        )
+    if target is None or array.type == target:
+        return array
+    try:
+        return array.cast(target)
+    except errors:
+        if pa.types.is_large_string(target) or pa.types.is_string(target):
+            # A column already pinned as text takes anything, including the
+            # shapes Arrow refuses to cast (a nested value among scalars).
+            return pa.array(
+                [None if v is None else str(v) for v in values], type=target
+            )
+        return array
+
+
+# ---------------------------------------------------------------------------
+# SQL
+# ---------------------------------------------------------------------------
+
+
+def stream_sql_to_parquet(
+    engine: Any,
+    sql: str,
+    output_dir: str,
+    base_name: str,
+    *,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    fetch_rows: Optional[int] = None,
+    type_hints: Optional[Dict[str, "pa.DataType"]] = None,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+) -> List[str]:
+    """Stream a SQL result set to Parquet parts.
+
+    ``stream_results``/``yield_per`` ask the DBAPI driver for a server-side
+    cursor, which is the only way the client does not buffer the whole result
+    set first. ``pandas.read_sql(..., chunksize=N)`` chunks client-side only:
+    psycopg2, pymysql and pymssql have already materialized every row before
+    pandas yields the first chunk, so a 100 GiB table dies inside libpq without
+    Python seeing a row.
+
+    Not every driver honours it — sqlite3, pymssql and most warehouse HTTP
+    drivers ignore the option — and for those this is no worse than before while
+    still writing Arrow batches straight to disk instead of building DataFrames.
+
+    ``fetch_rows`` is deliberately separate from ``chunk_rows``: how many rows
+    are alive at once is a memory question, how many rows go in a file is a
+    layout question, and tying them together taxes the first for the second.
+    Fetching 10k rows into 100k-row parts measured at a third of the peak RSS of
+    fetching 100k.
+    """
+    check_disk_space(output_dir, min_free_bytes=min_free_bytes)
+    batch_rows = _batch_rows(chunk_rows, fetch_rows)
+
+    with engine.connect().execution_options(
+        stream_results=True, yield_per=batch_rows
+    ) as connection:
+        batches = pl.read_database(
+            sql,
+            connection,
+            iter_batches=True,
+            batch_size=batch_rows,
+            # Infer over the whole batch rather than its first 100 rows: a
+            # column that is null in the first rows and populated later in the
+            # same batch would otherwise be typed as Null.
+            infer_schema_length=None,
+        )
+        writer = ParquetPartWriter(
+            output_dir,
+            base_name,
+            type_hints=type_hints,
+            chunk_rows=chunk_rows,
+            min_free_bytes=min_free_bytes,
+        )
+        try:
+            for batch in batches:
+                writer.write(batch)
+        except Exception:
+            writer.abort(discard=True)
+            raise
+        if writer.schema is None and type_hints:
+            # An empty result set yields no batch at all, so the schema can only
+            # come from the metadata; write the empty object rather than nothing.
+            writer.schema = pa.schema(
+                [pa.field(n, t) for n, t in type_hints.items()]
+            )
+        return writer.close()
+
+
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
 
 
 def scan_csv(
@@ -50,28 +869,9 @@ def scan_csv(
     ignore_errors: bool = True,
     **kwargs: Any,
 ) -> "pl.LazyFrame":
-    """
-    Create a lazy scan of a CSV file for streaming processing.
-
-    This does NOT load data into memory - it creates a query plan
-    that will be executed when .collect() or .sink_parquet() is called.
-
-    Args:
-        file_path: Path to the CSV file
-        skip_rows: Number of rows to skip at the beginning
-        encoding: File encoding (default: utf8). Must be 'utf8' or 'utf8-lossy'
-        infer_schema_length: Number of rows to use for schema inference
-        ignore_errors: Whether to ignore parsing errors
-        **kwargs: Additional arguments passed to pl.scan_csv()
-
-    Returns:
-        LazyFrame for deferred execution
-    """
-    ensure_polars()
-    # Normalize encoding name for Polars (utf-8 -> utf8)
+    """Lazily scan a CSV. Nothing is read until the plan is executed."""
     if encoding.lower() in ("utf-8", "utf_8"):
         encoding = "utf8"
-
     return pl.scan_csv(
         file_path,
         skip_rows=skip_rows,
@@ -82,400 +882,216 @@ def scan_csv(
     )
 
 
-def scan_parquet(
-    source: Union[str, List[str], Path],
-    **kwargs: Any,
-) -> "pl.LazyFrame":
-    """
-    Create a lazy scan of Parquet file(s) for streaming processing.
+def scan_ndjson(file_path: str, **kwargs: Any) -> "pl.LazyFrame":
+    """Lazily scan newline-delimited JSON."""
+    return pl.scan_ndjson(file_path, **kwargs)
 
-    Args:
-        source: Path to parquet file, list of paths, or glob pattern
-        **kwargs: Additional arguments passed to pl.scan_parquet()
 
-    Returns:
-        LazyFrame for deferred execution
-    """
-    ensure_polars()
+def scan_parquet(source: Any, **kwargs: Any) -> "pl.LazyFrame":
+    """Lazily scan Parquet file(s), local or remote."""
     return pl.scan_parquet(source, **kwargs)
-
-
-def scan_excel(
-    file_path: str,
-    *,
-    sheet_name: Optional[str] = None,
-    skip_rows: int = 0,
-    **kwargs: Any,
-) -> "pl.LazyFrame":
-    """
-    Read Excel file and return as LazyFrame.
-
-    Note: Excel files cannot be truly streamed, but we minimize memory
-    by reading directly into Polars format without pandas intermediate.
-
-    Args:
-        file_path: Path to the Excel file
-        sheet_name: Name of sheet to read (None for first sheet)
-        skip_rows: Number of rows to skip
-        **kwargs: Additional arguments
-
-    Returns:
-        LazyFrame for deferred execution
-    """
-    ensure_polars()
-    # Polars read_excel returns DataFrame, we convert to lazy
-    df = pl.read_excel(
-        file_path,
-        sheet_name=sheet_name,
-        read_options={"skip_rows": skip_rows} if skip_rows else None,
-        **kwargs,
-    )
-    return df.lazy()
-
-
-def scan_json(
-    file_path: str,
-    *,
-    ndjson: bool = False,
-    **kwargs: Any,
-) -> "pl.LazyFrame":
-    """
-    Create a lazy scan of JSON/NDJSON file.
-
-    Args:
-        file_path: Path to the JSON file
-        ndjson: If True, treat as newline-delimited JSON (streamable)
-        **kwargs: Additional arguments
-
-    Returns:
-        LazyFrame for deferred execution
-    """
-    ensure_polars()
-    if ndjson:
-        return pl.scan_ndjson(file_path, **kwargs)
-    else:
-        # Regular JSON must be read fully, then converted to lazy
-        df = pl.read_json(file_path, **kwargs)
-        return df.lazy()
 
 
 def stream_to_parquet(
     lf: "pl.LazyFrame",
     output_path: str,
     *,
-    row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
-    compression: str = "zstd",
+    row_group_size: int = DEFAULT_CHUNK_ROWS,
+    compression: str = PARQUET_COMPRESSION,
     **kwargs: Any,
 ) -> str:
-    """
-    Stream a LazyFrame to a Parquet file using Polars streaming engine.
-
-    This processes data in batches without loading everything into memory.
-
-    Args:
-        lf: LazyFrame to write
-        output_path: Destination path for parquet file
-        row_group_size: Number of rows per row group (affects memory usage)
-        compression: Compression algorithm (zstd, snappy, lz4, gzip, none)
-        **kwargs: Additional arguments passed to sink_parquet()
-
-    Returns:
-        Path to the written parquet file
-    """
-    ensure_polars()
-
-    # Ensure output directory exists
+    """Sink a LazyFrame to one Parquet file without materializing it."""
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-    # Use sink_parquet for streaming write
     lf.sink_parquet(
         output_path,
         row_group_size=row_group_size,
         compression=compression,
         **kwargs,
     )
-
     return output_path
 
 
-def stream_to_parquet_chunks(
+def sink_parts(
     lf: "pl.LazyFrame",
     output_dir: str,
     base_name: str,
     *,
-    rows_per_chunk: int = DEFAULT_CHUNK_ROWS,
-    compression: str = "zstd",
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    compression: str = PARQUET_COMPRESSION,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
 ) -> List[str]:
+    """Sink a LazyFrame to ``<base>_part_<n>.parquet`` in a SINGLE pass.
+
+    The partitioned sink splits inside the engine. Slicing the plan per part
+    instead — what ``stream_to_parquet_chunks`` did — re-executes the whole plan
+    once per slice, so writing N parts meant reading the source N times.
     """
-    Stream a LazyFrame to multiple Parquet chunk files.
-
-    This is useful when downstream processing expects multiple smaller files.
-
-    Args:
-        lf: LazyFrame to write
-        output_dir: Directory for output files
-        base_name: Base name for chunk files (will be {base_name}_part_{n}.parquet)
-        rows_per_chunk: Approximate number of rows per chunk file
-        compression: Compression algorithm
-
-    Returns:
-        List of paths to written parquet files
-    """
-    ensure_polars()
-
+    check_disk_space(output_dir, min_free_bytes=min_free_bytes)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Get row count efficiently (streaming count)
-    try:
-        row_count = lf.select(pl.len()).collect(engine="streaming").item()
-    except Exception:
-        # Fallback: collect and count
-        row_count = lf.select(pl.len()).collect().item()
+    written: List[str] = []
 
-    if row_count == 0:
-        # Empty dataset - write single empty file
-        output_path = os.path.join(output_dir, f"{base_name}_part_1.parquet")
-        lf.collect().write_parquet(output_path, compression=compression)
-        return [output_path]
+    def _name(context: Any) -> str:
+        index = getattr(context, "index_in_partition", len(written))
+        name = f"{base_name}_part_{int(index) + 1}.parquet"
+        written.append(os.path.join(output_dir, name))
+        return name
 
-    # Calculate number of chunks needed
-    num_chunks = max(1, (row_count + rows_per_chunk - 1) // rows_per_chunk)
-
-    if num_chunks == 1:
-        # Single chunk - use streaming write
-        output_path = os.path.join(output_dir, f"{base_name}_part_1.parquet")
-        try:
-            lf.sink_parquet(output_path, compression=compression)
-        except Exception:
-            # Fallback if streaming fails
-            lf.collect().write_parquet(output_path, compression=compression)
-        return [output_path]
-
-    # Multiple chunks - collect and split
-    # Note: For very large datasets, consider using streaming with row limits
-    paths = []
-
-    for i in range(num_chunks):
-        offset = i * rows_per_chunk
-        chunk_lf = lf.slice(offset, rows_per_chunk)
-        output_path = os.path.join(
-            output_dir, f"{base_name}_part_{i + 1}.parquet"
-        )
-
-        try:
-            chunk_lf.sink_parquet(output_path, compression=compression)
-        except Exception:
-            # Fallback
-            chunk_lf.collect().write_parquet(
-                output_path, compression=compression
-            )
-
-        paths.append(output_path)
-
-    return paths
-
-
-def collect_streaming(
-    lf: "pl.LazyFrame",
-    *,
-    streaming: bool = True,
-) -> "pl.DataFrame":
-    """
-    Collect a LazyFrame with streaming mode when possible.
-
-    Args:
-        lf: LazyFrame to collect
-        streaming: Whether to use streaming mode (recommended for large data)
-
-    Returns:
-        Collected DataFrame
-    """
-    ensure_polars()
-    try:
-        # Use engine="streaming" for Polars 1.25+
-        if streaming:
-            return lf.collect(engine="streaming")
-        else:
-            return lf.collect()
-    except Exception:
-        # Fallback to non-streaming if streaming fails
-        logger.warning(
-            "Streaming collection failed, falling back to standard collect"
-        )
-        return lf.collect()
-
-
-def estimate_memory_usage(lf: "pl.LazyFrame") -> Dict[str, Any]:
-    """
-    Estimate memory usage for a LazyFrame without fully loading it.
-
-    Args:
-        lf: LazyFrame to analyze
-
-    Returns:
-        Dictionary with row count, column count, and estimated size
-    """
-    ensure_polars()
-
-    # Get schema without loading data
-    schema = lf.collect_schema()
-    column_count = len(schema)
-
-    # Get row count efficiently
-    try:
-        row_count = lf.select(pl.len()).collect(engine="streaming").item()
-    except Exception:
-        row_count = None
-
-    # Estimate bytes per row based on schema
-    bytes_per_row = 0
-    for dtype in schema.values():
-        if dtype in (pl.Int8, pl.UInt8, pl.Boolean):
-            bytes_per_row += 1
-        elif dtype in (pl.Int16, pl.UInt16):
-            bytes_per_row += 2
-        elif dtype in (pl.Int32, pl.UInt32, pl.Float32, pl.Date):
-            bytes_per_row += 4
-        elif dtype in (
-            pl.Int64,
-            pl.UInt64,
-            pl.Float64,
-            pl.Datetime,
-            pl.Duration,
-        ):
-            bytes_per_row += 8
-        elif dtype == pl.String:
-            bytes_per_row += 50  # Estimate for variable-length strings
-        else:
-            bytes_per_row += 8  # Default estimate
-
-    estimated_size_bytes = (
-        row_count * bytes_per_row if row_count is not None else None
+    lf.sink_parquet(
+        _partitioning(output_dir, _name, chunk_rows),
+        compression=compression,
+        row_group_size=chunk_rows,
     )
 
-    return {
-        "row_count": row_count,
-        "column_count": column_count,
-        "bytes_per_row_estimate": bytes_per_row,
-        "estimated_size_bytes": estimated_size_bytes,
-        "estimated_size_mb": (
-            estimated_size_bytes / (1024 * 1024)
-            if estimated_size_bytes is not None
-            else None
-        ),
-        "schema": {str(k): str(v) for k, v in schema.items()},
-    }
+    paths = sorted(p for p in written if os.path.exists(p))
+    if paths:
+        return _sorted_parts(paths)
+
+    # No row at all: keep the object scannable by writing its (empty) schema.
+    return [
+        stream_to_parquet(
+            lf.head(0),
+            part_path(output_dir, base_name, 1),
+            row_group_size=chunk_rows,
+            compression=compression,
+        )
+    ]
 
 
-def should_use_streaming(
-    lf: "pl.LazyFrame",
-    threshold_rows: int = MAX_ROWS_FOR_FULL_LOAD,
-) -> bool:
+def _partitioning(output_dir: str, namer: Any, chunk_rows: int) -> Any:
+    """Partitioned-sink target, across the Polars versions we support."""
+    if hasattr(pl, "PartitionBy"):
+        return pl.PartitionBy(
+            output_dir,
+            file_path_provider=namer,
+            max_rows_per_file=int(chunk_rows),
+            # Let the row count alone decide the split, so part files line up
+            # with chunk_rows instead of with an estimated in-memory size.
+            approximate_bytes_per_file=None,
+        )
+    return pl.PartitionMaxSize(
+        output_dir, file_path=namer, max_size=int(chunk_rows)
+    )
+
+
+def _sorted_parts(paths: Sequence[str]) -> List[str]:
+    def _index(path: str) -> int:
+        stem = Path(path).stem
+        try:
+            return int(stem.rsplit("_part_", 1)[1])
+        except (IndexError, ValueError):
+            return 0
+
+    return sorted(paths, key=_index)
+
+
+def sniff_json_format(file_path: str) -> str:
+    """Return ``"array"`` or ``"ndjson"`` by looking at the first token.
+
+    The loader used to take this from a ``json_lines`` config flag that defaults
+    to False, so an NDJSON file was read with ``pl.read_json`` — the whole
+    document at once — unless the caller happened to know to set it.
     """
-    Determine if streaming mode should be used based on data size.
+    with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+        while True:
+            character = handle.read(1)
+            if not character:
+                return "ndjson"
+            if not character.isspace():
+                return "array" if character == "[" else "ndjson"
 
-    Args:
-        lf: LazyFrame to check
-        threshold_rows: Row count threshold for streaming recommendation
 
-    Returns:
-        True if streaming is recommended
+def iter_json_array(
+    file_path: str, *, buffer_size: int = 1 << 20
+) -> Iterator[Any]:
+    """Yield the elements of a top-level JSON array one at a time.
+
+    ``json.load`` builds the whole document plus its Python object graph before
+    returning; a 2 GiB array of records is tens of GiB of dicts. This keeps one
+    element and one buffer alive at a time, which is all a batching writer
+    needs. It deliberately supports only the shape the loader can map to a
+    table: a top-level array.
     """
-    ensure_polars()
+    decoder = json.JSONDecoder()
+    with open(file_path, "r", encoding="utf-8") as handle:
+        buffer = handle.read(buffer_size)
+        index = _skip_space(buffer, 0)
+        if index >= len(buffer) or buffer[index] != "[":
+            raise ValueError(
+                f"{file_path} does not start with a JSON array; only "
+                f"newline-delimited JSON and top-level arrays can be streamed."
+            )
+        index += 1
 
-    try:
-        row_count = lf.select(pl.len()).collect(engine="streaming").item()
-        return row_count > threshold_rows
-    except Exception:
-        # If we can't count, assume streaming is needed
-        return True
+        while True:
+            buffer = buffer[index:]
+            index = 0
+            while True:
+                index = _skip_space(buffer, index)
+                if index < len(buffer):
+                    break
+                more = handle.read(buffer_size)
+                if not more:
+                    return
+                buffer += more
+
+            if buffer[index] == ",":
+                index += 1
+                continue
+            if buffer[index] == "]":
+                return
+
+            while True:
+                try:
+                    value, index = decoder.raw_decode(buffer, index)
+                    break
+                except ValueError:
+                    more = handle.read(buffer_size)
+                    if not more:
+                        raise
+                    buffer += more
+            yield value
 
 
-def read_database_streaming(
-    query: str,
-    connection_string: str,
-    *,
-    chunk_size: int = DEFAULT_CHUNK_ROWS,
-) -> "pl.LazyFrame":
-    """
-    Read from database with efficient memory usage.
-
-    Args:
-        query: SQL query to execute
-        connection_string: Database connection string
-        chunk_size: Not used directly (Polars handles batching internally)
-
-    Returns:
-        LazyFrame with query results
-    """
-    ensure_polars()
-
-    # Polars read_database returns DataFrame, convert to lazy
-    df = pl.read_database(query, connection_string)
-    return df.lazy()
+def _skip_space(text: str, index: int) -> int:
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
 
 
-def iter_parquet_row_groups(
+def iter_excel_rows(
     file_path: str,
-) -> Iterator["pl.DataFrame"]:
-    """
-    Iterate over row groups in a Parquet file for memory-efficient processing.
-
-    Args:
-        file_path: Path to parquet file
-
-    Yields:
-        DataFrame for each row group
-    """
-    ensure_polars()
-
-    import pyarrow.parquet as pq
-
-    parquet_file = pq.ParquetFile(file_path)
-
-    for i in range(parquet_file.metadata.num_row_groups):
-        table = parquet_file.read_row_group(i)
-        yield pl.from_arrow(table)
-
-
-def polars_to_pandas(
-    lf_or_df: Union["pl.LazyFrame", "pl.DataFrame"],
     *,
-    streaming: bool = True,
-) -> "Any":
+    skip_rows: int = 0,
+    sheet_name: Optional[str] = None,
+):
+    """Yield ``(headers, row_iterator)`` for a worksheet, row by row.
+
+    Neither Polars nor pandas can stream an xlsx: both build the whole sheet
+    before returning it. openpyxl's read-only mode is the only iterator over the
+    file, so it is the only path the loader uses for Excel.
     """
-    Convert Polars LazyFrame/DataFrame to pandas DataFrame.
+    from openpyxl import load_workbook
 
-    Use this for backward compatibility with pandas-based code.
+    workbook = load_workbook(
+        filename=file_path, read_only=True, data_only=True
+    )
+    worksheet = workbook[sheet_name] if sheet_name else workbook.active
+    if worksheet is None:
+        raise ValueError(f"{file_path} has no readable worksheet")
 
-    Args:
-        lf_or_df: Polars LazyFrame or DataFrame
-        streaming: Use streaming collection for LazyFrames
+    rows = worksheet.iter_rows(values_only=True)
+    for _ in range(int(skip_rows)):
+        try:
+            next(rows)
+        except StopIteration:
+            break
+    try:
+        headers = [
+            str(name) if name is not None else f"column_{index + 1}"
+            for index, name in enumerate(next(rows))
+        ]
+    except StopIteration:
+        headers = []
 
-    Returns:
-        pandas DataFrame
-    """
-    ensure_polars()
-
-    if isinstance(lf_or_df, pl.LazyFrame):
-        df = collect_streaming(lf_or_df, streaming=streaming)
-    else:
-        df = lf_or_df
-
-    return df.to_pandas()
-
-
-def pandas_to_polars(
-    pdf: "Any",
-) -> "pl.DataFrame":
-    """
-    Convert pandas DataFrame to Polars DataFrame.
-
-    Args:
-        pdf: pandas DataFrame
-
-    Returns:
-        Polars DataFrame
-    """
-    ensure_polars()
-    return pl.from_pandas(pdf)
+    return headers, rows

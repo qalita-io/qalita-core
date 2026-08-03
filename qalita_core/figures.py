@@ -6,6 +6,8 @@ Canal de sortie `figures.json` : agrégats sémantiquement décrits.
 Un pack déclare une intention ; il ne choisit jamais le rendu.
 """
 
+import sys
+
 from qalita_core.pack import PlatformAsset, _sanitize_for_json
 
 INTENTS = (
@@ -85,17 +87,8 @@ def _take(frame, records, positions, folded, columns):
         rows = [records[i] for i in positions]
         return rows + [folded] if folded is not None else rows
 
-    if hasattr(frame, "to_dicts"):  # polars
-        import polars as pl
-
-        head = frame.select(pl.all().gather(positions))
-        if folded is None:
-            return head
-        # vertical_relaxed : une colonne nulle prend le type de la tête, et la
-        # colonne repliée prend le supertype (str) sans toucher aux autres.
-        return pl.concat([head, type(frame)([folded])], how="vertical_relaxed")
-
-    # pandas
+    # pandas — un frame polars ne passe jamais par ici, il est trié dans le
+    # moteur par `_top_n_polars`.
     import pandas as pd
 
     head = frame.iloc[positions].reset_index(drop=True)
@@ -165,6 +158,40 @@ def _fold_target(columns, by, dim, label):
     return candidates[0]
 
 
+def _is_polars_frame(frame):
+    """Vrai pour un `pl.DataFrame` — sans importer polars s'il n'est pas là."""
+    polars = sys.modules.get("polars")
+    return polars is not None and isinstance(frame, polars.DataFrame)
+
+
+def _top_n_polars(frame, by, n, other, label, dimension):
+    """Version polars de `top_n` : le tri et le repli restent dans le moteur.
+
+    `top_n` est nourri de résultats de `group_by` — le cas à forte cardinalité
+    par excellence. La version générique matérialise tout le frame en dicts
+    Python puis trie en Python ; ici seules les `n` lignes gardées (plus la
+    ligne repliée) traversent la frontière Python.
+    """
+    import polars as pl
+
+    from qalita_core import analytics
+
+    head = analytics.top_k(frame, by, n) if n > 0 else frame.head(0)
+    if not other or frame.height <= n:
+        return head
+
+    tail = analytics.agg(
+        frame.lazy().sort(by, descending=True, nulls_last=True).slice(n),
+        {"total": pl.col(by).sum()},
+    )
+    folded = {column: None for column in frame.columns}
+    folded[dimension] = label
+    folded[by] = tail["total"] or 0
+    # vertical_relaxed : une colonne nulle prend le type de la tête, et la
+    # colonne repliée prend le supertype (str) sans toucher aux autres.
+    return pl.concat([head, type(frame)([folded])], how="vertical_relaxed")
+
+
 def top_n(frame, by, n, other=False, label="Autres", dim=None):
     """Garde les n plus grandes lignes selon `by`, en jetant la queue.
 
@@ -179,9 +206,18 @@ def top_n(frame, by, n, other=False, label="Autres", dim=None):
 
     La ligne repliée ne fabrique aucune valeur : `label` va dans `dim`, `by`
     porte la somme de la queue, et toute autre colonne est nulle.
+
+    Sur un `pl.DataFrame`, le classement est délégué au moteur (voir
+    `_top_n_polars`) : seules les lignes conservées deviennent des objets
+    Python. Un `LazyFrame` reste refusé — agrégez et collectez d'abord.
     """
-    records = _records_of(frame)
-    columns = _columns_of(frame, records)
+    polars_frame = _is_polars_frame(frame)
+    # Un frame polars n'est jamais matérialisé en dicts : ses colonnes se lisent
+    # sur le schéma, et le tri reste dans le moteur.
+    records = None if polars_frame else _records_of(frame)
+    columns = (
+        list(frame.columns) if polars_frame else _columns_of(frame, records)
+    )
 
     if columns is not None:
         if by not in columns:
@@ -194,6 +230,9 @@ def top_n(frame, by, n, other=False, label="Autres", dim=None):
         # Résolu même sans queue à replier : le contrat d'appel ne doit pas
         # dépendre du contenu du frame du jour.
         dimension = _fold_target(columns, by, dim, label)
+
+    if polars_frame:
+        return _top_n_polars(frame, by, n, other, label, dimension)
 
     positions = sorted(
         range(len(records)),
