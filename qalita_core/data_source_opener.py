@@ -1018,11 +1018,11 @@ class DatabaseSource(_SqlAlchemySource):
         def _collect_for_schema(target_schema: Optional[str]) -> List[str]:
             try:
                 tables = inspector.get_table_names(schema=target_schema)
-            except Exception:
+            except NotImplementedError:
                 tables = []
             try:
                 views = inspector.get_view_names(schema=target_schema)
-            except Exception:
+            except NotImplementedError:
                 views = []
             return list(set((tables or []) + (views or [])))
 
@@ -1032,15 +1032,12 @@ class DatabaseSource(_SqlAlchemySource):
             return initial
 
         # Special handling for Oracle when no schema specified and nothing found
-        try:
-            dialect_name = self.engine.dialect.name
-        except Exception:
-            dialect_name = None
+        dialect_name = self.engine.dialect.name
 
         if dialect_name == "oracle" and schema is None:
             try:
                 schemas = inspector.get_schema_names()
-            except Exception:
+            except NotImplementedError:
                 schemas = []
 
             system_schemas = {
@@ -1094,14 +1091,14 @@ class DatabaseSource(_SqlAlchemySource):
                     names = _collect_for_schema(current_schema)
                     if names:
                         return sorted([f"{current_schema}.{n}" for n in names])
-            except Exception:
+            except NotImplementedError:
                 pass
 
         # Special handling for PostgreSQL when no schema specified and nothing found
         if dialect_name == "postgresql" and schema is None:
             try:
                 schemas = inspector.get_schema_names()
-            except Exception:
+            except NotImplementedError:
                 schemas = []
 
             # Filter out system schemas
@@ -1859,7 +1856,10 @@ class ClickHouseSource(_SqlAlchemySource):
         return table_name, table_name
 
     def _list_tables(self, engine, schema):
-        tables = super()._list_tables(engine, None)
+        try:
+            tables = super()._list_tables(engine, None)
+        except NotImplementedError:
+            tables = []
         if tables:
             return tables
         database = self.config.get("database", "default")

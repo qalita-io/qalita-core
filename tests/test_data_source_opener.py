@@ -27,6 +27,7 @@ from qalita_core.data_source_opener import (
     FolderSource,
     MongoDBSource,
     RedshiftSource,
+    ClickHouseSource,
     SqliteSource,
     get_data_source,
     _ensure_output_dir,
@@ -694,6 +695,98 @@ class TestScanSkipsUnreadableObjects:
                 "reason": "permission denied",
             }
         ]
+
+
+class TestCatalogIntrospectionFailures:
+    def test_database_source_preserves_catalog_connection_error(
+        self, tmp_path, monkeypatch
+    ):
+        failure = OperationalError(
+            "catalog query",
+            {},
+            _PostgresDriverError("connection dropped", "08006"),
+            connection_invalidated=True,
+        )
+
+        class _Inspector:
+            def get_table_names(self, schema=None):
+                raise failure
+
+            def get_view_names(self, schema=None):
+                return []
+
+        source = DatabaseSource(connection_string="sqlite://")
+        monkeypatch.setattr(
+            "qalita_core.data_source_opener.inspect",
+            lambda engine: _Inspector(),
+        )
+
+        with pytest.raises(OperationalError) as excinfo:
+            source.get_data(
+                "*",
+                pack_config={"parquet_output_dir": str(tmp_path / "out")},
+            )
+
+        assert excinfo.value is failure
+
+    def test_clickhouse_uses_show_tables_when_inspection_is_unsupported(
+        self, monkeypatch
+    ):
+        class _Inspector:
+            def get_table_names(self, schema=None):
+                raise NotImplementedError("ClickHouse inspection unsupported")
+
+        class _Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def execute(self, statement):
+                assert str(statement) == "SHOW TABLES FROM analytics"
+                return [("alpha",), ("beta",)]
+
+        class _Engine:
+            def connect(self):
+                return _Connection()
+
+        monkeypatch.setattr(
+            "qalita_core.data_source_opener.inspect",
+            lambda engine: _Inspector(),
+        )
+        source = ClickHouseSource({"database": "analytics"})
+
+        assert source._list_tables(_Engine(), None) == ["alpha", "beta"]
+
+    def test_clickhouse_preserves_show_tables_connection_error(
+        self, monkeypatch
+    ):
+        failure = OperationalError(
+            "SHOW TABLES",
+            {},
+            _PostgresDriverError("connection dropped", "08006"),
+            connection_invalidated=True,
+        )
+
+        class _Inspector:
+            def get_table_names(self, schema=None):
+                raise NotImplementedError("ClickHouse inspection unsupported")
+
+        class _Engine:
+            def connect(self):
+                raise failure
+
+        monkeypatch.setattr(
+            "qalita_core.data_source_opener.inspect",
+            lambda engine: _Inspector(),
+        )
+        source = ClickHouseSource({})
+
+        with pytest.raises(OperationalError) as excinfo:
+            source._list_tables(_Engine(), None)
+
+        assert excinfo.value is failure
 
 
 class TestGetDataSource:
