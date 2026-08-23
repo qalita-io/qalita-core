@@ -52,6 +52,7 @@ __all__ = [
     "InsufficientDiskSpaceError",
     "ParquetPartWriter",
     "SchemaDriftError",
+    "UTF8_ENCODINGS",
     "arrow_type_hints",
     "check_disk_space",
     "iter_excel_rows",
@@ -88,6 +89,12 @@ DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024
 # of file. The pandas path used to write snappy silently while the Polars path
 # wrote zstd, which made part files of the same object differ in size by 3x.
 PARQUET_COMPRESSION = "zstd"
+
+# Encoding names that Polars reads natively under the single name ``utf8``.
+# Anything else has to be transcoded before it reaches the reader, so the
+# loader refuses it rather than handing Polars a name it will reject with
+# "invalid utf-8 sequence" halfway through the file.
+UTF8_ENCODINGS = ("utf-8", "utf8", "utf-8-sig", "utf8-sig", "ascii")
 
 
 class InsufficientDiskSpaceError(RuntimeError):
@@ -918,17 +925,29 @@ def scan_csv(
     *,
     skip_rows: int = 0,
     encoding: str = "utf8",
+    separator: str = ",",
+    has_header: bool = True,
+    decimal_comma: bool = False,
     infer_schema_length: int = 10000,
     ignore_errors: bool = True,
     **kwargs: Any,
 ) -> "pl.LazyFrame":
-    """Lazily scan a CSV. Nothing is read until the plan is executed."""
-    if encoding.lower() in ("utf-8", "utf_8"):
+    """Lazily scan a CSV. Nothing is read until the plan is executed.
+
+    ``truncate_ragged_lines`` is deliberately left off: a file read with the
+    wrong separator must fail here rather than come back as one wide string
+    column that every downstream metric would then describe.
+    """
+    if encoding.lower().replace("_", "-") in UTF8_ENCODINGS:
+        # Polars names the whole family ``utf8`` and strips a BOM on its own.
         encoding = "utf8"
     return pl.scan_csv(
         file_path,
         skip_rows=skip_rows,
         encoding=encoding,
+        separator=separator,
+        has_header=has_header,
+        decimal_comma=decimal_comma,
         infer_schema_length=infer_schema_length,
         ignore_errors=ignore_errors,
         **kwargs,

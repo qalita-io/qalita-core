@@ -584,9 +584,78 @@ def _as_documents(values: Iterable[Any]) -> Iterator[Dict[str, Any]]:
             yield {"value": value}
 
 
+def _csv_read_options(config: Optional[dict]) -> Dict[str, Any]:
+    """Translate a file source config into ``pio.scan_csv`` keyword options.
+
+    The keys are the ones the platform stores on a CSV source and the CLI
+    worker reads for its own preview (qalita/cli#143): the two readers have to
+    agree, or the pack profiles a file the user never saw in the Studio.
+
+    Every unusable value raises instead of falling back to the default. A
+    silent fallback is what makes this class of bug expensive: reading a ``;``
+    file as comma-separated does not fail, it yields one column and a green job
+    whose metrics describe nothing.
+    """
+    config = config or {}
+    options: Dict[str, Any] = {}
+
+    delimiter = config.get("delimiter")
+    if delimiter not in (None, ""):
+        # The form field is free text, so a tabulation is typed as the two
+        # characters ``\t`` far more often than as a real tabulation.
+        separator = "\t" if delimiter == "\\t" else str(delimiter)
+        if len(separator) != 1:
+            raise ValueError(
+                f"Invalid CSV delimiter {delimiter!r}: a separator must be "
+                "exactly one character (write a tabulation as '\\t')."
+            )
+        options["separator"] = separator
+
+    encoding = config.get("encoding")
+    if encoding not in (None, ""):
+        if str(encoding).lower().replace("_", "-") not in pio.UTF8_ENCODINGS:
+            raise ValueError(
+                f"Unsupported CSV encoding {encoding!r}: the loader only reads "
+                "the utf-8 family. Convert the file to UTF-8 and declare "
+                "'utf-8' on the source."
+            )
+        options["encoding"] = "utf8"
+
+    has_header = config.get("has_header")
+    if has_header is not None:
+        options["has_header"] = _config_flag(has_header, default=True)
+
+    decimal_separator = config.get("decimal_separator")
+    if decimal_separator not in (None, ""):
+        if decimal_separator not in (".", ","):
+            raise ValueError(
+                f"Invalid CSV decimal separator {decimal_separator!r}: "
+                "expected '.' or ','."
+            )
+        options["decimal_comma"] = decimal_separator == ","
+    elif config.get("decimal_comma") is not None:
+        options["decimal_comma"] = _config_flag(
+            config["decimal_comma"], default=False
+        )
+
+    return options
+
+
+def _config_flag(value: Any, default: bool) -> bool:
+    """Parse a platform flag using the CLI's legacy-compatible semantics."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no")
+    return bool(value)
+
+
 class FileSource(DataSource):
-    def __init__(self, file_path):
+    def __init__(self, file_path, config=None):
         self.file_path = file_path
+        # Optional so that the dozens of ``FileSource(path)`` call sites keep
+        # working; only the CSV reader looks at it.
+        self.config = config or {}
 
     def get_data(self, table_or_query=None, pack_config=None):
         output_dir = _ensure_output_dir(pack_config)
@@ -638,7 +707,11 @@ class FileSource(DataSource):
         if lower.endswith(".csv"):
             return _sink_to_parquet(
                 self,
-                pio.scan_csv(file_path, skip_rows=int(skiprows)),
+                pio.scan_csv(
+                    file_path,
+                    skip_rows=int(skiprows),
+                    **_csv_read_options(self.config),
+                ),
                 output_dir,
                 base_name,
                 chunk_rows,
@@ -1042,16 +1115,22 @@ def _materialize_remote_to_parquet(
         )
 
     if fmt == "csv":
+        # Object stores hold the same European CSVs as local disks do, and the
+        # source config carries the same keys, so the reader options apply here
+        # too.
+        csv_options = _csv_read_options(getattr(source, "config", None))
         if native:
             lf = pio.scan_csv(
                 path,
                 skip_rows=int(skiprows),
                 storage_options=storage_options,
+                **csv_options,
             )
         else:
             lf = pio.scan_csv(
                 _stage_remote_file(path, storage_options),
                 skip_rows=int(skiprows),
+                **csv_options,
             )
         return _sink_to_parquet(
             source,
@@ -2566,7 +2645,7 @@ def get_data_source(source_config):
 
     # File sources
     if type_ in ("file", "csv", "excel", "json", "parquet"):
-        return FileSource(config.get("path"))
+        return FileSource(config.get("path"), config=config)
     elif type_ == "folder":
         return FolderSource(config)
 
