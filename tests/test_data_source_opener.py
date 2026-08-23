@@ -14,7 +14,7 @@ from pathlib import Path
 import polars as pl
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from qalita_core.data_source_opener import (
     FileSource,
@@ -26,6 +26,7 @@ from qalita_core.data_source_opener import (
     HDFSSource,
     FolderSource,
     MongoDBSource,
+    RedshiftSource,
     SqliteSource,
     get_data_source,
     _ensure_output_dir,
@@ -284,11 +285,10 @@ class TestDatabaseSource:
 
 
 def _make_scan_db(path, readable=("alpha", "beta"), unreadable=("forbidden",)):
-    """A database whose catalog lists objects the connection cannot read.
+    """A database with real readable tables and catalog-visible broken views.
 
-    A view over a missing table fails exactly where a table without a ``SELECT``
-    grant fails: the catalog lists it, the ``SELECT`` is refused. That shape is
-    reachable on sqlite, so the scan can be exercised without a server.
+    Permission tests replace only the broken view's read with a structured
+    SQLAlchemy driver error; successful objects still use the real SQL writer.
     """
     conn = sqlite3.connect(path)
     cur = conn.cursor()
@@ -299,6 +299,62 @@ def _make_scan_db(path, readable=("alpha", "beta"), unreadable=("forbidden",)):
         cur.execute(f"CREATE VIEW {name} AS SELECT * FROM missing_{name}")
     conn.commit()
     conn.close()
+
+
+class _PostgresDriverError(Exception):
+    """Driver-shaped error carrying PostgreSQL's structured SQLSTATE."""
+
+    def __init__(self, message, sqlstate):
+        super().__init__(message)
+        self.pgcode = sqlstate
+        self.sqlstate = sqlstate
+
+
+def _permission_error(table_name):
+    return ProgrammingError(
+        f"SELECT * FROM {table_name}",
+        {},
+        _PostgresDriverError("permission denied", "42501"),
+    )
+
+
+def _connection_drop(table_name):
+    return OperationalError(
+        f"SELECT * FROM {table_name}",
+        {},
+        _PostgresDriverError("connection dropped", "08006"),
+        connection_invalidated=True,
+    )
+
+
+def _fail_tables(monkeypatch, source, failures):
+    """Keep successful reads real and inject driver/writer boundary failures."""
+
+    original = source._read_table_to_parquet
+
+    def _read_table(
+        engine,
+        table_name,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name=None,
+        pack_config=None,
+    ):
+        failure = failures.get(table_name)
+        if failure is not None:
+            raise failure
+        return original(
+            engine,
+            table_name,
+            schema,
+            output_dir,
+            chunk_rows,
+            dialect_name,
+            pack_config=pack_config,
+        )
+
+    monkeypatch.setattr(source, "_read_table_to_parquet", _read_table)
 
 
 class _WarehouseStub(_SqlAlchemySource):
@@ -333,11 +389,18 @@ class TestScanSkipsUnreadableObjects:
     after it had already streamed every readable table.
     """
 
-    def test_unreadable_object_is_skipped_and_recorded(self, tmp_path):
+    def test_unreadable_object_is_skipped_and_recorded(
+        self, tmp_path, monkeypatch
+    ):
         db_path = tmp_path / "partial.db"
         _make_scan_db(db_path)
 
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        _fail_tables(
+            monkeypatch,
+            source,
+            {"forbidden": _permission_error("forbidden")},
+        )
         paths = source.get_data(
             "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
         )
@@ -352,16 +415,23 @@ class TestScanSkipsUnreadableObjects:
             "forbidden"
         ]
         skipped = source.skipped_objects[0]
-        assert skipped["error"] == "OperationalError"
-        assert "missing_forbidden" in skipped["reason"]
+        assert skipped["error"] == "ProgrammingError"
+        assert "permission denied" in skipped["reason"]
 
-    def test_the_scan_logs_a_recap_of_what_it_skipped(self, tmp_path, caplog):
+    def test_the_scan_logs_a_recap_of_what_it_skipped(
+        self, tmp_path, monkeypatch, caplog
+    ):
         # A partial scan nobody is told about is worse than the abort it
         # replaces, so the recap is part of the contract.
         db_path = tmp_path / "recap.db"
         _make_scan_db(db_path)
 
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        _fail_tables(
+            monkeypatch,
+            source,
+            {"forbidden": _permission_error("forbidden")},
+        )
         with caplog.at_level(
             logging.WARNING, logger="qalita_core.data_source_opener"
         ):
@@ -371,20 +441,30 @@ class TestScanSkipsUnreadableObjects:
 
         messages = [record.getMessage() for record in caplog.records]
         assert any(
-            "skipping forbidden" in message and "OperationalError" in message
+            "skipping forbidden" in message and "ProgrammingError" in message
             for message in messages
         )
         recap = [m for m in messages if "absent from this scan" in m]
         assert len(recap) == 1
         assert "1 of 3 objects" in recap[0] and "forbidden" in recap[0]
 
-    def test_scan_fails_when_no_object_could_be_read(self, tmp_path):
+    def test_scan_fails_when_no_object_could_be_read(
+        self, tmp_path, monkeypatch
+    ):
         # Otherwise a dropped connection would return an empty scan as a
         # success, which is the failure mode the per-table skip introduces.
         db_path = tmp_path / "denied.db"
         _make_scan_db(db_path, readable=(), unreadable=("forbidden", "other"))
 
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        _fail_tables(
+            monkeypatch,
+            source,
+            {
+                "forbidden": _permission_error("forbidden"),
+                "other": _permission_error("other"),
+            },
+        )
         with pytest.raises(RuntimeError) as excinfo:
             source.get_data(
                 "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
@@ -392,7 +472,7 @@ class TestScanSkipsUnreadableObjects:
 
         message = str(excinfo.value)
         assert "forbidden" in message and "other" in message
-        assert "OperationalError" in message
+        assert "ProgrammingError" in message
         assert source.skipped_objects != []
 
     def test_empty_schema_still_raises_value_error(self, tmp_path):
@@ -418,11 +498,18 @@ class TestScanSkipsUnreadableObjects:
         assert len(paths) == 2
         assert source.skipped_objects == []
 
-    def test_explicit_table_list_skips_the_unreadable_one(self, tmp_path):
+    def test_explicit_table_list_skips_the_unreadable_one(
+        self, tmp_path, monkeypatch
+    ):
         db_path = tmp_path / "listed.db"
         _make_scan_db(db_path)
 
         source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        _fail_tables(
+            monkeypatch,
+            source,
+            {"forbidden": _permission_error("forbidden")},
+        )
         paths = source.get_data(
             ["alpha", "forbidden", "beta"],
             pack_config={"parquet_output_dir": str(tmp_path / "out")},
@@ -449,12 +536,17 @@ class TestScanSkipsUnreadableObjects:
         assert source.skipped_objects == []
 
     def test_shared_warehouse_dispatch_skips_the_unreadable_one(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         db_path = tmp_path / "warehouse.db"
         _make_scan_db(db_path, readable=("alpha",))
 
         source = _WarehouseStub(create_engine(f"sqlite:///{db_path}"))
+        _fail_tables(
+            monkeypatch,
+            source,
+            {"forbidden": _permission_error("forbidden")},
+        )
         paths = source.get_data(
             ["alpha", "forbidden"],
             pack_config={"parquet_output_dir": str(tmp_path / "out")},
@@ -464,6 +556,143 @@ class TestScanSkipsUnreadableObjects:
         assert len(paths) == 1
         assert [item["object"] for item in source.skipped_objects] == [
             "forbidden"
+        ]
+
+    def test_connection_drop_after_success_is_reraised(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "connection-drop.db"
+        _make_scan_db(db_path, unreadable=())
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        failure = _connection_drop("beta")
+        _fail_tables(monkeypatch, source, {"beta": failure})
+
+        with pytest.raises(OperationalError) as excinfo:
+            source.get_data(
+                ["alpha", "beta"],
+                pack_config={"parquet_output_dir": str(tmp_path / "out")},
+            )
+
+        assert excinfo.value is failure
+
+    def test_writer_error_after_success_is_reraised(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "writer-error.db"
+        _make_scan_db(db_path, unreadable=())
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        failure = OSError("parquet writer failed")
+        _fail_tables(monkeypatch, source, {"beta": failure})
+
+        with pytest.raises(OSError) as excinfo:
+            source.get_data(
+                ["alpha", "beta"],
+                pack_config={"parquet_output_dir": str(tmp_path / "out")},
+            )
+
+        assert excinfo.value is failure
+
+    def test_catalog_introspection_failure_is_reraised(
+        self, tmp_path, monkeypatch
+    ):
+        failure = OperationalError(
+            "catalog query",
+            {},
+            _PostgresDriverError("catalog unavailable", "08006"),
+            connection_invalidated=True,
+        )
+
+        class _FailingInspector:
+            def get_table_names(self, schema=None):
+                raise failure
+
+        source = _WarehouseStub(object())
+        monkeypatch.setattr(
+            "qalita_core.data_source_opener.inspect",
+            lambda engine: _FailingInspector(),
+        )
+
+        with pytest.raises(OperationalError) as excinfo:
+            source.get_data(
+                "*",
+                pack_config={"parquet_output_dir": str(tmp_path / "out")},
+            )
+
+        assert excinfo.value is failure
+
+    def test_empty_explicit_table_list_is_rejected(self, tmp_path):
+        source = _WarehouseStub(object())
+
+        with pytest.raises(ValueError, match="No objects"):
+            source.get_data(
+                [],
+                pack_config={"parquet_output_dir": str(tmp_path / "out")},
+            )
+
+    def test_second_scan_resets_skipped_objects(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "reset-skips.db"
+        _make_scan_db(db_path)
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        _fail_tables(
+            monkeypatch,
+            source,
+            {"forbidden": _permission_error("forbidden")},
+        )
+
+        source.get_data(
+            ["alpha", "forbidden"],
+            pack_config={"parquet_output_dir": str(tmp_path / "first")},
+        )
+        assert [item["object"] for item in source.skipped_objects] == [
+            "forbidden"
+        ]
+
+        source.get_data(
+            ["beta"],
+            pack_config={"parquet_output_dir": str(tmp_path / "second")},
+        )
+
+        assert source.skipped_objects == []
+
+    def test_redshift_propagates_a_snapshot_of_internal_skips(
+        self, monkeypatch
+    ):
+        skipped = [
+            {
+                "object": "forbidden",
+                "error": "ProgrammingError",
+                "reason": "permission denied",
+            }
+        ]
+
+        class _InternalSource:
+            object_paths = {"redshift_alpha": ["alpha.parquet"]}
+            skipped_objects = skipped
+
+            def __init__(self, connection_string=None, config=None):
+                pass
+
+            def get_data(self, table_or_query=None, pack_config=None):
+                return ["alpha.parquet"]
+
+        monkeypatch.setattr(
+            "qalita_core.data_source_opener.DatabaseSource", _InternalSource
+        )
+        source = RedshiftSource(
+            {"connection_string": "postgresql://example.invalid/db"}
+        )
+
+        assert source.get_data(["alpha", "forbidden"]) == ["alpha.parquet"]
+        assert source.skipped_objects == skipped
+
+        skipped[0]["reason"] = "mutated after load"
+        skipped.append({"object": "later"})
+        assert source.skipped_objects == [
+            {
+                "object": "forbidden",
+                "error": "ProgrammingError",
+                "reason": "permission denied",
+            }
         ]
 
 

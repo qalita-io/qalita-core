@@ -215,6 +215,66 @@ class TestPackDataLoading:
         for p in data:
             assert os.path.exists(p)
 
+    def test_pack_preserves_source_and_target_skip_snapshots(
+        self, config_paths, monkeypatch
+    ):
+        pack = Pack(configs=config_paths)
+        source_skips = [
+            {
+                "object": "source_denied",
+                "error": "ProgrammingError",
+                "reason": "source permission denied",
+            }
+        ]
+        target_skips = [
+            {
+                "object": "target_denied",
+                "error": "ProgrammingError",
+                "reason": "target permission denied",
+            }
+        ]
+
+        class _SourceWithSkips:
+            def __init__(self, path, skipped):
+                self.path = path
+                self.skipped_objects = skipped
+                self.object_paths = {path: [f"{path}.parquet"]}
+
+            def get_data(self, table_or_query=None, pack_config=None):
+                return [f"{self.path}.parquet"]
+
+        data_sources = [
+            _SourceWithSkips("source_readable", source_skips),
+            _SourceWithSkips("target_readable", target_skips),
+        ]
+        monkeypatch.setattr(
+            "qalita_core.pack.get_data_source",
+            lambda config: data_sources.pop(0),
+        )
+
+        pack.load_data("source")
+        pack.load_data("target")
+
+        assert pack.skipped_source_objects == source_skips
+        assert pack.skipped_target_objects == target_skips
+
+        source_skips[0]["reason"] = "mutated after load"
+        target_skips.append({"object": "later"})
+        assert pack.skipped_source_objects == [
+            {
+                "object": "source_denied",
+                "error": "ProgrammingError",
+                "reason": "source permission denied",
+            }
+        ]
+        assert pack.skipped_target_objects == [
+            {
+                "object": "target_denied",
+                "error": "ProgrammingError",
+                "reason": "target permission denied",
+            }
+        ]
+
 
 class TestConfigLoader:
     """Tests for ConfigLoader class."""

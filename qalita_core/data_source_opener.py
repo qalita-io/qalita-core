@@ -35,6 +35,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import DBAPIError
 
 from qalita_core import polars_io as pio
 
@@ -115,6 +116,15 @@ class DataSource(ABC):
         if existing is None:
             existing = {}
             self._object_paths = existing
+        return existing
+
+    @property
+    def skipped_objects(self) -> List[Dict[str, str]]:
+        """Objects skipped by the current multi-object scan."""
+        existing = getattr(self, "_skipped_objects", None)
+        if existing is None:
+            existing = []
+            self._skipped_objects = existing
         return existing
 
     @property
@@ -320,6 +330,34 @@ def _sink_to_parquet(
     return source._record_object(base_name, paths)
 
 
+def _is_skippable_object_error(exc: Exception, dialect: Optional[str]) -> bool:
+    """Whether *exc* is a structured, object-level permission refusal.
+
+    SQLAlchemy wraps driver failures in ``DBAPIError`` and preserves the
+    driver's structured status on ``orig``. SQLSTATE 42501 is the standard
+    insufficient-privilege signal used by PostgreSQL and other drivers. No
+    exception message is parsed: unknown SQL states and non-database failures
+    remain fatal.
+    """
+    if not isinstance(exc, DBAPIError) or exc.connection_invalidated:
+        return False
+
+    original = exc.orig
+    sqlstate = getattr(original, "sqlstate", None) or getattr(
+        original, "pgcode", None
+    )
+
+    # redshift-connector exposes PostgreSQL protocol fields as a mapping in
+    # args[0], rather than as attributes on the exception.
+    dialect_name = (dialect or "").lower().split("+", 1)[0]
+    if sqlstate is None and dialect_name == "redshift" and original.args:
+        fields = original.args[0]
+        if isinstance(fields, dict):
+            sqlstate = fields.get("C")
+
+    return str(sqlstate).upper() == "42501"
+
+
 class _SqlAlchemySource(DataSource):
     """Shared table/query dispatch for every SQLAlchemy-backed source.
 
@@ -339,27 +377,10 @@ class _SqlAlchemySource(DataSource):
         return table_name, table_name
 
     def _list_tables(self, engine, schema: Optional[str]) -> List[str]:
-        try:
-            return list(inspect(engine).get_table_names(schema=schema) or [])
-        except Exception:  # noqa: BLE001 - dialects without a catalog
-            return []
+        return list(inspect(engine).get_table_names(schema=schema) or [])
 
     def _is_sql_query(self, s: str) -> bool:
         return _is_sql_query(s)
-
-    @property
-    def skipped_objects(self) -> List[Dict[str, str]]:
-        """Objects a scan could not read: ``object``, ``error``, ``reason``.
-
-        Populated in scan order and never cleared, so a caller that runs
-        several scans on the same source still sees every object that is
-        missing from the parquet parts it was handed.
-        """
-        existing = getattr(self, "_skipped_objects", None)
-        if existing is None:
-            existing = []
-            self._skipped_objects = existing
-        return existing
 
     def _read_tables(
         self,
@@ -384,6 +405,11 @@ class _SqlAlchemySource(DataSource):
         per-object warning, the end-of-scan recap, and the refusal to return an
         empty scan as a success.
         """
+        self._skipped_objects = []
+        table_names = list(table_names)
+        if not table_names:
+            raise ValueError("No objects were selected for this scan.")
+
         all_paths: List[str] = []
         read_count = 0
         skipped: List[Dict[str, str]] = []
@@ -407,7 +433,9 @@ class _SqlAlchemySource(DataSource):
                 # the same way, and burying the cause under N identical
                 # warnings would turn a full disk into a partial scan.
                 raise
-            except Exception as exc:  # noqa: BLE001 - any table may be denied
+            except Exception as exc:  # noqa: BLE001 - classify driver errors
+                if not _is_skippable_object_error(exc, dialect_name):
+                    raise
                 # Driver messages carry the offending SQL on their own lines;
                 # folded into one so a skip stays a single greppable log line.
                 reason = " ".join(str(exc).split()) or exc.__class__.__name__
@@ -1812,6 +1840,9 @@ class RedshiftSource(DataSource):
             table_or_query=table_or_query, pack_config=pack_config
         )
         self._object_paths = db_source.object_paths
+        self._skipped_objects = [
+            dict(item) for item in db_source.skipped_objects
+        ]
         return paths
 
 
