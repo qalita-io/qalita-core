@@ -29,6 +29,7 @@ from qalita_core.data_source_opener import (
     _build_parquet_path,
     _infer_format_from_path,
     _materialize_remote_to_parquet,
+    _csv_read_options,
     DEFAULT_PORTS,
 )
 
@@ -774,3 +775,211 @@ class TestSqlStreaming:
         )
         assert len(paths) == 1
         assert pl.scan_parquet(paths).select(pl.len()).collect().item() == 0
+
+
+class TestCsvSourceOptions:
+    """CSV reader options declared on the source reach the reader.
+
+    Regression for qalita/core#47: the factory kept only ``config['path']``, so
+    a source declaring ``;`` was read as if it were comma-separated.
+    """
+
+    # The European shape: semicolon-separated, comma as the decimal mark. Read
+    # with the defaults, the header is one field and every data row is three,
+    # which is the ComputeError seen on the on-prem deployment.
+    EUROPEAN = (
+        "bilan_id;patient_id;date_bilan;hba1c_pct;glucose_aj_gl\n"
+        "BIO0001_01;PAT0001;2023-01-07;8,4;3,33\n"
+        "BIO0002_01;PAT0002;2023-02-11;6,1;1,05\n"
+        "BIO0003_01;PAT0003;2023-03-02;7,25;2,4\n"
+    )
+
+    def _european(self, tmp_path):
+        csv_path = tmp_path / "bilans.csv"
+        csv_path.write_text(self.EUROPEAN, encoding="utf-8")
+        return csv_path
+
+    @staticmethod
+    def _collect(source, tmp_path):
+        paths = source.get_data(
+            pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+        return pl.scan_parquet(paths).collect()
+
+    def test_delimiter_and_decimal_separator_are_both_applied(self, tmp_path):
+        csv_path = self._european(tmp_path)
+        source = FileSource(
+            str(csv_path),
+            config={
+                "path": str(csv_path),
+                "delimiter": ";",
+                "decimal_separator": ",",
+            },
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.columns == [
+            "bilan_id",
+            "patient_id",
+            "date_bilan",
+            "hba1c_pct",
+            "glucose_aj_gl",
+        ]
+        assert frame.height == 3
+        # The schema is the assertion that matters: the separator alone gives
+        # five columns too, but leaves these two as String and every numeric
+        # metric computed from them wrong.
+        assert frame.schema["hba1c_pct"] == pl.Float64
+        assert frame.schema["glucose_aj_gl"] == pl.Float64
+        assert frame["hba1c_pct"].to_list() == [8.4, 6.1, 7.25]
+
+    def test_delimiter_alone_leaves_the_numbers_as_strings(self, tmp_path):
+        """Pins the half-fix that turns a crash into silent wrong metrics."""
+        csv_path = self._european(tmp_path)
+        source = FileSource(
+            str(csv_path), config={"path": str(csv_path), "delimiter": ";"}
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.width == 5
+        assert frame.schema["hba1c_pct"] == pl.String
+
+    def test_semicolon_file_without_options_still_fails(self, tmp_path):
+        """No ``truncate_ragged_lines`` on this path, on purpose.
+
+        Tolerating ragged lines would return the file as one wide string
+        column instead of failing — a green job describing nothing.
+        """
+        csv_path = self._european(tmp_path)
+        source = FileSource(str(csv_path))
+
+        with pytest.raises(pl.exceptions.ComputeError):
+            self._collect(source, tmp_path)
+
+    def test_has_header_false_keeps_the_first_line_as_data(self, tmp_path):
+        csv_path = tmp_path / "headless.csv"
+        csv_path.write_text("1;alpha\n2;beta\n", encoding="utf-8")
+        source = FileSource(
+            str(csv_path),
+            config={
+                "path": str(csv_path),
+                "delimiter": ";",
+                "has_header": False,
+            },
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.height == 2
+        assert frame.columns == ["column_1", "column_2"]
+        assert frame["column_1"].to_list() == [1, 2]
+
+    def test_utf8_sig_is_accepted_and_the_bom_is_dropped(self, tmp_path):
+        """Checked against Polars rather than assumed: it strips the BOM."""
+        csv_path = tmp_path / "bom.csv"
+        csv_path.write_bytes("id;prix\n1;2,5\n".encode("utf-8-sig"))
+        source = FileSource(
+            str(csv_path),
+            config={
+                "path": str(csv_path),
+                "delimiter": ";",
+                "encoding": "utf-8-sig",
+                "decimal_separator": ",",
+            },
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.columns == ["id", "prix"]
+        assert frame["prix"].to_list() == [2.5]
+
+    def test_defaults_are_unchanged_when_nothing_is_declared(self, tmp_path):
+        csv_path = tmp_path / "plain.csv"
+        csv_path.write_text("id,value\n1,10.5\n2,20.25\n", encoding="utf-8")
+
+        bare = self._collect(FileSource(str(csv_path)), tmp_path / "bare")
+        configured = self._collect(
+            FileSource(str(csv_path), config={"path": str(csv_path)}),
+            tmp_path / "configured",
+        )
+
+        assert bare.columns == ["id", "value"]
+        assert bare.schema["value"] == pl.Float64
+        assert configured.equals(bare)
+
+    def test_factory_hands_the_config_to_the_file_source(self, tmp_path):
+        csv_path = self._european(tmp_path)
+        source = get_data_source(
+            {
+                "type": "csv",
+                "config": {
+                    "path": str(csv_path),
+                    "delimiter": ";",
+                    "decimal_separator": ",",
+                },
+            }
+        )
+
+        assert isinstance(source, FileSource)
+        assert self._collect(source, tmp_path).schema["hba1c_pct"] == (
+            pl.Float64
+        )
+
+
+class TestCsvReadOptions:
+    """Translation of a source config into reader options."""
+
+    def test_empty_config_asks_for_nothing(self):
+        assert _csv_read_options(None) == {}
+        assert _csv_read_options({}) == {}
+        assert _csv_read_options({"path": "/tmp/x.csv"}) == {}
+
+    def test_tabulation_is_accepted_as_the_two_character_escape(self):
+        # The form field is free text, so this is how a tab is usually typed.
+        assert _csv_read_options({"delimiter": "\\t"}) == {"separator": "\t"}
+        assert _csv_read_options({"delimiter": "\t"}) == {"separator": "\t"}
+
+    def test_multi_character_delimiter_names_the_value(self):
+        with pytest.raises(ValueError, match=r"'\|\|'"):
+            _csv_read_options({"delimiter": "||"})
+
+    def test_empty_delimiter_falls_back_to_the_default(self):
+        assert _csv_read_options({"delimiter": ""}) == {}
+
+    def test_utf8_family_maps_to_the_single_polars_name(self):
+        for name in ("utf-8", "UTF8", "utf_8", "utf-8-sig", "ascii"):
+            assert _csv_read_options({"encoding": name}) == {
+                "encoding": "utf8"
+            }
+
+    def test_unsupported_encoding_says_what_to_do(self):
+        with pytest.raises(ValueError) as excinfo:
+            _csv_read_options({"encoding": "latin-1"})
+        message = str(excinfo.value)
+        assert "latin-1" in message
+        assert "UTF-8" in message
+
+    def test_decimal_separator_maps_to_decimal_comma(self):
+        assert _csv_read_options({"decimal_separator": ","}) == {
+            "decimal_comma": True
+        }
+        assert _csv_read_options({"decimal_separator": "."}) == {
+            "decimal_comma": False
+        }
+
+    def test_decimal_comma_boolean_is_accepted_too(self):
+        assert _csv_read_options({"decimal_comma": True}) == {
+            "decimal_comma": True
+        }
+
+    def test_unknown_decimal_separator_names_the_value(self):
+        with pytest.raises(ValueError, match=r"';'"):
+            _csv_read_options({"decimal_separator": ";"})
+
+    def test_has_header_is_only_sent_when_declared(self):
+        assert _csv_read_options({"has_header": False}) == {
+            "has_header": False
+        }
+        assert _csv_read_options({"has_header": True}) == {"has_header": True}
