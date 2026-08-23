@@ -197,11 +197,24 @@ def test_explicit_decimal256_schema_becomes_readable_text(tmp_path, caplog):
     import polars as pl
 
     exact = Decimal("123456789012345678901234567890123456789.12")
-    schema = pa.schema([pa.field("amount", pa.decimal256(41, 2))])
+    schema = pa.schema(
+        [
+            pa.field(
+                "amount",
+                pa.decimal256(41, 2),
+                nullable=False,
+                metadata={b"source": b"postgres"},
+            )
+        ]
+    )
     with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
         with pio.ParquetPartWriter(
             str(tmp_path), "ledger", schema=schema
         ) as writer:
+            assert writer.schema.field("amount").nullable is False
+            assert writer.schema.field("amount").metadata == {
+                b"source": b"postgres"
+            }
             writer.write(pa.table({"amount": [exact]}, schema=schema))
         paths = writer.close()
 
@@ -210,6 +223,74 @@ def test_explicit_decimal256_schema_becomes_readable_text(tmp_path, caplog):
     assert frame["amount"].to_list() == [
         "123456789012345678901234567890123456789.12"
     ]
+    assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_list_decimal256_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(
+                pa.table(
+                    {
+                        "amounts": pa.array(
+                            [[exact]],
+                            type=pa.list_(pa.decimal256(41, 2)),
+                        )
+                    }
+                )
+            )
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amounts": pl.List(pl.String)}
+    assert frame["amounts"].to_list() == [
+        ["123456789012345678901234567890123456789.12"]
+    ]
+    assert "amounts.item: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_struct_decimal256_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    record_type = pa.struct([pa.field("amount", pa.decimal256(41, 2))])
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(
+                pa.table(
+                    {"record": pa.array([{"amount": exact}], type=record_type)}
+                )
+            )
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"record": pl.Struct({"amount": pl.String})}
+    assert frame["record"].to_list() == [
+        {"amount": "123456789012345678901234567890123456789.12"}
+    ]
+    assert "record.amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_empty_sql_decimal256_hint_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+    from sqlalchemy import create_engine
+
+    engine = create_engine("sqlite://")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        paths = pio.stream_sql_to_parquet(
+            engine,
+            "SELECT 1 AS amount WHERE 0",
+            str(tmp_path),
+            "ledger",
+            type_hints={"amount": pa.decimal256(41, 2)},
+        )
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.String}
+    assert frame.to_dicts() == []
     assert "amount: decimal256(41, 2) -> large_string" in caplog.text
 
 

@@ -190,27 +190,109 @@ def _pin_schema(
 ) -> "pa.Schema":
     """Resolve the schema every part of an object will be written with.
 
-    Columns inferred as ``null`` use their metadata hint when present. Arrow
-    Decimal256 is always changed to ``large_string`` because Polars cannot read
-    a Decimal256 Parquet part back; casting preserves every decimal digit.
+    Columns inferred as ``null`` use their metadata hint when present. Every
+    Arrow Decimal256 leaf is changed to ``large_string`` because Polars cannot
+    read a Decimal256 Parquet part back; casting preserves every decimal digit.
     """
     hints = type_hints or {}
     fields = []
     for field in schema:
         if pa.types.is_null(field.type):
-            field = pa.field(
-                field.name, hints.get(field.name, pa.large_string())
+            field = _field_with_type(
+                field, hints.get(field.name, pa.large_string())
             )
-        if pa.types.is_decimal256(field.type):
-            logger.warning(
-                "%s: %s -> large_string; Polars cannot read Decimal256 "
-                "and the fallback preserves every digit",
-                field.name,
-                field.type,
-            )
-            field = pa.field(field.name, pa.large_string())
-        fields.append(field)
-    return pa.schema(fields)
+        fields.append(_normalize_decimal256_field(field, field.name))
+    return pa.schema(fields, metadata=schema.metadata)
+
+
+def _field_with_type(field: "pa.Field", dtype: "pa.DataType") -> "pa.Field":
+    """Change a field type without dropping the source contract."""
+    if field.type.equals(dtype):
+        return field
+    return pa.field(
+        field.name,
+        dtype,
+        nullable=field.nullable,
+        metadata=field.metadata,
+    )
+
+
+def _normalize_decimal256_field(field: "pa.Field", path: str) -> "pa.Field":
+    """Normalize Decimal256 descendants and preserve the Arrow field."""
+    return _field_with_type(
+        field, _normalize_decimal256_type(field.type, path)
+    )
+
+
+def _normalize_decimal256_type(
+    dtype: "pa.DataType", path: str
+) -> "pa.DataType":
+    """Replace Decimal256 leaves in Arrow container types with text."""
+    if pa.types.is_decimal256(dtype):
+        logger.warning(
+            "%s: %s -> large_string; Polars cannot read Decimal256 "
+            "and the fallback preserves every digit",
+            path,
+            dtype,
+        )
+        normalized = pa.large_string()
+    elif pa.types.is_list(dtype):
+        normalized = pa.list_(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_large_list(dtype):
+        normalized = pa.large_list(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_fixed_size_list(dtype):
+        normalized = pa.list_(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item"),
+            dtype.list_size,
+        )
+    elif pa.types.is_list_view(dtype):
+        normalized = pa.list_view(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_large_list_view(dtype):
+        normalized = pa.large_list_view(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_struct(dtype):
+        normalized = pa.struct(
+            [
+                _normalize_decimal256_field(child, f"{path}.{child.name}")
+                for child in dtype
+            ]
+        )
+    elif pa.types.is_map(dtype):
+        normalized = pa.map_(
+            _normalize_decimal256_field(dtype.key_field, f"{path}.key"),
+            _normalize_decimal256_field(dtype.item_field, f"{path}.value"),
+            keys_sorted=dtype.keys_sorted,
+        )
+    elif pa.types.is_dictionary(dtype):
+        normalized = pa.dictionary(
+            dtype.index_type,
+            _normalize_decimal256_type(dtype.value_type, f"{path}.value"),
+            ordered=dtype.ordered,
+        )
+    elif pa.types.is_run_end_encoded(dtype):
+        normalized = pa.run_end_encoded(
+            dtype.run_end_type,
+            _normalize_decimal256_type(dtype.value_type, f"{path}.value"),
+        )
+    elif pa.types.is_union(dtype):
+        children = [
+            _normalize_decimal256_field(child, f"{path}.{child.name}")
+            for child in dtype
+        ]
+        constructor = (
+            pa.sparse_union if dtype.mode == "sparse" else pa.dense_union
+        )
+        normalized = constructor(children, type_codes=dtype.type_codes)
+    else:
+        normalized = dtype
+    return normalized
 
 
 def _conform(table: "pa.Table", schema: "pa.Schema") -> "pa.Table":
@@ -922,8 +1004,8 @@ def stream_sql_to_parquet(
         if writer.schema is None and type_hints:
             # An empty result set yields no batch at all, so the schema can only
             # come from the metadata; write the empty object rather than nothing.
-            writer.schema = pa.schema(
-                [pa.field(n, t) for n, t in type_hints.items()]
+            writer.schema = _pin_schema(
+                pa.schema([pa.field(n, t) for n, t in type_hints.items()])
             )
         return writer.close()
 
