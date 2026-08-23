@@ -190,19 +190,26 @@ def _pin_schema(
 ) -> "pa.Schema":
     """Resolve the schema every part of an object will be written with.
 
-    Only columns inferred as ``null`` are overridden: an all-null first batch
-    says nothing about the column, whereas an inferred concrete type is evidence
-    from the data itself and outranks any metadata hint.
+    Columns inferred as ``null`` use their metadata hint when present. Arrow
+    Decimal256 is always changed to ``large_string`` because Polars cannot read
+    a Decimal256 Parquet part back; casting preserves every decimal digit.
     """
     hints = type_hints or {}
     fields = []
     for field in schema:
         if pa.types.is_null(field.type):
-            fields.append(
-                pa.field(field.name, hints.get(field.name, pa.large_string()))
+            field = pa.field(
+                field.name, hints.get(field.name, pa.large_string())
             )
-        else:
-            fields.append(field)
+        if pa.types.is_decimal256(field.type):
+            logger.warning(
+                "%s: %s -> large_string; Polars cannot read Decimal256 "
+                "and the fallback preserves every digit",
+                field.name,
+                field.type,
+            )
+            field = pa.field(field.name, pa.large_string())
+        fields.append(field)
     return pa.schema(fields)
 
 

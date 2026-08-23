@@ -174,6 +174,60 @@ def test_decimal_past_decimal128_becomes_readable_text(tmp_path, caplog):
     assert "large_string" in caplog.text
 
 
+def test_first_batch_decimal256_inference_becomes_readable_text(
+    tmp_path, caplog
+):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(pa.table({"amount": [exact]}))
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.String}
+    assert frame["amount"].to_list() == [
+        "123456789012345678901234567890123456789.12"
+    ]
+    assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_explicit_decimal256_schema_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    schema = pa.schema([pa.field("amount", pa.decimal256(41, 2))])
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(
+            str(tmp_path), "ledger", schema=schema
+        ) as writer:
+            writer.write(pa.table({"amount": [exact]}, schema=schema))
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.String}
+    assert frame["amount"].to_list() == [
+        "123456789012345678901234567890123456789.12"
+    ]
+    assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_first_batch_decimal128_remains_decimal(tmp_path):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456.12")
+    with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+        writer.write(pa.table({"amount": [exact]}))
+    paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.Decimal(38, 2)}
+    assert frame["amount"].to_list() == [
+        Decimal("123456789012345678901234567890123456.12")
+    ]
+
+
 def test_integer_and_decimal_meet_on_a_decimal():
     covering = pio._covering_decimal(pa.int64(), pa.decimal128(10, 4))
     assert pa.types.is_decimal(covering)
