@@ -224,10 +224,48 @@ def _normalize_decimal256_field(field: "pa.Field", path: str) -> "pa.Field":
     )
 
 
+def _contains_decimal256(dtype: "pa.DataType") -> bool:
+    """Whether an Arrow type contains Decimal256 without changing it."""
+    if pa.types.is_decimal256(dtype):
+        return True
+
+    children = []
+    if isinstance(dtype, pa.BaseExtensionType):
+        children = [dtype.storage_type]
+    elif (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_list_view(dtype)
+        or pa.types.is_large_list_view(dtype)
+    ):
+        children = [dtype.value_type]
+    elif pa.types.is_struct(dtype) or pa.types.is_union(dtype):
+        children = [field.type for field in dtype]
+    elif pa.types.is_map(dtype):
+        children = [dtype.key_field.type, dtype.item_field.type]
+    elif pa.types.is_dictionary(dtype) or pa.types.is_run_end_encoded(dtype):
+        children = [dtype.value_type]
+    return any(_contains_decimal256(child) for child in children)
+
+
 def _normalize_decimal256_type(
     dtype: "pa.DataType", path: str
 ) -> "pa.DataType":
     """Replace Decimal256 leaves in Arrow container types with text."""
+    if isinstance(dtype, pa.BaseExtensionType) and _contains_decimal256(
+        dtype.storage_type
+    ):
+        logger.warning(
+            "%s: extension storage contains Decimal256 in %s; refusing to "
+            "write an unreadable Parquet part",
+            path,
+            dtype,
+        )
+        raise SchemaDriftError(
+            f"cannot write extension type at {path}: its storage contains "
+            f"Decimal256 ({dtype})"
+        )
     if pa.types.is_decimal256(dtype):
         logger.warning(
             "%s: %s -> large_string; Polars cannot read Decimal256 "

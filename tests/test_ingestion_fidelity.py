@@ -25,6 +25,18 @@ from qalita_core.data_source_opener import (
 # ---------------------------------------------------------------------------
 
 
+class _DecimalStorageExtensionType(pa.ExtensionType):
+    def __init__(self, storage_type):
+        super().__init__(storage_type, "qalita.test_decimal_storage")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls(storage_type)
+
+
 def test_decimal_reaches_arrow_untouched():
     """float() used to be applied here, rounding away everything past ~15
     significant digits."""
@@ -292,6 +304,32 @@ def test_empty_sql_decimal256_hint_becomes_readable_text(tmp_path, caplog):
     assert frame.schema == {"amount": pl.String}
     assert frame.to_dicts() == []
     assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_decimal256_extension_storage_is_refused_before_opening_a_part(
+    tmp_path, caplog
+):
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    extension_type = _DecimalStorageExtensionType(pa.decimal256(41, 2))
+    array = pa.ExtensionArray.from_storage(
+        extension_type,
+        pa.array([exact], type=pa.decimal256(41, 2)),
+    )
+    writer = pio.ParquetPartWriter(str(tmp_path), "ledger")
+
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pytest.raises(pio.SchemaDriftError, match="amount.*Decimal256"):
+            writer.write(pa.table({"amount": array}))
+
+    assert list(tmp_path.glob("ledger_part_*.parquet")) == []
+    assert "amount: extension storage contains Decimal256" in caplog.text
+
+
+def test_extension_storage_without_decimal256_is_unchanged():
+    extension_type = _DecimalStorageExtensionType(pa.large_string())
+    schema = pa.schema([pa.field("amount", extension_type)])
+
+    assert pio._pin_schema(schema).field("amount").type == extension_type
 
 
 def test_first_batch_decimal128_remains_decimal(tmp_path):
