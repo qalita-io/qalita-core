@@ -11,13 +11,16 @@ in the driver before the first chunk is yielded. Everything here now goes
 through :mod:`qalita_core.polars_io`, which asks for a server-side cursor where
 the driver has one and streams Arrow batches straight to Parquet.
 
-Two properties the rest of the system depends on:
+Three properties the rest of the system depends on:
 
 * ``get_data()`` returns ``List[str]`` — the parquet parts, in order.
 * ``object_paths`` maps each logical object (table, collection, index, file) to
   its parts. ``Pack`` prefers it over parsing part-file names, which is what
   makes ``zip(table_names, parquet_paths)`` — the idiom that silently dropped
   chunks 2..N — unnecessary at the root.
+* ``skipped_objects`` lists what a multi-object scan could not read and why. A
+  scan that silently returns half a schema is worse than one that fails, so a
+  partial result always comes with the objects that are missing from it.
 """
 
 import glob
@@ -344,6 +347,112 @@ class _SqlAlchemySource(DataSource):
     def _is_sql_query(self, s: str) -> bool:
         return _is_sql_query(s)
 
+    @property
+    def skipped_objects(self) -> List[Dict[str, str]]:
+        """Objects a scan could not read: ``object``, ``error``, ``reason``.
+
+        Populated in scan order and never cleared, so a caller that runs
+        several scans on the same source still sees every object that is
+        missing from the parquet parts it was handed.
+        """
+        existing = getattr(self, "_skipped_objects", None)
+        if existing is None:
+            existing = []
+            self._skipped_objects = existing
+        return existing
+
+    def _read_tables(
+        self,
+        engine,
+        table_names,
+        schema,
+        output_dir,
+        chunk_rows,
+        dialect_name=None,
+        pack_config=None,
+    ) -> List[str]:
+        """Read each table, skipping the ones the connection cannot read.
+
+        A ``"*"`` scan covers every table *and view* of the schema, technical
+        objects included, so it used to require ``SELECT`` on the whole schema:
+        the first refusal aborted the job after it had already streamed every
+        readable table. A refused table is a property of that table, not of the
+        run, so it is skipped.
+
+        Skipping silently would be worse than the abort it replaces — a scan
+        missing half its tables would look like a clean one — hence the
+        per-object warning, the end-of-scan recap, and the refusal to return an
+        empty scan as a success.
+        """
+        all_paths: List[str] = []
+        read_count = 0
+        skipped: List[Dict[str, str]] = []
+        first_error: Optional[BaseException] = None
+
+        for table_name in table_names:
+            try:
+                all_paths.extend(
+                    self._read_table_to_parquet(
+                        engine,
+                        table_name,
+                        schema,
+                        output_dir,
+                        chunk_rows,
+                        dialect_name,
+                        pack_config=pack_config,
+                    )
+                )
+            except InsufficientDiskSpaceError:
+                # Not a property of this table: every remaining one would fail
+                # the same way, and burying the cause under N identical
+                # warnings would turn a full disk into a partial scan.
+                raise
+            except Exception as exc:  # noqa: BLE001 - any table may be denied
+                # Driver messages carry the offending SQL on their own lines;
+                # folded into one so a skip stays a single greppable log line.
+                reason = " ".join(str(exc).split()) or exc.__class__.__name__
+                skipped.append(
+                    {
+                        "object": str(table_name),
+                        "error": exc.__class__.__name__,
+                        "reason": reason,
+                    }
+                )
+                if first_error is None:
+                    first_error = exc
+                logger.warning(
+                    "skipping %s: it could not be read (%s: %s)",
+                    table_name,
+                    exc.__class__.__name__,
+                    reason,
+                )
+            else:
+                # Counted rather than derived from all_paths: an empty table
+                # was read successfully and yields no part.
+                read_count += 1
+
+        if skipped:
+            self.skipped_objects.extend(skipped)
+            if not read_count:
+                # Every object failing is not a permission story any more — a
+                # dropped connection would otherwise surface as an empty scan.
+                details = "; ".join(
+                    f"{item['object']} ({item['error']}: {item['reason']})"
+                    for item in skipped
+                )
+                raise RuntimeError(
+                    f"None of the {len(skipped)} objects in the scan could be "
+                    f"read: {details}"
+                ) from first_error
+            logger.warning(
+                "%d of %d objects were skipped and are absent from this scan: %s",
+                len(skipped),
+                len(skipped) + read_count,
+                ", ".join(item["object"] for item in skipped),
+            )
+
+        return all_paths
+
     def _load_data(
         self,
         engine,
@@ -373,27 +482,32 @@ class _SqlAlchemySource(DataSource):
                     chunk_rows,
                     pack_config=pack_config,
                 )
-            tables = [table_or_query]
+            # One explicitly named table: there is nothing to fall back on, so
+            # the driver's own error is more useful than a scan summary.
+            return self._read_table_to_parquet(
+                engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+                pack_config=pack_config,
+            )
         else:
             raise TypeError(
                 "table_or_query must be None, '*', a string, or a list of "
                 "table names."
             )
 
-        all_paths: List[str] = []
-        for table_name in tables:
-            all_paths.extend(
-                self._read_table_to_parquet(
-                    engine,
-                    table_name,
-                    schema,
-                    output_dir,
-                    chunk_rows,
-                    dialect_name,
-                    pack_config=pack_config,
-                )
-            )
-        return all_paths
+        return self._read_tables(
+            engine,
+            tables,
+            schema,
+            output_dir,
+            chunk_rows,
+            dialect_name,
+            pack_config=pack_config,
+        )
 
     def _read_table_to_parquet(
         self,
@@ -743,6 +857,10 @@ class DatabaseSource(_SqlAlchemySource):
         - If table_or_query is a SQL query string: returns list of parquet paths for the query result
         - If table_or_query is a list/tuple/set of table names: returns parquet paths for each table
         - If table_or_query is '*' or None: scan all tables and return parquet paths for each
+
+        When several tables are read, one the connection cannot read is
+        skipped and recorded in ``skipped_objects`` rather than aborting the
+        scan; see :meth:`_SqlAlchemySource._read_tables`.
         """
 
         # Determine schema: prefer source config over pack config; both are optional
@@ -773,37 +891,27 @@ class DatabaseSource(_SqlAlchemySource):
                 raise ValueError(
                     "No tables found in the database for the given schema."
                 )
-            all_paths: List[str] = []
-            for table_name in table_names:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        self.engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                        pack_config=pack_config,
-                    )
-                )
-            return all_paths
+            return self._read_tables(
+                self.engine,
+                table_names,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+                pack_config=pack_config,
+            )
 
         # If a list/tuple/set of table names is provided
         if isinstance(table_or_query, (list, tuple, set)):
-            all_paths: List[str] = []
-            for table_name in table_or_query:
-                all_paths.extend(
-                    self._read_table_to_parquet(
-                        self.engine,
-                        table_name,
-                        schema,
-                        output_dir,
-                        chunk_rows,
-                        dialect_name,
-                        pack_config=pack_config,
-                    )
-                )
-            return all_paths
+            return self._read_tables(
+                self.engine,
+                table_or_query,
+                schema,
+                output_dir,
+                chunk_rows,
+                dialect_name,
+                pack_config=pack_config,
+            )
 
         # If a single string is provided, determine if it's a table name or SQL query
         if isinstance(table_or_query, str):

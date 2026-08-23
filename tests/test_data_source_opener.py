@@ -4,6 +4,7 @@ Tests for qalita_core.data_source_opener module
 """
 
 import pytest
+import logging
 import os
 import json
 import sqlite3
@@ -12,10 +13,13 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
+from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 
 from qalita_core.data_source_opener import (
     FileSource,
     DatabaseSource,
+    _SqlAlchemySource,
     S3Source,
     GCSSource,
     AzureBlobSource,
@@ -25,6 +29,7 @@ from qalita_core.data_source_opener import (
     SqliteSource,
     get_data_source,
     _ensure_output_dir,
+    _chunk_rows,
     _build_base_name,
     _build_parquet_path,
     _infer_format_from_path,
@@ -276,6 +281,190 @@ class TestDatabaseSource:
         )
         assert source._is_sql_query("my_table") is False
         assert source._is_sql_query("SELECT;multiple") is True
+
+
+def _make_scan_db(path, readable=("alpha", "beta"), unreadable=("forbidden",)):
+    """A database whose catalog lists objects the connection cannot read.
+
+    A view over a missing table fails exactly where a table without a ``SELECT``
+    grant fails: the catalog lists it, the ``SELECT`` is refused. That shape is
+    reachable on sqlite, so the scan can be exercised without a server.
+    """
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    for index, name in enumerate(readable):
+        cur.execute(f"CREATE TABLE {name}(id INTEGER)")
+        cur.execute(f"INSERT INTO {name} VALUES ({index})")
+    for name in unreadable:
+        cur.execute(f"CREATE VIEW {name} AS SELECT * FROM missing_{name}")
+    conn.commit()
+    conn.close()
+
+
+class _WarehouseStub(_SqlAlchemySource):
+    """Stands in for the sources that share ``_SqlAlchemySource._load_data``.
+
+    Snowflake, BigQuery, ClickHouse, Teradata, SAP HANA, DB2, Athena and
+    Synapse all dispatch through it; a sqlite engine exercises that shared loop
+    without any of their drivers.
+    """
+
+    dialect_name = "warehouse"
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def get_data(self, table_or_query=None, pack_config=None):
+        return self._load_data(
+            self.engine,
+            table_or_query,
+            None,
+            _ensure_output_dir(pack_config),
+            _chunk_rows(pack_config),
+            pack_config=pack_config,
+        )
+
+
+class TestScanSkipsUnreadableObjects:
+    """``table_or_query`` defaults to ``"*"``, which covers the whole schema.
+
+    Every table *and view* of it, technical objects included, so on a base with
+    fine-grained grants the first refused ``SELECT`` used to kill the job —
+    after it had already streamed every readable table.
+    """
+
+    def test_unreadable_object_is_skipped_and_recorded(self, tmp_path):
+        db_path = tmp_path / "partial.db"
+        _make_scan_db(db_path)
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        paths = source.get_data(
+            "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+
+        assert set(source.object_paths) == {"sqlite_alpha", "sqlite_beta"}
+        assert sorted(paths) == sorted(
+            p for parts in source.object_paths.values() for p in parts
+        )
+
+        # The tables that are missing from the scan are named, with the reason.
+        assert [item["object"] for item in source.skipped_objects] == [
+            "forbidden"
+        ]
+        skipped = source.skipped_objects[0]
+        assert skipped["error"] == "OperationalError"
+        assert "missing_forbidden" in skipped["reason"]
+
+    def test_the_scan_logs_a_recap_of_what_it_skipped(self, tmp_path, caplog):
+        # A partial scan nobody is told about is worse than the abort it
+        # replaces, so the recap is part of the contract.
+        db_path = tmp_path / "recap.db"
+        _make_scan_db(db_path)
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        with caplog.at_level(
+            logging.WARNING, logger="qalita_core.data_source_opener"
+        ):
+            source.get_data(
+                "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "skipping forbidden" in message and "OperationalError" in message
+            for message in messages
+        )
+        recap = [m for m in messages if "absent from this scan" in m]
+        assert len(recap) == 1
+        assert "1 of 3 objects" in recap[0] and "forbidden" in recap[0]
+
+    def test_scan_fails_when_no_object_could_be_read(self, tmp_path):
+        # Otherwise a dropped connection would return an empty scan as a
+        # success, which is the failure mode the per-table skip introduces.
+        db_path = tmp_path / "denied.db"
+        _make_scan_db(db_path, readable=(), unreadable=("forbidden", "other"))
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        with pytest.raises(RuntimeError) as excinfo:
+            source.get_data(
+                "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
+            )
+
+        message = str(excinfo.value)
+        assert "forbidden" in message and "other" in message
+        assert "OperationalError" in message
+        assert source.skipped_objects != []
+
+    def test_empty_schema_still_raises_value_error(self, tmp_path):
+        db_path = tmp_path / "empty.db"
+        sqlite3.connect(db_path).close()
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        with pytest.raises(ValueError, match="No tables found"):
+            source.get_data(
+                "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
+            )
+
+    def test_a_fully_readable_scan_is_unchanged(self, tmp_path):
+        db_path = tmp_path / "readable.db"
+        _make_scan_db(db_path, unreadable=())
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        paths = source.get_data(
+            "*", pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+
+        assert set(source.object_paths) == {"sqlite_alpha", "sqlite_beta"}
+        assert len(paths) == 2
+        assert source.skipped_objects == []
+
+    def test_explicit_table_list_skips_the_unreadable_one(self, tmp_path):
+        db_path = tmp_path / "listed.db"
+        _make_scan_db(db_path)
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        paths = source.get_data(
+            ["alpha", "forbidden", "beta"],
+            pack_config={"parquet_output_dir": str(tmp_path / "out")},
+        )
+
+        assert set(source.object_paths) == {"sqlite_alpha", "sqlite_beta"}
+        assert len(paths) == 2
+        assert [item["object"] for item in source.skipped_objects] == [
+            "forbidden"
+        ]
+
+    def test_a_single_named_table_keeps_its_own_error(self, tmp_path):
+        # Nothing to fall back on when one table was asked for by name: the
+        # driver's error is more useful than a one-line scan summary.
+        db_path = tmp_path / "named.db"
+        _make_scan_db(db_path)
+
+        source = DatabaseSource(connection_string=f"sqlite:///{db_path}")
+        with pytest.raises(OperationalError):
+            source.get_data(
+                "forbidden",
+                pack_config={"parquet_output_dir": str(tmp_path / "out")},
+            )
+        assert source.skipped_objects == []
+
+    def test_shared_warehouse_dispatch_skips_the_unreadable_one(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "warehouse.db"
+        _make_scan_db(db_path, readable=("alpha",))
+
+        source = _WarehouseStub(create_engine(f"sqlite:///{db_path}"))
+        paths = source.get_data(
+            ["alpha", "forbidden"],
+            pack_config={"parquet_output_dir": str(tmp_path / "out")},
+        )
+
+        assert list(source.object_paths) == ["warehouse_alpha"]
+        assert len(paths) == 1
+        assert [item["object"] for item in source.skipped_objects] == [
+            "forbidden"
+        ]
 
 
 class TestGetDataSource:
