@@ -93,6 +93,8 @@ class Pack:
         # is how chunks 2..N used to be silently dropped or relabelled.
         self.objects_source: Dict[str, List[str]] = {}
         self.objects_target: Dict[str, List[str]] = {}
+        self.skipped_source_objects: List[Dict[str, str]] = []
+        self.skipped_target_objects: List[Dict[str, str]] = []
 
         # Validate configurations
         if not self.source_config:
@@ -207,16 +209,21 @@ class Pack:
         }
         paths = ds.get_data(table_or_query, pack_config=effective_pack_conf)
         objects = self._group_by_object(ds, paths)
+        skipped_objects = [
+            dict(item) for item in getattr(ds, "skipped_objects", [])
+        ]
         if trigger == "source":
             # Keep legacy attribute names for backward compatibility
             self.paths_source = paths
             self.df_source = paths
             self.objects_source = objects
+            self.skipped_source_objects = skipped_objects
             return self.paths_source
         elif trigger == "target":
             self.paths_target = paths
             self.df_target = paths
             self.objects_target = objects
+            self.skipped_target_objects = skipped_objects
             return self.paths_target
 
     @staticmethod
