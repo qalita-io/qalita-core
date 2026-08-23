@@ -623,7 +623,7 @@ def _csv_read_options(config: Optional[dict]) -> Dict[str, Any]:
 
     has_header = config.get("has_header")
     if has_header is not None:
-        options["has_header"] = bool(has_header)
+        options["has_header"] = _config_flag(has_header, default=True)
 
     decimal_separator = config.get("decimal_separator")
     if decimal_separator not in (None, ""):
@@ -634,9 +634,20 @@ def _csv_read_options(config: Optional[dict]) -> Dict[str, Any]:
             )
         options["decimal_comma"] = decimal_separator == ","
     elif config.get("decimal_comma") is not None:
-        options["decimal_comma"] = bool(config["decimal_comma"])
+        options["decimal_comma"] = _config_flag(
+            config["decimal_comma"], default=False
+        )
 
     return options
+
+
+def _config_flag(value: Any, default: bool) -> bool:
+    """Parse a platform flag using the CLI's legacy-compatible semantics."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no")
+    return bool(value)
 
 
 class FileSource(DataSource):

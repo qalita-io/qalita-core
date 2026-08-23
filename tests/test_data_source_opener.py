@@ -876,6 +876,60 @@ class TestCsvSourceOptions:
         assert frame.columns == ["column_1", "column_2"]
         assert frame["column_1"].to_list() == [1, 2]
 
+    def test_has_header_string_false_keeps_the_first_line_as_data(
+        self, tmp_path
+    ):
+        csv_path = tmp_path / "headless-string.csv"
+        csv_path.write_text("1;alpha\n2;beta\n", encoding="utf-8")
+        source = FileSource(
+            str(csv_path),
+            config={
+                "path": str(csv_path),
+                "delimiter": ";",
+                "has_header": "false",
+            },
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.height == 2
+        assert frame.columns == ["column_1", "column_2"]
+        assert frame["column_1"].to_list() == [1, 2]
+
+    def test_decimal_comma_string_false_keeps_decimal_values_as_strings(
+        self, tmp_path
+    ):
+        csv_path = self._european(tmp_path)
+        source = FileSource(
+            str(csv_path),
+            config={
+                "path": str(csv_path),
+                "delimiter": ";",
+                "decimal_comma": "false",
+            },
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.schema["hba1c_pct"] == pl.String
+        assert frame["hba1c_pct"].to_list() == ["8,4", "6,1", "7,25"]
+
+    def test_decimal_comma_string_true_infers_decimal_values(self, tmp_path):
+        csv_path = self._european(tmp_path)
+        source = FileSource(
+            str(csv_path),
+            config={
+                "path": str(csv_path),
+                "delimiter": ";",
+                "decimal_comma": "true",
+            },
+        )
+
+        frame = self._collect(source, tmp_path)
+
+        assert frame.schema["hba1c_pct"] == pl.Float64
+        assert frame["hba1c_pct"].to_list() == [8.4, 6.1, 7.25]
+
     def test_utf8_sig_is_accepted_and_the_bom_is_dropped(self, tmp_path):
         """Checked against Polars rather than assumed: it strips the BOM."""
         csv_path = tmp_path / "bom.csv"
