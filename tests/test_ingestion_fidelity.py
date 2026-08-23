@@ -6,9 +6,11 @@ Nothing raised, so nothing caught them except reading the values back.
 """
 
 import json
+import logging
 from decimal import Decimal
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from qalita_core import polars_io as pio
@@ -96,12 +98,80 @@ def test_decimal_widens_to_decimal_not_to_text():
     assert wider[0] == pa.decimal128(7, 4)
 
 
-def test_decimal_beyond_decimal128_goes_to_decimal256():
-    covering = pio._covering_decimal(
-        pa.decimal128(38, 0), pa.decimal128(38, 20)
+def test_polars_reads_decimal128_back_and_refuses_decimal256(tmp_path):
+    """The ceiling the promotion obeys, measured instead of assumed.
+
+    Arrow writes decimal256 happily; Polars reads Decimal128 and nothing
+    wider, so a part written past 38 digits cannot be opened by the step that
+    follows the load. In a job the refusal arrives as a Rust panic —
+    ``PanicException`` inherits from ``BaseException``, so no ``except
+    Exception`` in the chain catches it — while under pytest the same read
+    surfaces as ``InvalidOperationError``; either way the object is lost.
+    """
+    import polars as pl
+    from polars.exceptions import InvalidOperationError, PanicException
+
+    readable = tmp_path / "readable.parquet"
+    pq.write_table(
+        pa.table({"q": pa.array([None], type=pa.decimal128(38, 18))}),
+        str(readable),
     )
-    assert pa.types.is_decimal256(covering)
-    assert covering.scale == 20
+    assert pl.read_parquet(readable).height == 1
+
+    unreadable = tmp_path / "unreadable.parquet"
+    pq.write_table(
+        pa.table({"q": pa.array([None], type=pa.decimal256(41, 21))}),
+        str(unreadable),
+    )
+    with pytest.raises((PanicException, InvalidOperationError)) as caught:
+        pl.read_parquet(unreadable)
+    assert "Decimal256" in str(caught.value) or "38" in str(caught.value)
+
+
+def test_covering_decimal_never_returns_something_unreadable():
+    """Whatever comes in — including the decimal256 Arrow infers on its own —
+    what comes out is a decimal128 the reader supports, or nothing at all."""
+    types = [pa.int64(), pa.uint64()]
+    for precision in (2, 20, 38, 39, 50, 76):
+        build = pa.decimal128 if precision <= 38 else pa.decimal256
+        for scale in (0, 1, 18, 21, 38):
+            if scale <= precision:
+                types.append(build(precision, scale))
+
+    for pinned in types:
+        for incoming in types:
+            covering = pio._covering_decimal(pinned, incoming)
+            if covering is None:
+                continue
+            assert pa.types.is_decimal128(covering), (
+                pinned,
+                incoming,
+                covering,
+            )
+            assert covering.precision <= 38
+
+
+def test_decimal_past_decimal128_becomes_readable_text(tmp_path, caplog):
+    """The reported trigger: a PostgreSQL ``numeric`` declared without
+    precision whose scale grows batch after batch. Twenty integer digits and
+    twenty-two decimals fit no decimal Polars can read, so the column falls to
+    text — keeping every digit, and keeping the object openable, which used to
+    be what the promotion cost us."""
+    import polars as pl
+
+    big = Decimal("12345678901234567890.12")
+    precise = Decimal("1.234567890123456789012")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(pa.table({"amount": pa.array([big])}))
+            writer.write(pa.table({"amount": pa.array([precise])}))
+        paths = writer.close()
+
+    assert writer.schema.field("amount").type == pa.large_string()
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame["amount"].to_list() == [str(big), str(precise)]
+    # a column that stops being a number has to be visible in the job log
+    assert "large_string" in caplog.text
 
 
 def test_integer_and_decimal_meet_on_a_decimal():

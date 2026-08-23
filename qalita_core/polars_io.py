@@ -244,6 +244,14 @@ def _castable(column: Any, target: "pa.DataType") -> bool:
 
 _INTEGER_DIGITS = {8: 3, 16: 5, 32: 10, 64: 19}
 
+# Arrow widens decimals to 76 digits via decimal256, but Polars reads back
+# Decimal128 and nothing else: a part written as decimal256 makes the very next
+# ``pl.scan_parquet`` panic in Rust ("Arrow datatype Decimal256(41, 21) not
+# supported by Polars"), and that panic is a ``BaseException`` no ``except
+# Exception`` on the way out catches. The reader is the binding constraint, so
+# the ladder stops at what decimal128 holds.
+_MAX_DECIMAL_PRECISION = 38
+
 
 def _decimal_parts(dtype: "pa.DataType") -> Optional[tuple]:
     """``(integer digits, scale)`` needed to hold every value of ``dtype``."""
@@ -262,11 +270,16 @@ def _decimal_parts(dtype: "pa.DataType") -> Optional[tuple]:
 def _covering_decimal(
     pinned: "pa.DataType", incoming: "pa.DataType"
 ) -> Optional["pa.DataType"]:
-    """The narrowest decimal holding both, or None when no standard one does.
+    """The narrowest decimal holding both, or None when no readable one does.
 
     Absorbing a longer scale by widening to float64 would reintroduce exactly
     the silent rounding that keeping Decimal out of float exists to prevent, so
     a decimal column widens to a wider decimal or not at all.
+
+    "Readable" is ``_MAX_DECIMAL_PRECISION`` digits: past that only decimal256
+    would fit, and Polars cannot read that back. Returning None there hands the
+    column to the ``large_string`` step of the ladder, which keeps every digit
+    in a form the next step can actually open.
     """
     left = _decimal_parts(pinned)
     right = _decimal_parts(incoming)
@@ -274,11 +287,9 @@ def _covering_decimal(
         return None
     scale = max(left[1], right[1])
     precision = max(left[0], right[0]) + scale
-    if precision <= 38:
-        return pa.decimal128(precision, scale)
-    if precision <= 76:
-        return pa.decimal256(precision, scale)
-    return None
+    if precision > _MAX_DECIMAL_PRECISION:
+        return None
+    return pa.decimal128(precision, scale)
 
 
 def _wider_types(
@@ -293,8 +304,10 @@ def _wider_types(
 
     Decimals are the one place a column can widen more than twice: a source
     whose batches carry a growing scale walks decimal128(p,s) upwards one step
-    per surprise. It is bounded by precision 38 (then 76 via decimal256), and
-    each step is a rewrite of the parts already on disk — the alternative,
+    per surprise. It is bounded by precision 38 — the limit Polars imposes on
+    the way back in, not the one Arrow imposes on the way out — after which the
+    column falls to ``large_string`` like any other type that ran out of room.
+    Each step is a rewrite of the parts already on disk; the alternative,
     collapsing to float64 on the first scale change, silently rounds the
     values instead.
     """
