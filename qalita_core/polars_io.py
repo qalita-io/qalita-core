@@ -197,20 +197,147 @@ def _pin_schema(
 ) -> "pa.Schema":
     """Resolve the schema every part of an object will be written with.
 
-    Only columns inferred as ``null`` are overridden: an all-null first batch
-    says nothing about the column, whereas an inferred concrete type is evidence
-    from the data itself and outranks any metadata hint.
+    Columns inferred as ``null`` use their metadata hint when present. Every
+    Arrow Decimal256 leaf is changed to ``large_string`` because Polars cannot
+    read a Decimal256 Parquet part back; casting preserves every decimal digit.
     """
     hints = type_hints or {}
     fields = []
     for field in schema:
         if pa.types.is_null(field.type):
-            fields.append(
-                pa.field(field.name, hints.get(field.name, pa.large_string()))
+            field = _field_with_type(
+                field, hints.get(field.name, pa.large_string())
             )
-        else:
-            fields.append(field)
-    return pa.schema(fields)
+        fields.append(_normalize_decimal256_field(field, field.name))
+    return pa.schema(fields, metadata=schema.metadata)
+
+
+def _field_with_type(field: "pa.Field", dtype: "pa.DataType") -> "pa.Field":
+    """Change a field type without dropping the source contract."""
+    if field.type.equals(dtype):
+        return field
+    return pa.field(
+        field.name,
+        dtype,
+        nullable=field.nullable,
+        metadata=field.metadata,
+    )
+
+
+def _normalize_decimal256_field(field: "pa.Field", path: str) -> "pa.Field":
+    """Normalize Decimal256 descendants and preserve the Arrow field."""
+    return _field_with_type(
+        field, _normalize_decimal256_type(field.type, path)
+    )
+
+
+def _contains_decimal256(dtype: "pa.DataType") -> bool:
+    """Whether an Arrow type contains Decimal256 without changing it."""
+    if pa.types.is_decimal256(dtype):
+        return True
+
+    children = []
+    if isinstance(dtype, pa.BaseExtensionType):
+        children = [dtype.storage_type]
+    elif (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_list_view(dtype)
+        or pa.types.is_large_list_view(dtype)
+    ):
+        children = [dtype.value_type]
+    elif pa.types.is_struct(dtype) or pa.types.is_union(dtype):
+        children = [field.type for field in dtype]
+    elif pa.types.is_map(dtype):
+        children = [dtype.key_field.type, dtype.item_field.type]
+    elif pa.types.is_dictionary(dtype) or pa.types.is_run_end_encoded(dtype):
+        children = [dtype.value_type]
+    return any(_contains_decimal256(child) for child in children)
+
+
+def _normalize_decimal256_type(
+    dtype: "pa.DataType", path: str
+) -> "pa.DataType":
+    """Replace Decimal256 leaves in Arrow container types with text."""
+    if isinstance(dtype, pa.BaseExtensionType) and _contains_decimal256(
+        dtype.storage_type
+    ):
+        logger.warning(
+            "%s: extension storage contains Decimal256 in %s; refusing to "
+            "write an unreadable Parquet part",
+            path,
+            dtype,
+        )
+        raise SchemaDriftError(
+            f"cannot write extension type at {path}: its storage contains "
+            f"Decimal256 ({dtype})"
+        )
+    if pa.types.is_decimal256(dtype):
+        logger.warning(
+            "%s: %s -> large_string; Polars cannot read Decimal256 "
+            "and the fallback preserves every digit",
+            path,
+            dtype,
+        )
+        normalized = pa.large_string()
+    elif pa.types.is_list(dtype):
+        normalized = pa.list_(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_large_list(dtype):
+        normalized = pa.large_list(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_fixed_size_list(dtype):
+        normalized = pa.list_(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item"),
+            dtype.list_size,
+        )
+    elif pa.types.is_list_view(dtype):
+        normalized = pa.list_view(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_large_list_view(dtype):
+        normalized = pa.large_list_view(
+            _normalize_decimal256_field(dtype.value_field, f"{path}.item")
+        )
+    elif pa.types.is_struct(dtype):
+        normalized = pa.struct(
+            [
+                _normalize_decimal256_field(child, f"{path}.{child.name}")
+                for child in dtype
+            ]
+        )
+    elif pa.types.is_map(dtype):
+        normalized = pa.map_(
+            _normalize_decimal256_field(dtype.key_field, f"{path}.key"),
+            _normalize_decimal256_field(dtype.item_field, f"{path}.value"),
+            keys_sorted=dtype.keys_sorted,
+        )
+    elif pa.types.is_dictionary(dtype):
+        normalized = pa.dictionary(
+            dtype.index_type,
+            _normalize_decimal256_type(dtype.value_type, f"{path}.value"),
+            ordered=dtype.ordered,
+        )
+    elif pa.types.is_run_end_encoded(dtype):
+        normalized = pa.run_end_encoded(
+            dtype.run_end_type,
+            _normalize_decimal256_type(dtype.value_type, f"{path}.value"),
+        )
+    elif pa.types.is_union(dtype):
+        children = [
+            _normalize_decimal256_field(child, f"{path}.{child.name}")
+            for child in dtype
+        ]
+        constructor = (
+            pa.sparse_union if dtype.mode == "sparse" else pa.dense_union
+        )
+        normalized = constructor(children, type_codes=dtype.type_codes)
+    else:
+        normalized = dtype
+    return normalized
 
 
 def _conform(table: "pa.Table", schema: "pa.Schema") -> "pa.Table":
@@ -251,6 +378,14 @@ def _castable(column: Any, target: "pa.DataType") -> bool:
 
 _INTEGER_DIGITS = {8: 3, 16: 5, 32: 10, 64: 19}
 
+# Arrow widens decimals to 76 digits via decimal256, but Polars reads back
+# Decimal128 and nothing else: a part written as decimal256 makes the very next
+# ``pl.scan_parquet`` panic in Rust ("Arrow datatype Decimal256(41, 21) not
+# supported by Polars"), and that panic is a ``BaseException`` no ``except
+# Exception`` on the way out catches. The reader is the binding constraint, so
+# the ladder stops at what decimal128 holds.
+_MAX_DECIMAL_PRECISION = 38
+
 
 def _decimal_parts(dtype: "pa.DataType") -> Optional[tuple]:
     """``(integer digits, scale)`` needed to hold every value of ``dtype``."""
@@ -269,11 +404,16 @@ def _decimal_parts(dtype: "pa.DataType") -> Optional[tuple]:
 def _covering_decimal(
     pinned: "pa.DataType", incoming: "pa.DataType"
 ) -> Optional["pa.DataType"]:
-    """The narrowest decimal holding both, or None when no standard one does.
+    """The narrowest decimal holding both, or None when no readable one does.
 
     Absorbing a longer scale by widening to float64 would reintroduce exactly
     the silent rounding that keeping Decimal out of float exists to prevent, so
     a decimal column widens to a wider decimal or not at all.
+
+    "Readable" is ``_MAX_DECIMAL_PRECISION`` digits: past that only decimal256
+    would fit, and Polars cannot read that back. Returning None there hands the
+    column to the ``large_string`` step of the ladder, which keeps every digit
+    in a form the next step can actually open.
     """
     left = _decimal_parts(pinned)
     right = _decimal_parts(incoming)
@@ -281,11 +421,9 @@ def _covering_decimal(
         return None
     scale = max(left[1], right[1])
     precision = max(left[0], right[0]) + scale
-    if precision <= 38:
-        return pa.decimal128(precision, scale)
-    if precision <= 76:
-        return pa.decimal256(precision, scale)
-    return None
+    if precision > _MAX_DECIMAL_PRECISION:
+        return None
+    return pa.decimal128(precision, scale)
 
 
 def _wider_types(
@@ -300,8 +438,10 @@ def _wider_types(
 
     Decimals are the one place a column can widen more than twice: a source
     whose batches carry a growing scale walks decimal128(p,s) upwards one step
-    per surprise. It is bounded by precision 38 (then 76 via decimal256), and
-    each step is a rewrite of the parts already on disk — the alternative,
+    per surprise. It is bounded by precision 38 — the limit Polars imposes on
+    the way back in, not the one Arrow imposes on the way out — after which the
+    column falls to ``large_string`` like any other type that ran out of room.
+    Each step is a rewrite of the parts already on disk; the alternative,
     collapsing to float64 on the first scale change, silently rounds the
     values instead.
     """
@@ -909,8 +1049,8 @@ def stream_sql_to_parquet(
         if writer.schema is None and type_hints:
             # An empty result set yields no batch at all, so the schema can only
             # come from the metadata; write the empty object rather than nothing.
-            writer.schema = pa.schema(
-                [pa.field(n, t) for n, t in type_hints.items()]
+            writer.schema = _pin_schema(
+                pa.schema([pa.field(n, t) for n, t in type_hints.items()])
             )
         return writer.close()
 

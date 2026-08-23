@@ -6,9 +6,11 @@ Nothing raised, so nothing caught them except reading the values back.
 """
 
 import json
+import logging
 from decimal import Decimal
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from qalita_core import polars_io as pio
@@ -21,6 +23,18 @@ from qalita_core.data_source_opener import (
 # ---------------------------------------------------------------------------
 # Decimal fidelity
 # ---------------------------------------------------------------------------
+
+
+class _DecimalStorageExtensionType(pa.ExtensionType):
+    def __init__(self, storage_type):
+        super().__init__(storage_type, "qalita.test_decimal_storage")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls(storage_type)
 
 
 def test_decimal_reaches_arrow_untouched():
@@ -96,12 +110,241 @@ def test_decimal_widens_to_decimal_not_to_text():
     assert wider[0] == pa.decimal128(7, 4)
 
 
-def test_decimal_beyond_decimal128_goes_to_decimal256():
-    covering = pio._covering_decimal(
-        pa.decimal128(38, 0), pa.decimal128(38, 20)
+def test_polars_reads_decimal128_back_and_refuses_decimal256(tmp_path):
+    """The ceiling the promotion obeys, measured instead of assumed.
+
+    Arrow writes decimal256 happily; Polars reads Decimal128 and nothing
+    wider, so a part written past 38 digits cannot be opened by the step that
+    follows the load. In a job the refusal arrives as a Rust panic —
+    ``PanicException`` inherits from ``BaseException``, so no ``except
+    Exception`` in the chain catches it — while under pytest the same read
+    surfaces as ``InvalidOperationError``; either way the object is lost.
+    """
+    import polars as pl
+    from polars.exceptions import InvalidOperationError, PanicException
+
+    readable = tmp_path / "readable.parquet"
+    pq.write_table(
+        pa.table({"q": pa.array([None], type=pa.decimal128(38, 18))}),
+        str(readable),
     )
-    assert pa.types.is_decimal256(covering)
-    assert covering.scale == 20
+    assert pl.read_parquet(readable).height == 1
+
+    unreadable = tmp_path / "unreadable.parquet"
+    pq.write_table(
+        pa.table({"q": pa.array([None], type=pa.decimal256(41, 21))}),
+        str(unreadable),
+    )
+    with pytest.raises((PanicException, InvalidOperationError)) as caught:
+        pl.read_parquet(unreadable)
+    assert "Decimal256" in str(caught.value) or "38" in str(caught.value)
+
+
+def test_covering_decimal_never_returns_something_unreadable():
+    """Whatever comes in — including the decimal256 Arrow infers on its own —
+    what comes out is a decimal128 the reader supports, or nothing at all."""
+    types = [pa.int64(), pa.uint64()]
+    for precision in (2, 20, 38, 39, 50, 76):
+        build = pa.decimal128 if precision <= 38 else pa.decimal256
+        for scale in (0, 1, 18, 21, 38):
+            if scale <= precision:
+                types.append(build(precision, scale))
+
+    for pinned in types:
+        for incoming in types:
+            covering = pio._covering_decimal(pinned, incoming)
+            if covering is None:
+                continue
+            assert pa.types.is_decimal128(covering), (
+                pinned,
+                incoming,
+                covering,
+            )
+            assert covering.precision <= 38
+
+
+def test_decimal_past_decimal128_becomes_readable_text(tmp_path, caplog):
+    """The reported trigger: a PostgreSQL ``numeric`` declared without
+    precision whose scale grows batch after batch. Twenty integer digits and
+    twenty-two decimals fit no decimal Polars can read, so the column falls to
+    text — keeping every digit, and keeping the object openable, which used to
+    be what the promotion cost us."""
+    import polars as pl
+
+    big = Decimal("12345678901234567890.12")
+    precise = Decimal("1.234567890123456789012")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(pa.table({"amount": pa.array([big])}))
+            writer.write(pa.table({"amount": pa.array([precise])}))
+        paths = writer.close()
+
+    assert writer.schema.field("amount").type == pa.large_string()
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame["amount"].to_list() == [str(big), str(precise)]
+    # a column that stops being a number has to be visible in the job log
+    assert "large_string" in caplog.text
+
+
+def test_first_batch_decimal256_inference_becomes_readable_text(
+    tmp_path, caplog
+):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(pa.table({"amount": [exact]}))
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.String}
+    assert frame["amount"].to_list() == [
+        "123456789012345678901234567890123456789.12"
+    ]
+    assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_explicit_decimal256_schema_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    schema = pa.schema(
+        [
+            pa.field(
+                "amount",
+                pa.decimal256(41, 2),
+                nullable=False,
+                metadata={b"source": b"postgres"},
+            )
+        ]
+    )
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(
+            str(tmp_path), "ledger", schema=schema
+        ) as writer:
+            assert writer.schema.field("amount").nullable is False
+            assert writer.schema.field("amount").metadata == {
+                b"source": b"postgres"
+            }
+            writer.write(pa.table({"amount": [exact]}, schema=schema))
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.String}
+    assert frame["amount"].to_list() == [
+        "123456789012345678901234567890123456789.12"
+    ]
+    assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_list_decimal256_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(
+                pa.table(
+                    {
+                        "amounts": pa.array(
+                            [[exact]],
+                            type=pa.list_(pa.decimal256(41, 2)),
+                        )
+                    }
+                )
+            )
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amounts": pl.List(pl.String)}
+    assert frame["amounts"].to_list() == [
+        ["123456789012345678901234567890123456789.12"]
+    ]
+    assert "amounts.item: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_struct_decimal256_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    record_type = pa.struct([pa.field("amount", pa.decimal256(41, 2))])
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+            writer.write(
+                pa.table(
+                    {"record": pa.array([{"amount": exact}], type=record_type)}
+                )
+            )
+        paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"record": pl.Struct({"amount": pl.String})}
+    assert frame["record"].to_list() == [
+        {"amount": "123456789012345678901234567890123456789.12"}
+    ]
+    assert "record.amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_empty_sql_decimal256_hint_becomes_readable_text(tmp_path, caplog):
+    import polars as pl
+    from sqlalchemy import create_engine
+
+    engine = create_engine("sqlite://")
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        paths = pio.stream_sql_to_parquet(
+            engine,
+            "SELECT 1 AS amount WHERE 0",
+            str(tmp_path),
+            "ledger",
+            type_hints={"amount": pa.decimal256(41, 2)},
+        )
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.String}
+    assert frame.to_dicts() == []
+    assert "amount: decimal256(41, 2) -> large_string" in caplog.text
+
+
+def test_decimal256_extension_storage_is_refused_before_opening_a_part(
+    tmp_path, caplog
+):
+    exact = Decimal("123456789012345678901234567890123456789.12")
+    extension_type = _DecimalStorageExtensionType(pa.decimal256(41, 2))
+    array = pa.ExtensionArray.from_storage(
+        extension_type,
+        pa.array([exact], type=pa.decimal256(41, 2)),
+    )
+    writer = pio.ParquetPartWriter(str(tmp_path), "ledger")
+
+    with caplog.at_level(logging.WARNING, logger="qalita_core.polars_io"):
+        with pytest.raises(pio.SchemaDriftError, match="amount.*Decimal256"):
+            writer.write(pa.table({"amount": array}))
+
+    assert list(tmp_path.glob("ledger_part_*.parquet")) == []
+    assert "amount: extension storage contains Decimal256" in caplog.text
+
+
+def test_extension_storage_without_decimal256_is_unchanged():
+    extension_type = _DecimalStorageExtensionType(pa.large_string())
+    schema = pa.schema([pa.field("amount", extension_type)])
+
+    assert pio._pin_schema(schema).field("amount").type == extension_type
+
+
+def test_first_batch_decimal128_remains_decimal(tmp_path):
+    import polars as pl
+
+    exact = Decimal("123456789012345678901234567890123456.12")
+    with pio.ParquetPartWriter(str(tmp_path), "ledger") as writer:
+        writer.write(pa.table({"amount": [exact]}))
+    paths = writer.close()
+
+    frame = pl.scan_parquet(paths).collect(engine="streaming")
+    assert frame.schema == {"amount": pl.Decimal(38, 2)}
+    assert frame["amount"].to_list() == [
+        Decimal("123456789012345678901234567890123456.12")
+    ]
 
 
 def test_integer_and_decimal_meet_on_a_decimal():
