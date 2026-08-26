@@ -256,3 +256,61 @@ class TestSanitizeCopySemantics:
         out = sanitize_dataframe_for_parquet(df, copy=False)
         assert out is df
         assert df["col"].iloc[0] == "a"
+
+
+class TestSanitizeWarningsAndFallbacks:
+    """Covers the warning and error-fallback branches."""
+
+    def test_warn_deprecated_emits_warning(self):
+        df = pd.DataFrame({"a": [1]})
+        with pytest.warns(DeprecationWarning):
+            sanitize_dataframe_for_parquet(df, warn_deprecated=True)
+
+    def test_astype_string_failure_falls_back_to_str(self):
+        # A dict value makes to_numeric raise and astype("string") fail, so the
+        # final apply(str) fallback must kick in.
+        df = pd.DataFrame({"col": [{"a": 1}, "x"]})
+        out = sanitize_dataframe_for_parquet(df)
+        assert out["col"].iloc[0] == "{'a': 1}"
+        assert out["col"].iloc[1] == "x"
+
+
+class TestInstallFallbackBranches:
+    """Covers the skip_sanitize and error-fallback paths of the hook."""
+
+    def test_skip_sanitize_passes_through(self, tmp_path):
+        install_pandas_parquet_sanitization()
+        df = pd.DataFrame({"col": [b"a", b"b"]})
+        p = tmp_path / "out.parquet"
+        df.to_parquet(p, _skip_sanitize=True)
+        assert p.exists()
+
+    def test_sanitize_failure_falls_back(self, tmp_path, monkeypatch):
+        import qalita_core.pandas_sanitization as ps
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ps, "sanitize_dataframe_for_parquet", _boom)
+        install_pandas_parquet_sanitization()
+        df = pd.DataFrame({"col": [b"a", b"b"]})
+        p = tmp_path / "out.parquet"
+        df.to_parquet(p)
+        assert p.exists()
+
+    def test_install_swallows_patch_failure(self, monkeypatch):
+        class _ReadOnly:
+            @property
+            def to_parquet(self):
+                return None
+
+            @to_parquet.setter
+            def to_parquet(self, value):
+                raise AttributeError("read-only")
+
+        monkeypatch.setattr(pd.DataFrame, "to_parquet", _ReadOnly.to_parquet)
+        monkeypatch.setattr(
+            pd.DataFrame, "_qalita_safe_to_parquet_installed", False
+        )
+        # Must not raise even though the assignment is rejected.
+        install_pandas_parquet_sanitization()

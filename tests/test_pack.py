@@ -8,14 +8,17 @@ from qalita_core.pack import (
     ConfigLoader,
     PlatformAsset,
     _sanitize_for_json,
+    _object_key,
 )
 from qalita_core.data_source_opener import cleanup_parquet_files
 import pytest
 import os
 import json
 import math
+import base64
 import datetime as dt
 from decimal import Decimal
+import polars as pl
 
 
 @pytest.fixture(scope="session")
@@ -713,3 +716,222 @@ class TestPackCleanup:
         # Second cleanup should be safe (files already removed)
         removed2 = pack.cleanup()
         assert removed2 == 0
+
+
+class TestObjectKey:
+    """Tests for the _object_key helper."""
+
+    def test_without_part_suffix(self):
+        assert _object_key("foo.parquet") == "foo.parquet"
+
+    def test_with_part_suffix(self):
+        assert _object_key("tbl_part_3.parquet") == "tbl"
+
+    def test_with_uppercase_part_suffix(self):
+        assert _object_key("tbl_PART_3.PARQUET") == "tbl"
+
+
+class TestPackConfigsNone:
+    """Pack(configs=None) must fall back to the default config paths."""
+
+    def test_configs_none_uses_defaults(self, monkeypatch):
+        monkeypatch.chdir("/tmp")
+        pack = Pack(configs=None)
+        assert pack.config_paths == Pack.default_configs
+        # The default pack/source/target files do not exist, so they load empty.
+        assert pack.pack_config == {}
+        assert pack.source_config == {}
+        assert pack.target_config == {}
+        # The default agent file may or may not exist on this machine; only the
+        # fallback to the default path matters here.
+        assert isinstance(pack.agent_config, dict)
+
+
+class TestLoadAgentConfig:
+    """Tests for Pack.load_agent_config edge cases."""
+
+    def test_missing_file_returns_empty(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        assert pack.load_agent_config(str(tmp_path / "nonexistent")) == {}
+
+    def test_invalid_base64_returns_empty(self, config_paths, tmp_path):
+        f = tmp_path / "agent"
+        f.write_text("this is not base64!!!")
+        pack = Pack(configs=config_paths)
+        assert pack.load_agent_config(str(f)) == {}
+
+    def test_normalizes_local_context_url(self, config_paths, tmp_path):
+        data = {
+            "context": {
+                "local": {"url": "https://api.dev.platform.qalita.io/api/v1"}
+            }
+        }
+        f = tmp_path / "agent"
+        f.write_text(base64.b64encode(json.dumps(data).encode()).decode())
+        pack = Pack(configs=config_paths)
+        result = pack.load_agent_config(str(f))
+        assert (
+            result["context"]["local"]["url"]
+            == "https://api.dev.platform.qalita.io"
+        )
+
+    def test_keeps_url_without_path_unchanged(self, config_paths, tmp_path):
+        data = {"context": {"local": {"url": "https://api.example.com"}}}
+        f = tmp_path / "agent"
+        f.write_text(base64.b64encode(json.dumps(data).encode()).decode())
+        pack = Pack(configs=config_paths)
+        result = pack.load_agent_config(str(f))
+        assert result["context"]["local"]["url"] == "https://api.example.com"
+
+
+class TestGroupByObject:
+    """Tests for Pack._group_by_object."""
+
+    def test_uses_recorded_object_paths_when_present(self):
+        ds = type("DS", (), {"object_paths": {"x": ["x.parquet"]}})()
+        assert Pack._group_by_object(ds, ["x.parquet"]) == {"x": ["x.parquet"]}
+
+    def test_fallback_groups_by_part_suffix(self):
+        ds = type("DS", (), {})()
+        paths = [
+            "a_part_1.parquet",
+            "a_part_2.parquet",
+            "b_part_1.parquet",
+        ]
+        assert Pack._group_by_object(ds, paths) == {
+            "a": ["a_part_1.parquet", "a_part_2.parquet"],
+            "b": ["b_part_1.parquet"],
+        }
+
+    def test_fallback_skips_non_string_paths(self):
+        ds = type("DS", (), {})()
+        assert Pack._group_by_object(ds, ["a_part_1.parquet", 123, None]) == {
+            "a": ["a_part_1.parquet"]
+        }
+
+
+class TestObjectsAccessors:
+    """Tests for _objects, tables, scan, scan_all, schema, scan_data."""
+
+    def test_objects_invalid_trigger(self, config_paths):
+        pack = Pack(configs=config_paths)
+        with pytest.raises(ValueError):
+            pack._objects("bogus")
+
+    def test_objects_no_data(self, config_paths):
+        pack = Pack(configs=config_paths)
+        with pytest.raises(RuntimeError):
+            pack._objects("source")
+
+    def test_tables(self, config_paths):
+        pack = Pack(configs=config_paths)
+        pack.objects_source = {"x": ["x.parquet"], "y": ["y.parquet"]}
+        assert set(pack.tables("source")) == {"x", "y"}
+
+    def test_scan_multiple_objects_requires_table(self, config_paths):
+        pack = Pack(configs=config_paths)
+        pack.objects_source = {"x": ["x.parquet"], "y": ["y.parquet"]}
+        with pytest.raises(ValueError):
+            pack.scan("source")
+
+    def test_scan_unknown_object_raises(self, config_paths):
+        pack = Pack(configs=config_paths)
+        pack.objects_source = {"x": ["x.parquet"]}
+        with pytest.raises(KeyError):
+            pack.scan("source", "nope")
+
+    def test_scan_single_object_omits_table(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        p = tmp_path / "x.parquet"
+        pl.DataFrame({"a": [1, 2]}).write_parquet(p)
+        pack.objects_source = {"x": [str(p)]}
+        assert pack.scan("source").collect().height == 2
+
+    def test_scan_all(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        p1 = tmp_path / "x.parquet"
+        p2 = tmp_path / "y.parquet"
+        pl.DataFrame({"a": [1]}).write_parquet(p1)
+        pl.DataFrame({"a": [2]}).write_parquet(p2)
+        pack.objects_source = {"x": [str(p1)], "y": [str(p2)]}
+        frames = pack.scan_all("source")
+        assert set(frames) == {"x", "y"}
+
+    def test_schema(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        p = tmp_path / "x.parquet"
+        pl.DataFrame({"a": [1]}).write_parquet(p)
+        pack.objects_source = {"x": [str(p)]}
+        assert pack.schema("source") == {"a": pl.Int64}
+
+    def test_scan_data_no_data(self, config_paths):
+        pack = Pack(configs=config_paths)
+        with pytest.raises(RuntimeError):
+            pack.scan_data("source")
+
+    def test_scan_data(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        p = tmp_path / "x.parquet"
+        pl.DataFrame({"a": [1, 2]}).write_parquet(p)
+        pack.paths_source = [str(p)]
+        assert pack.scan_data("source").collect().height == 2
+
+
+class TestGetRowCount:
+    """Tests for Pack.get_row_count."""
+
+    def test_no_objects_returns_zero(self, config_paths):
+        pack = Pack(configs=config_paths)
+        assert pack.get_row_count("source") == 0
+
+    def test_single_object(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        p = tmp_path / "x.parquet"
+        pl.DataFrame({"a": [1, 2, 3]}).write_parquet(p)
+        pack.objects_source = {"x": [str(p)]}
+        assert pack.get_row_count("source") == 3
+
+    def test_multiple_objects_sums(self, config_paths, tmp_path):
+        pack = Pack(configs=config_paths)
+        p1 = tmp_path / "x.parquet"
+        p2 = tmp_path / "y.parquet"
+        pl.DataFrame({"a": [1, 2]}).write_parquet(p1)
+        pl.DataFrame({"a": [3, 4, 5]}).write_parquet(p2)
+        pack.objects_source = {"x": [str(p1)], "y": [str(p2)]}
+        assert pack.get_row_count("source") == 5
+
+
+class TestSanitizeForJsonExtraBranches:
+    """Covers the remaining error branches of _sanitize_for_json."""
+
+    def test_decimal_non_finite(self):
+        assert _sanitize_for_json(Decimal("sNaN")) == "sNaN"
+
+    def test_tolist_raises(self):
+        class BadTolist:
+            def tolist(self):
+                raise ValueError("no")
+
+        assert isinstance(_sanitize_for_json(BadTolist()), str)
+
+    def test_item_raises(self):
+        class BadItem:
+            def item(self):
+                raise ValueError("no")
+
+        assert isinstance(_sanitize_for_json(BadItem()), str)
+
+    def test_dict_key_str_raises_uses_repr(self):
+        class BadKey:
+            def __str__(self):
+                raise ValueError("no")
+
+        result = _sanitize_for_json({BadKey(): 1})
+        assert list(result.values()) == [1]
+
+    def test_fallback_str_raises_returns_none(self):
+        class BadStr:
+            def __str__(self):
+                raise ValueError("no")
+
+        assert _sanitize_for_json(BadStr()) is None
